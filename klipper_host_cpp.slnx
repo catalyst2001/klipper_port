@@ -1,0 +1,10 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="klipper_gui/klipper_gui.vcxproj">
+    <Platform Project="x64" />
+  </Project>
+  <Project Path="klipper_host/klipper_host.vcxproj" />
+</Solution>

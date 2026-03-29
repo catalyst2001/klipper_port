@@ -1,0 +1,17 @@
+/.vs
+/x64
+/klipper_gui/klipper_gui/x64
+/klipper_gui/x64
+/klipper_host/klipper_host/x64
+/klipper_host/x64
+/vcpkg
+/examples/klipper
+*.user
+*.tlog
+*.obj
+*.pdb
+*.ilk
+*.log
+*.idb
+*.ipch
+*.pch
