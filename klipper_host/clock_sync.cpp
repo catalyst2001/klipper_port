@@ -164,6 +164,10 @@ double ClockSync::estimatedPrintTime(double eventTime) const {
     return clockToPrintTime(getClock(eventTime));
 }
 
+double ClockSync::estimatedPrintTime() const {
+    return estimatedPrintTime(hostTime());
+}
+
 int64_t ClockSync::clock32ToClock64(uint32_t clock32) const {
     // Signed extension (handles both forward and backward deltas)
     int64_t lastClock = m_lastClock;

@@ -38,6 +38,7 @@ public:
 
     // Convert host time to print_time
     double estimatedPrintTime(double eventTime) const;
+    double estimatedPrintTime() const;  // uses current host time
 
     // Extend 32-bit MCU clock to 64-bit (signed extension, for response timestamps)
     int64_t clock32ToClock64(uint32_t clock32) const;

@@ -160,6 +160,23 @@ public:
     using ShutdownCallback = std::function<void(const std::string& reason)>;
     void setShutdownCallback(ShutdownCallback cb) { m_shutdownCallback = std::move(cb); }
 
+    // ---- Convenience Methods ----
+    // Convert seconds to MCU clock ticks using estimated frequency
+    int64_t secondsToClock(double seconds) const;
+
+    // Get an integer constant from MCU config (e.g. "ADC_MAX", "PWM_MAX")
+    int getConstantInt(const std::string& name, int defaultVal = 0) const;
+
+    // Get a float constant (reads int constant and returns as double)
+    double getConstantFloat(const std::string& name, double defaultVal = 0.0) const;
+
+    // Register a response handler for a specific OID (analog_in_state, etc.)
+    using OidResponseHandler = std::function<void(const ParsedResponse& resp)>;
+    void registerOidResponse(const std::string& responseName, int oid, OidResponseHandler handler);
+
+    // Request a move queue slot (needed for scheduled commands)
+    void requestMoveQueueSlot();
+
 private:
     SerialPort m_serial;
     uint8_t m_sendSeq = 0;
@@ -191,10 +208,14 @@ private:
 
     // OID management
     int m_oidCount = 0;
+    int m_moveQueueSlots = 0;
     bool m_configFinalized = false;
     std::vector<std::string> m_configCmds;
     std::vector<std::string> m_restartCmds;
     std::vector<std::string> m_initCmds;
+
+    // OID response handlers: key = "responseName:oid"
+    std::map<std::string, OidResponseHandler> m_oidHandlers;
 
     // Shutdown state
     std::atomic<bool> m_isShutdown{false};

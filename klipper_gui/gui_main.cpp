@@ -13,6 +13,9 @@
 #include <sstream>
 
 #include "../klipper_host/klipper_mcu.h"
+#include "../klipper_host/mcu_objects.h"
+
+#include <memory>
 
 // ---- Log Message for passing between threads ----
 struct LogEntry {
@@ -66,6 +69,23 @@ private:
     wxListCtrl* m_respList = nullptr;
     wxTimer m_uiTimer;
 
+    // GPIO/ADC objects
+    std::vector<std::unique_ptr<MCU_digital_out>> m_digitalOuts;
+    std::vector<std::unique_ptr<MCU_adc>> m_adcInputs;
+    struct AdcReading { double time = 0; double value = 0; };
+    std::mutex m_adcMutex;
+    std::vector<AdcReading> m_adcReadings;  // latest reading per ADC (indexed by order)
+
+    // GPIO/ADC UI
+    wxListCtrl* m_gpioList = nullptr;
+    wxListCtrl* m_adcList = nullptr;
+    wxTextCtrl* m_cfgPinCtrl = nullptr;
+    wxButton* m_btnAddDigitalOut = nullptr;
+    wxButton* m_btnAddAdc = nullptr;
+    wxButton* m_btnFinalize = nullptr;
+    wxTextCtrl* m_adcPinCtrl = nullptr;
+    wxTextCtrl* m_adcReportCtrl = nullptr;
+
     // Pin management
     int m_nextOid = 0;
 
@@ -96,6 +116,10 @@ private:
     void PopulateCommandList();
     void PopulateResponseList();
     int ResolvePinNumber(const wxString& pinStr);
+    void OnAddDigitalOut(wxCommandEvent& evt);
+    void OnAddAdc(wxCommandEvent& evt);
+    void OnFinalizeConfig(wxCommandEvent& evt);
+    void OnToggleGpio(wxListEvent& evt);
 };
 
 // ---- App Implementation ----
@@ -118,6 +142,10 @@ enum {
     ID_EMERGENCY_STOP,
     ID_RESET,
     ID_UI_TIMER,
+    ID_ADD_DIGITAL_OUT,
+    ID_ADD_ADC,
+    ID_FINALIZE_CONFIG,
+    ID_GPIO_LIST,
 };
 
 KlipperFrame::KlipperFrame()
@@ -134,6 +162,10 @@ KlipperFrame::KlipperFrame()
     Bind(wxEVT_BUTTON, &KlipperFrame::OnSetPin, this, ID_SET_PIN);
     Bind(wxEVT_BUTTON, &KlipperFrame::OnEmergencyStop, this, ID_EMERGENCY_STOP);
     Bind(wxEVT_BUTTON, &KlipperFrame::OnReset, this, ID_RESET);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnAddDigitalOut, this, ID_ADD_DIGITAL_OUT);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnAddAdc, this, ID_ADD_ADC);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnFinalizeConfig, this, ID_FINALIZE_CONFIG);
+    Bind(wxEVT_LIST_ITEM_ACTIVATED, &KlipperFrame::OnToggleGpio, this, ID_GPIO_LIST);
     Bind(wxEVT_TIMER, &KlipperFrame::OnUITimer, this, ID_UI_TIMER);
     Bind(wxEVT_CLOSE_WINDOW, &KlipperFrame::OnClose, this);
 
@@ -226,6 +258,50 @@ void KlipperFrame::CreateUI() {
     respPanel->SetSizer(respSizer);
     notebook->AddPage(respPanel, "Responses");
 
+    // GPIO tab
+    auto* gpioPanel = new wxPanel(notebook);
+    auto* gpioSizer = new wxBoxSizer(wxVERTICAL);
+    auto* gpioAddSizer = new wxBoxSizer(wxHORIZONTAL);
+    gpioAddSizer->Add(new wxStaticText(gpioPanel, wxID_ANY, "Pin:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_cfgPinCtrl = new wxTextCtrl(gpioPanel, wxID_ANY, "PD0", wxDefaultPosition, wxSize(80, -1));
+    gpioAddSizer->Add(m_cfgPinCtrl, 0, wxALL, 3);
+    m_btnAddDigitalOut = new wxButton(gpioPanel, ID_ADD_DIGITAL_OUT, "Add Digital Out");
+    gpioAddSizer->Add(m_btnAddDigitalOut, 0, wxALL, 3);
+    m_btnFinalize = new wxButton(gpioPanel, ID_FINALIZE_CONFIG, "Finalize Config");
+    gpioAddSizer->Add(m_btnFinalize, 0, wxALL, 3);
+    gpioSizer->Add(gpioAddSizer, 0, wxEXPAND);
+    m_gpioList = new wxListCtrl(gpioPanel, ID_GPIO_LIST, wxDefaultPosition, wxDefaultSize, wxLC_REPORT);
+    m_gpioList->AppendColumn("OID", wxLIST_FORMAT_LEFT, 50);
+    m_gpioList->AppendColumn("Pin", wxLIST_FORMAT_LEFT, 100);
+    m_gpioList->AppendColumn("State", wxLIST_FORMAT_LEFT, 80);
+    m_gpioList->AppendColumn("Status", wxLIST_FORMAT_LEFT, 200);
+    gpioSizer->Add(m_gpioList, 1, wxEXPAND | wxALL, 2);
+    gpioPanel->SetSizer(gpioSizer);
+    notebook->AddPage(gpioPanel, "GPIO");
+
+    // ADC tab
+    auto* adcPanel = new wxPanel(notebook);
+    auto* adcSizer = new wxBoxSizer(wxVERTICAL);
+    auto* adcAddSizer = new wxBoxSizer(wxHORIZONTAL);
+    adcAddSizer->Add(new wxStaticText(adcPanel, wxID_ANY, "Pin:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_adcPinCtrl = new wxTextCtrl(adcPanel, wxID_ANY, "ADC_TEMPERATURE", wxDefaultPosition, wxSize(140, -1));
+    adcAddSizer->Add(m_adcPinCtrl, 0, wxALL, 3);
+    adcAddSizer->Add(new wxStaticText(adcPanel, wxID_ANY, "Report(s):"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_adcReportCtrl = new wxTextCtrl(adcPanel, wxID_ANY, "0.5", wxDefaultPosition, wxSize(60, -1));
+    adcAddSizer->Add(m_adcReportCtrl, 0, wxALL, 3);
+    m_btnAddAdc = new wxButton(adcPanel, ID_ADD_ADC, "Add ADC");
+    adcAddSizer->Add(m_btnAddAdc, 0, wxALL, 3);
+    adcSizer->Add(adcAddSizer, 0, wxEXPAND);
+    m_adcList = new wxListCtrl(adcPanel, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxLC_REPORT);
+    m_adcList->AppendColumn("OID", wxLIST_FORMAT_LEFT, 50);
+    m_adcList->AppendColumn("Pin", wxLIST_FORMAT_LEFT, 140);
+    m_adcList->AppendColumn("Value", wxLIST_FORMAT_LEFT, 100);
+    m_adcList->AppendColumn("Voltage", wxLIST_FORMAT_LEFT, 100);
+    m_adcList->AppendColumn("Last Read", wxLIST_FORMAT_LEFT, 150);
+    adcSizer->Add(m_adcList, 1, wxEXPAND | wxALL, 2);
+    adcPanel->SetSizer(adcSizer);
+    notebook->AddPage(adcPanel, "ADC");
+
     // Log panel
     m_logText = new wxTextCtrl(splitter, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
         wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2 | wxHSCROLL);
@@ -247,6 +323,9 @@ void KlipperFrame::CreateUI() {
     m_btnSetPin->Enable(false);
     m_btnEmergencyStop->Enable(false);
     m_btnReset->Enable(false);
+    m_btnAddDigitalOut->Enable(false);
+    m_btnAddAdc->Enable(false);
+    m_btnFinalize->Enable(false);
 }
 
 void KlipperFrame::Log(const wxString& msg, const wxColour& color) {
@@ -293,6 +372,19 @@ void KlipperFrame::OnUITimer(wxTimerEvent&) {
         m_statusLabel->SetLabel(wxString::Format("Status: MCU SHUTDOWN - %s", m_mcu.getShutdownMsg()));
         m_statusLabel->SetForegroundColour(*wxRED);
     }
+
+    // Update ADC readings display
+    {
+        std::lock_guard<std::mutex> lock(m_adcMutex);
+        for (size_t i = 0; i < m_adcReadings.size() && i < static_cast<size_t>(m_adcList->GetItemCount()); i++) {
+            auto& r = m_adcReadings[i];
+            if (r.time > 0) {
+                m_adcList->SetItem(static_cast<int>(i), 2, wxString::Format("%.4f", r.value));
+                m_adcList->SetItem(static_cast<int>(i), 3, wxString::Format("%.3f V", r.value * 3.3));
+                m_adcList->SetItem(static_cast<int>(i), 4, wxString::Format("t=%.3f", r.time));
+            }
+        }
+    }
 }
 
 void KlipperFrame::OnConnect(wxCommandEvent&) {
@@ -311,8 +403,16 @@ void KlipperFrame::OnConnect(wxCommandEvent&) {
         m_btnSetPin->Enable(false);
         m_btnEmergencyStop->Enable(false);
         m_btnReset->Enable(false);
+        m_btnAddDigitalOut->Enable(false);
+        m_btnAddAdc->Enable(false);
+        m_btnFinalize->Enable(false);
         m_cmdList->DeleteAllItems();
         m_respList->DeleteAllItems();
+        m_gpioList->DeleteAllItems();
+        m_adcList->DeleteAllItems();
+        m_digitalOuts.clear();
+        m_adcInputs.clear();
+        m_adcReadings.clear();
         Log("Disconnected.", *wxRED);
     }
     else {
@@ -360,6 +460,9 @@ void KlipperFrame::OnIdentify(wxCommandEvent&) {
         m_btnSetPin->Enable(true);
         m_btnEmergencyStop->Enable(true);
         m_btnReset->Enable(true);
+        m_btnAddDigitalOut->Enable(true);
+        m_btnAddAdc->Enable(true);
+        m_btnFinalize->Enable(true);
 
         StartPolling();
 
@@ -597,6 +700,143 @@ void KlipperFrame::ClockSyncThread() {
         }
         // Poll at ~1 Hz (matching Klipper's QUERY_FREQ)
         std::this_thread::sleep_for(std::chrono::milliseconds(984));
+    }
+}
+
+void KlipperFrame::OnAddDigitalOut(wxCommandEvent&) {
+    if (!m_connected) return;
+    if (m_mcu.isConfigFinalized()) {
+        Log("Config already finalized. Disconnect and reconnect to reconfigure.", *wxRED);
+        return;
+    }
+
+    wxString pinStr = m_cfgPinCtrl->GetValue().Trim();
+    if (pinStr.empty()) return;
+
+    auto dout = std::make_unique<MCU_digital_out>(m_mcu);
+    dout->setupPin(pinStr.ToStdString(), false);
+    dout->setupMaxDuration(0.0);
+    dout->setupStartValue(false, false);
+
+    std::lock_guard<std::mutex> lock(m_mcuMutex);
+    if (dout->buildConfig()) {
+        int row = m_gpioList->GetItemCount();
+        m_gpioList->InsertItem(row, wxString::Format("%d", dout->getOid()));
+        m_gpioList->SetItem(row, 1, pinStr);
+        m_gpioList->SetItem(row, 2, "LOW");
+        m_gpioList->SetItem(row, 3, "pending finalize");
+
+        Log(wxString::Format("Added digital out: OID=%d pin=%s", dout->getOid(), pinStr),
+            wxColour(0, 128, 0));
+        m_digitalOuts.push_back(std::move(dout));
+    } else {
+        Log(wxString::Format("Failed to add digital out for pin %s", pinStr), *wxRED);
+    }
+}
+
+void KlipperFrame::OnAddAdc(wxCommandEvent&) {
+    if (!m_connected) return;
+    if (m_mcu.isConfigFinalized()) {
+        Log("Config already finalized. Disconnect and reconnect to reconfigure.", *wxRED);
+        return;
+    }
+
+    wxString pinStr = m_adcPinCtrl->GetValue().Trim();
+    if (pinStr.empty()) return;
+
+    double reportTime = 0.5;
+    m_adcReportCtrl->GetValue().ToDouble(&reportTime);
+    if (reportTime < 0.01) reportTime = 0.01;
+
+    auto adc = std::make_unique<MCU_adc>(m_mcu);
+    adc->setupPin(pinStr.ToStdString());
+    adc->setupAdcSample(reportTime, 0.001, 8, 0.0, 1.0, 0);
+
+    size_t adcIdx = m_adcInputs.size();
+    {
+        std::lock_guard<std::mutex> lock(m_adcMutex);
+        m_adcReadings.push_back({0.0, 0.0});
+    }
+
+    adc->setupAdcCallback([this, adcIdx](double readTime, double value) {
+        std::lock_guard<std::mutex> lock(m_adcMutex);
+        if (adcIdx < m_adcReadings.size()) {
+            m_adcReadings[adcIdx] = {readTime, value};
+        }
+    });
+
+    std::lock_guard<std::mutex> lock(m_mcuMutex);
+    if (adc->buildConfig()) {
+        int row = m_adcList->GetItemCount();
+        m_adcList->InsertItem(row, wxString::Format("%d", adc->getOid()));
+        m_adcList->SetItem(row, 1, pinStr);
+        m_adcList->SetItem(row, 2, "---");
+        m_adcList->SetItem(row, 3, "---");
+        m_adcList->SetItem(row, 4, "pending finalize");
+
+        Log(wxString::Format("Added ADC: OID=%d pin=%s report=%.2fs", adc->getOid(), pinStr, reportTime),
+            wxColour(0, 128, 0));
+        m_adcInputs.push_back(std::move(adc));
+    } else {
+        Log(wxString::Format("Failed to add ADC for pin %s", pinStr), *wxRED);
+        std::lock_guard<std::mutex> adcLock(m_adcMutex);
+        m_adcReadings.pop_back();
+    }
+}
+
+void KlipperFrame::OnFinalizeConfig(wxCommandEvent&) {
+    if (!m_connected) return;
+    if (m_mcu.isConfigFinalized()) {
+        Log("Config already finalized.", wxColour(200, 100, 0));
+        return;
+    }
+
+    if (m_digitalOuts.empty() && m_adcInputs.empty()) {
+        Log("No GPIO or ADC objects configured. Add some first.", wxColour(200, 100, 0));
+        return;
+    }
+
+    Log("Finalizing MCU configuration...");
+    wxBusyCursor wait;
+
+    std::lock_guard<std::mutex> lock(m_mcuMutex);
+    if (m_mcu.finalizeConfig()) {
+        Log(wxString::Format("Config finalized! OIDs=%d", m_mcu.getOidCount()), wxColour(0, 128, 0));
+
+        // Update GPIO list status
+        for (int i = 0; i < m_gpioList->GetItemCount(); i++) {
+            m_gpioList->SetItem(i, 3, "active");
+        }
+        // Update ADC list status
+        for (int i = 0; i < m_adcList->GetItemCount(); i++) {
+            m_adcList->SetItem(i, 4, "active");
+        }
+
+        m_btnAddDigitalOut->Enable(false);
+        m_btnAddAdc->Enable(false);
+        m_btnFinalize->Enable(false);
+    } else {
+        Log("Config finalization failed: " + wxString(m_mcu.getLastError()), *wxRED);
+    }
+}
+
+void KlipperFrame::OnToggleGpio(wxListEvent& evt) {
+    if (!m_connected || !m_mcu.isConfigFinalized()) return;
+
+    int idx = evt.GetIndex();
+    if (idx < 0 || idx >= static_cast<int>(m_digitalOuts.size())) return;
+
+    auto& dout = m_digitalOuts[idx];
+    bool newVal = !dout->getLastValue();
+
+    std::lock_guard<std::mutex> lock(m_mcuMutex);
+    double printTime = m_mcu.getClockSync().estimatedPrintTime();
+    if (dout->setDigital(printTime + 0.05, newVal)) {
+        m_gpioList->SetItem(idx, 2, newVal ? "HIGH" : "LOW");
+        Log(wxString::Format("GPIO OID=%d -> %s", dout->getOid(), newVal ? "HIGH" : "LOW"),
+            wxColour(0, 128, 0));
+    } else {
+        Log(wxString::Format("Failed to toggle GPIO OID=%d", dout->getOid()), *wxRED);
     }
 }
 

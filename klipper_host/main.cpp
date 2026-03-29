@@ -2,6 +2,7 @@
 #include <string>
 #include <iomanip>
 #include "klipper_mcu.h"
+#include "mcu_objects.h"
 
 int main() {
     std::cout << "=== Klipper Host C++ Test ===" << std::endl;
@@ -122,6 +123,78 @@ int main() {
     mcu.setShutdownCallback([](const std::string& reason) {
         std::cerr << "*** SHUTDOWN CALLBACK: " << reason << " ***" << std::endl;
     });
+
+    // Test: MCU constants
+    std::cout << "\n--- MCU Constants ---" << std::endl;
+    std::cout << "  ADC_MAX = " << mcu.getConstantInt("ADC_MAX") << std::endl;
+    std::cout << "  PWM_MAX = " << mcu.getConstantInt("PWM_MAX") << std::endl;
+    std::cout << "  CLOCK_FREQ = " << mcu.getConstantInt("CLOCK_FREQ") << std::endl;
+    std::cout << "  MCU = " << mcu.getConfigStrings().count("MCU") << std::endl;
+
+    // Test: MCU_digital_out (build config but don't finalize - just verify API)
+    std::cout << "\n--- Testing MCU_digital_out API ---" << std::endl;
+    {
+        MCU_digital_out dout(mcu);
+        dout.setupPin("PD0", false);
+        dout.setupMaxDuration(0.0);
+        dout.setupStartValue(false, false);
+        if (dout.buildConfig()) {
+            std::cout << "  Digital out OID=" << dout.getOid()
+                      << " pin=" << dout.getPinName() << " OK" << std::endl;
+        } else {
+            std::cout << "  Digital out build failed" << std::endl;
+        }
+    }
+
+    // Test: MCU_pwm (hardware PWM)
+    std::cout << "\n--- Testing MCU_pwm API ---" << std::endl;
+    {
+        MCU_pwm pwm(mcu);
+        pwm.setupPin("PD0", false);
+        pwm.setupCycleTime(0.001, true);  // 1kHz hardware PWM
+        pwm.setupMaxDuration(0.0);
+        pwm.setupStartValue(0.0, 0.0);
+        if (pwm.buildConfig()) {
+            std::cout << "  PWM OID=" << pwm.getOid()
+                      << " pin=" << pwm.getPinName()
+                      << " pwm_max=" << pwm.getPwmMax() << " OK" << std::endl;
+        } else {
+            std::cout << "  PWM build failed" << std::endl;
+        }
+    }
+
+    // Test: MCU_adc
+    std::cout << "\n--- Testing MCU_adc API ---" << std::endl;
+    {
+        MCU_adc adc(mcu);
+        adc.setupPin("ADC_TEMPERATURE");
+        adc.setupAdcSample(0.5, 0.001, 8, 0.0, 1.0, 0);
+        adc.setupAdcCallback([](double readTime, double value) {
+            std::cout << "  ADC callback: time=" << readTime
+                      << " value=" << value << std::endl;
+        });
+        if (adc.buildConfig()) {
+            std::cout << "  ADC OID=" << adc.getOid()
+                      << " pin=" << adc.getPinName() << " OK" << std::endl;
+        } else {
+            std::cout << "  ADC build failed" << std::endl;
+        }
+    }
+
+    // Test: Config finalization (sends all config to MCU)
+    std::cout << "\n--- Testing Config Finalization ---" << std::endl;
+    if (mcu.finalizeConfig()) {
+        std::cout << "  Config finalized OK! OIDs=" << mcu.getOidCount() << std::endl;
+
+        // Poll for a few seconds to receive ADC data
+        std::cout << "\n--- Polling for ADC data (3 seconds) ---" << std::endl;
+        auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < std::chrono::seconds(3)) {
+            mcu.processIncoming(100);
+        }
+    } else {
+        std::cout << "  Config finalize failed: " << mcu.getLastError() << std::endl;
+    }
 
     std::cout << "\n=== Done ===" << std::endl;
     mcu.disconnect();

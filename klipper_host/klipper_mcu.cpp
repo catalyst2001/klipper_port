@@ -231,6 +231,18 @@ std::vector<KlipperMCU::ParsedResponse> KlipperMCU::processIncoming(uint32_t tim
                 // Check for shutdown/starting responses
                 checkShutdownResponse(resp);
 
+                // Dispatch to OID response handlers
+                if (!resp.name.empty()) {
+                    auto oidIt = resp.intParams.find("oid");
+                    if (oidIt != resp.intParams.end()) {
+                        std::string key = resp.name + ":" + std::to_string(oidIt->second);
+                        auto handlerIt = m_oidHandlers.find(key);
+                        if (handlerIt != m_oidHandlers.end()) {
+                            handlerIt->second(resp);
+                        }
+                    }
+                }
+
                 results.push_back(std::move(resp));
 
                 if (m_responseCallback && !results.empty()) {
@@ -593,10 +605,35 @@ void KlipperMCU::addInitCmd(const std::string& cmd) {
 
 void KlipperMCU::resetConfig() {
     m_oidCount = 0;
+    m_moveQueueSlots = 0;
     m_configFinalized = false;
     m_configCmds.clear();
     m_restartCmds.clear();
     m_initCmds.clear();
+    m_oidHandlers.clear();
+}
+
+int64_t KlipperMCU::secondsToClock(double seconds) const {
+    return static_cast<int64_t>(seconds * m_clockSync.getEstimatedFreq());
+}
+
+int KlipperMCU::getConstantInt(const std::string& name, int defaultVal) const {
+    auto it = m_config.find(name);
+    return (it != m_config.end()) ? it->second : defaultVal;
+}
+
+double KlipperMCU::getConstantFloat(const std::string& name, double defaultVal) const {
+    auto it = m_config.find(name);
+    return (it != m_config.end()) ? static_cast<double>(it->second) : defaultVal;
+}
+
+void KlipperMCU::registerOidResponse(const std::string& responseName, int oid, OidResponseHandler handler) {
+    std::string key = responseName + ":" + std::to_string(oid);
+    m_oidHandlers[key] = std::move(handler);
+}
+
+void KlipperMCU::requestMoveQueueSlot() {
+    m_moveQueueSlots++;
 }
 
 bool KlipperMCU::finalizeConfig() {
