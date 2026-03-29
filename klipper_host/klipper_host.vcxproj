@@ -136,6 +136,10 @@
     <ClCompile Include="clock_sync.cpp" />
     <ClCompile Include="mcu_objects.cpp" />
     <ClCompile Include="bus_objects.cpp" />
+    <ClCompile Include="stepper.cpp" />
+    <ClCompile Include="trapq.cpp" />
+    <ClCompile Include="toolhead.cpp" />
+    <ClCompile Include="gcode.cpp" />
     <ClCompile Include="miniz_impl.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -145,6 +149,10 @@
     <ClInclude Include="clock_sync.h" />
     <ClInclude Include="mcu_objects.h" />
     <ClInclude Include="bus_objects.h" />
+    <ClInclude Include="stepper.h" />
+    <ClInclude Include="trapq.h" />
+    <ClInclude Include="toolhead.h" />
+    <ClInclude Include="gcode.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\.editorconfig" />

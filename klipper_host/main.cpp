@@ -4,6 +4,9 @@
 #include "klipper_mcu.h"
 #include "mcu_objects.h"
 #include "bus_objects.h"
+#include "stepper.h"
+#include "toolhead.h"
+#include "gcode.h"
 
 int main() {
     std::cout << "=== Klipper Host C++ Test ===" << std::endl;
@@ -228,6 +231,108 @@ int main() {
             MCU_Thermocouple::SensorType::MAX6675, 100 << 3);
         std::cout << "  MAX6675 raw 0x0320 = " << t2 << " C" << std::endl;
     }
+
+    // ---- Phase 4: Stepper, Toolhead, G-code ----
+
+    // Test: MCU_stepper (build config API)
+    std::cout << "\n--- Testing MCU_stepper API ---" << std::endl;
+    MCU_stepper stepperX(mcu);
+    stepperX.setupPin("PD6", "PD11");
+    stepperX.setupStepDist(40.0, 200, 16); // 40mm belt, 200 steps, 16 microsteps
+    stepperX.setupInvertDir(false);
+    stepperX.buildConfig();
+    std::cout << "  Stepper X: OID=" << stepperX.getOid()
+              << " step_dist=" << stepperX.getStepDist() << " mm" << std::endl;
+
+    MCU_stepper stepperY(mcu);
+    stepperY.setupPin("PD7", "PD12");
+    stepperY.setupStepDist(40.0, 200, 16);
+    stepperY.setupInvertDir(false);
+    stepperY.buildConfig();
+    std::cout << "  Stepper Y: OID=" << stepperY.getOid()
+              << " step_dist=" << stepperY.getStepDist() << " mm" << std::endl;
+
+    MCU_stepper stepperZ(mcu);
+    stepperZ.setupPin("PD8", "PD13");
+    stepperZ.setupStepDist(8.0, 200, 16); // 8mm lead screw
+    stepperZ.setupInvertDir(false);
+    stepperZ.buildConfig();
+    std::cout << "  Stepper Z: OID=" << stepperZ.getOid()
+              << " step_dist=" << stepperZ.getStepDist() << " mm" << std::endl;
+
+    // Test: MCU_endstop
+    std::cout << "\n--- Testing MCU_endstop API ---" << std::endl;
+    MCU_endstop endstopX(mcu);
+    endstopX.setupPin("PC16", true);
+    endstopX.buildConfig();
+    std::cout << "  Endstop X: OID=" << endstopX.getOid()
+              << " trsync=" << endstopX.getTrsyncOid() << std::endl;
+
+    // Test: PrinterRail
+    std::cout << "\n--- Testing PrinterRail ---" << std::endl;
+    PrinterRail railX(stepperX, endstopX);
+    railX.setPositionLimits(0, 300);
+    railX.setHomingSpeed(25.0);
+    railX.setPositionEndstop(0);
+    std::cout << "  Rail X: range [" << railX.getPosMin() << ", " << railX.getPosMax()
+              << "] homing_speed=" << railX.getHomingSpeed() << std::endl;
+
+    // Test: Toolhead + Trapezoid Planner
+    std::cout << "\n--- Testing Toolhead ---" << std::endl;
+    ToolHead toolhead(mcu);
+    toolhead.setMaxVelocity(100);
+    toolhead.setMaxAccel(1000);
+    toolhead.setSquareCornerVelocity(5.0);
+    toolhead.addStepper(0, &stepperX);
+    toolhead.addStepper(1, &stepperY);
+    toolhead.addStepper(2, &stepperZ);
+    std::cout << "  maxVel=" << toolhead.getMaxVelocity()
+              << " maxAccel=" << toolhead.getMaxAccel()
+              << " junctionDev=" << toolhead.getJunctionDeviation() << std::endl;
+
+    // Test: Move/TrapMove generation (offline, no MCU send)
+    std::cout << "\n--- Testing Move + TrapMove ---" << std::endl;
+    {
+        Move move(Vec3(0, 0, 0), Vec3(10, 0, 0), 50.0, 1000.0);
+        move.setJunction(0, 50.0 * 50.0, 0);
+        auto trapMoves = move.toTrapMoves();
+        std::cout << "  Move 10mm @ 50mm/s: " << trapMoves.size() << " trap moves" << std::endl;
+        for (size_t i = 0; i < trapMoves.size(); ++i) {
+            auto& tm = trapMoves[i];
+            std::cout << "    [" << i << "] t=" << tm.print_time
+                      << " dt=" << tm.move_t
+                      << " v0=" << tm.start_v
+                      << " a/2=" << tm.half_accel << std::endl;
+        }
+    }
+
+    // Test: G-code parser (offline)
+    std::cout << "\n--- Testing GCodeParser ---" << std::endl;
+    GCodeParser gcode(toolhead, mcu);
+    gcode.addRail(0, &railX);
+
+    gcode.executeLine("G90");
+    std::cout << "  G90: absolute=" << gcode.isAbsoluteMode() << std::endl;
+    gcode.executeLine("G91");
+    std::cout << "  G91: absolute=" << gcode.isAbsoluteMode() << std::endl;
+    gcode.executeLine("G90");
+
+    gcode.executeLine("G92 X0 Y0 Z0");
+    std::cout << "  G92 X0 Y0 Z0: basePos=("
+              << gcode.getBasePosition().x << ","
+              << gcode.getBasePosition().y << ","
+              << gcode.getBasePosition().z << ")" << std::endl;
+
+    // Parse test without sending to MCU (toolhead queues but doesn't send)
+    gcode.executeLine("G1 X10 Y5 F3000");
+    gcode.executeLine("G1 X20 Y10");
+    std::cout << "  After G1 moves: queue=" << toolhead.getQueueSize()
+              << " pos=(" << toolhead.getPosition().x
+              << "," << toolhead.getPosition().y
+              << "," << toolhead.getPosition().z << ")" << std::endl;
+
+    gcode.executeLine("M114");
+    std::cout << "  M114: " << gcode.getLastMessage() << std::endl;
 
     // Test: Config finalization (sends all config to MCU)
     std::cout << "\n--- Testing Config Finalization ---" << std::endl;

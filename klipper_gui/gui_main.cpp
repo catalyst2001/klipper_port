@@ -15,6 +15,9 @@
 #include "../klipper_host/klipper_mcu.h"
 #include "../klipper_host/mcu_objects.h"
 #include "../klipper_host/bus_objects.h"
+#include "../klipper_host/stepper.h"
+#include "../klipper_host/toolhead.h"
+#include "../klipper_host/gcode.h"
 
 #include <memory>
 
@@ -104,6 +107,22 @@ private:
     wxChoice* m_tcTypeCtrl = nullptr;
     wxButton* m_btnAddThermocouple = nullptr;
 
+    // Stepper / motion objects
+    std::vector<std::unique_ptr<MCU_stepper>> m_stepperObjs;
+    std::vector<std::unique_ptr<MCU_endstop>> m_endstopObjs;
+    std::unique_ptr<ToolHead> m_toolhead;
+    std::unique_ptr<GCodeParser> m_gcode;
+
+    // Motion UI
+    wxListCtrl* m_stepperList = nullptr;
+    wxTextCtrl* m_stepPinCtrl = nullptr;
+    wxTextCtrl* m_dirPinCtrl = nullptr;
+    wxButton* m_btnAddStepper = nullptr;
+    wxTextCtrl* m_gcodeInput = nullptr;
+    wxButton* m_btnSendGcode = nullptr;
+    wxButton* m_btnHomeAll = nullptr;
+    wxStaticText* m_motionStatus = nullptr;
+
     // Pin management
     int m_nextOid = 0;
 
@@ -140,6 +159,9 @@ private:
     void OnToggleGpio(wxListEvent& evt);
     void OnAddSpi(wxCommandEvent& evt);
     void OnAddThermocouple(wxCommandEvent& evt);
+    void OnAddStepper(wxCommandEvent& evt);
+    void OnSendGcode(wxCommandEvent& evt);
+    void OnHomeAll(wxCommandEvent& evt);
 };
 
 // ---- App Implementation ----
@@ -168,6 +190,9 @@ enum {
     ID_GPIO_LIST,
     ID_ADD_SPI,
     ID_ADD_THERMOCOUPLE,
+    ID_ADD_STEPPER,
+    ID_SEND_GCODE,
+    ID_HOME_ALL,
 };
 
 KlipperFrame::KlipperFrame()
@@ -190,6 +215,9 @@ KlipperFrame::KlipperFrame()
     Bind(wxEVT_LIST_ITEM_ACTIVATED, &KlipperFrame::OnToggleGpio, this, ID_GPIO_LIST);
     Bind(wxEVT_BUTTON, &KlipperFrame::OnAddSpi, this, ID_ADD_SPI);
     Bind(wxEVT_BUTTON, &KlipperFrame::OnAddThermocouple, this, ID_ADD_THERMOCOUPLE);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnAddStepper, this, ID_ADD_STEPPER);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnSendGcode, this, ID_SEND_GCODE);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnHomeAll, this, ID_HOME_ALL);
     Bind(wxEVT_TIMER, &KlipperFrame::OnUITimer, this, ID_UI_TIMER);
     Bind(wxEVT_CLOSE_WINDOW, &KlipperFrame::OnClose, this);
 
@@ -374,6 +402,51 @@ void KlipperFrame::CreateUI() {
     tcPanel->SetSizer(tcSizer);
     notebook->AddPage(tcPanel, "Thermocouple");
 
+    // Motion tab
+    auto* motionPanel = new wxPanel(notebook);
+    auto* motionSizer = new wxBoxSizer(wxVERTICAL);
+
+    // Add stepper row
+    auto* stepAddSizer = new wxBoxSizer(wxHORIZONTAL);
+    stepAddSizer->Add(new wxStaticText(motionPanel, wxID_ANY, "Step Pin:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_stepPinCtrl = new wxTextCtrl(motionPanel, wxID_ANY, "PD6", wxDefaultPosition, wxSize(60, -1));
+    stepAddSizer->Add(m_stepPinCtrl, 0, wxALL, 3);
+    stepAddSizer->Add(new wxStaticText(motionPanel, wxID_ANY, "Dir Pin:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_dirPinCtrl = new wxTextCtrl(motionPanel, wxID_ANY, "PD11", wxDefaultPosition, wxSize(60, -1));
+    stepAddSizer->Add(m_dirPinCtrl, 0, wxALL, 3);
+    m_btnAddStepper = new wxButton(motionPanel, ID_ADD_STEPPER, "Add Stepper");
+    stepAddSizer->Add(m_btnAddStepper, 0, wxALL, 3);
+    m_btnHomeAll = new wxButton(motionPanel, ID_HOME_ALL, "Home All (G28)");
+    stepAddSizer->Add(m_btnHomeAll, 0, wxALL, 3);
+    motionSizer->Add(stepAddSizer, 0, wxEXPAND);
+
+    // Stepper list
+    m_stepperList = new wxListCtrl(motionPanel, wxID_ANY, wxDefaultPosition, wxSize(-1, 100), wxLC_REPORT);
+    m_stepperList->AppendColumn("OID", wxLIST_FORMAT_LEFT, 50);
+    m_stepperList->AppendColumn("Step Pin", wxLIST_FORMAT_LEFT, 80);
+    m_stepperList->AppendColumn("Dir Pin", wxLIST_FORMAT_LEFT, 80);
+    m_stepperList->AppendColumn("Step Dist", wxLIST_FORMAT_LEFT, 90);
+    m_stepperList->AppendColumn("Status", wxLIST_FORMAT_LEFT, 120);
+    motionSizer->Add(m_stepperList, 1, wxEXPAND | wxALL, 2);
+
+    // G-code input
+    auto* gcodeSizer = new wxBoxSizer(wxHORIZONTAL);
+    gcodeSizer->Add(new wxStaticText(motionPanel, wxID_ANY, "G-code:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_gcodeInput = new wxTextCtrl(motionPanel, wxID_ANY, "G1 X10 Y5 F3000",
+        wxDefaultPosition, wxSize(350, -1), wxTE_PROCESS_ENTER);
+    gcodeSizer->Add(m_gcodeInput, 1, wxALL, 3);
+    m_btnSendGcode = new wxButton(motionPanel, ID_SEND_GCODE, "Send");
+    gcodeSizer->Add(m_btnSendGcode, 0, wxALL, 3);
+    motionSizer->Add(gcodeSizer, 0, wxEXPAND);
+
+    // Motion status
+    m_motionStatus = new wxStaticText(motionPanel, wxID_ANY, "Motion: idle");
+    m_motionStatus->SetForegroundColour(wxColour(80, 80, 80));
+    motionSizer->Add(m_motionStatus, 0, wxALL, 5);
+
+    motionPanel->SetSizer(motionSizer);
+    notebook->AddPage(motionPanel, "Motion");
+
     // Log panel
     m_logText = new wxTextCtrl(splitter, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
         wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2 | wxHSCROLL);
@@ -400,6 +473,9 @@ void KlipperFrame::CreateUI() {
     m_btnFinalize->Enable(false);
     m_btnAddSpi->Enable(false);
     m_btnAddThermocouple->Enable(false);
+    m_btnAddStepper->Enable(false);
+    m_btnSendGcode->Enable(false);
+    m_btnHomeAll->Enable(false);
 }
 
 void KlipperFrame::Log(const wxString& msg, const wxColour& color) {
@@ -492,12 +568,16 @@ void KlipperFrame::OnConnect(wxCommandEvent&) {
         m_btnFinalize->Enable(false);
         m_btnAddSpi->Enable(false);
         m_btnAddThermocouple->Enable(false);
+        m_btnAddStepper->Enable(false);
+        m_btnSendGcode->Enable(false);
+        m_btnHomeAll->Enable(false);
         m_cmdList->DeleteAllItems();
         m_respList->DeleteAllItems();
         m_gpioList->DeleteAllItems();
         m_adcList->DeleteAllItems();
         m_busList->DeleteAllItems();
         m_tcList->DeleteAllItems();
+        m_stepperList->DeleteAllItems();
         m_digitalOuts.clear();
         m_adcInputs.clear();
         m_adcReadings.clear();
@@ -505,6 +585,10 @@ void KlipperFrame::OnConnect(wxCommandEvent&) {
         m_i2cDevices.clear();
         m_thermocouples.clear();
         m_tcReadings.clear();
+        m_stepperObjs.clear();
+        m_endstopObjs.clear();
+        m_toolhead.reset();
+        m_gcode.reset();
         Log("Disconnected.", *wxRED);
     }
     else {
@@ -557,6 +641,7 @@ void KlipperFrame::OnIdentify(wxCommandEvent&) {
         m_btnFinalize->Enable(true);
         m_btnAddSpi->Enable(true);
         m_btnAddThermocouple->Enable(true);
+        m_btnAddStepper->Enable(true);
 
         StartPolling();
 
@@ -885,8 +970,8 @@ void KlipperFrame::OnFinalizeConfig(wxCommandEvent&) {
         return;
     }
 
-    if (m_digitalOuts.empty() && m_adcInputs.empty()) {
-        Log("No GPIO or ADC objects configured. Add some first.", wxColour(200, 100, 0));
+    if (m_digitalOuts.empty() && m_adcInputs.empty() && m_stepperObjs.empty()) {
+        Log("No GPIO, ADC, or stepper objects configured. Add some first.", wxColour(200, 100, 0));
         return;
     }
 
@@ -919,6 +1004,29 @@ void KlipperFrame::OnFinalizeConfig(wxCommandEvent&) {
         m_btnFinalize->Enable(false);
         m_btnAddSpi->Enable(false);
         m_btnAddThermocouple->Enable(false);
+        m_btnAddStepper->Enable(false);
+
+        // Update stepper list status
+        for (int i = 0; i < m_stepperList->GetItemCount(); i++) {
+            m_stepperList->SetItem(i, 4, "active");
+        }
+
+        // Create toolhead + gcode parser after finalization
+        if (!m_stepperObjs.empty()) {
+            m_toolhead = std::make_unique<ToolHead>(m_mcu);
+            m_toolhead->setMaxVelocity(100);
+            m_toolhead->setMaxAccel(1000);
+            m_toolhead->setSquareCornerVelocity(5.0);
+
+            for (size_t i = 0; i < m_stepperObjs.size() && i < 3; ++i) {
+                m_toolhead->addStepper(static_cast<int>(i), m_stepperObjs[i].get());
+            }
+
+            m_gcode = std::make_unique<GCodeParser>(*m_toolhead, m_mcu);
+            m_btnSendGcode->Enable(true);
+            m_btnHomeAll->Enable(true);
+            Log("Toolhead + G-code parser initialized", wxColour(0, 128, 0));
+        }
     } else {
         Log("Config finalization failed: " + wxString(m_mcu.getLastError()), *wxRED);
     }
@@ -1025,6 +1133,84 @@ void KlipperFrame::OnAddThermocouple(wxCommandEvent&) {
         Log("Failed to add thermocouple", *wxRED);
         std::lock_guard<std::mutex> tcLock(m_tcMutex);
         m_tcReadings.pop_back();
+    }
+}
+
+void KlipperFrame::OnAddStepper(wxCommandEvent&) {
+    if (!m_connected) return;
+    if (m_mcu.isConfigFinalized()) {
+        Log("Config already finalized.", *wxRED);
+        return;
+    }
+
+    wxString stepPin = m_stepPinCtrl->GetValue().Trim();
+    wxString dirPin = m_dirPinCtrl->GetValue().Trim();
+    if (stepPin.empty() || dirPin.empty()) return;
+
+    auto stepper = std::make_unique<MCU_stepper>(m_mcu);
+    stepper->setupPin(stepPin.ToStdString(), dirPin.ToStdString());
+    stepper->setupStepDist(40.0, 200, 16); // defaults: 40mm belt, 200 steps, 16 microsteps
+    stepper->setupInvertDir(false);
+
+    std::lock_guard<std::mutex> lock(m_mcuMutex);
+    if (stepper->buildConfig()) {
+        int row = m_stepperList->GetItemCount();
+        m_stepperList->InsertItem(row, wxString::Format("%d", stepper->getOid()));
+        m_stepperList->SetItem(row, 1, stepPin);
+        m_stepperList->SetItem(row, 2, dirPin);
+        m_stepperList->SetItem(row, 3, wxString::Format("%.5f mm", stepper->getStepDist()));
+        m_stepperList->SetItem(row, 4, "pending finalize");
+
+        Log(wxString::Format("Added stepper: OID=%d step=%s dir=%s",
+            stepper->getOid(), stepPin, dirPin), wxColour(0, 128, 0));
+        m_stepperObjs.push_back(std::move(stepper));
+    } else {
+        Log(wxString::Format("Failed to add stepper %s/%s", stepPin, dirPin), *wxRED);
+    }
+}
+
+void KlipperFrame::OnSendGcode(wxCommandEvent&) {
+    if (!m_connected || !m_gcode) return;
+
+    wxString cmd = m_gcodeInput->GetValue().Trim();
+    if (cmd.empty()) return;
+
+    Log(wxString::Format("> %s", cmd), wxColour(0, 0, 160));
+
+    std::lock_guard<std::mutex> lock(m_mcuMutex);
+    if (m_gcode->executeLine(cmd.ToStdString())) {
+        // Flush and generate steps
+        m_toolhead->flush();
+        m_toolhead->generateSteps();
+
+        wxString msg = m_gcode->getLastMessage();
+        if (!msg.empty()) {
+            Log(wxString::Format("  %s", msg), wxColour(0, 128, 0));
+        }
+
+        Vec3 pos = m_toolhead->getPosition();
+        m_motionStatus->SetLabel(wxString::Format(
+            "Motion: X=%.3f Y=%.3f Z=%.3f | F=%.0f mm/min",
+            pos.x, pos.y, pos.z, m_gcode->getFeedrate() * 60.0));
+    } else {
+        Log(wxString::Format("  Error: %s", m_gcode->getLastMessage()), *wxRED);
+    }
+}
+
+void KlipperFrame::OnHomeAll(wxCommandEvent&) {
+    if (!m_connected || !m_gcode) return;
+
+    Log("Sending G28 (Home All)...", wxColour(0, 0, 160));
+
+    std::lock_guard<std::mutex> lock(m_mcuMutex);
+    if (m_gcode->executeLine("G28")) {
+        Log("Homing complete", wxColour(0, 128, 0));
+        Vec3 pos = m_toolhead->getPosition();
+        m_motionStatus->SetLabel(wxString::Format(
+            "Motion: X=%.3f Y=%.3f Z=%.3f | Homed",
+            pos.x, pos.y, pos.z));
+    } else {
+        Log(wxString::Format("Homing failed: %s", m_gcode->getLastMessage()), *wxRED);
     }
 }
 
