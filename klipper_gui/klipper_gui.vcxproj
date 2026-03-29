@@ -86,6 +86,7 @@
     <ClCompile Include="..\klipper_host\klipper_mcu.cpp" />
     <ClCompile Include="..\klipper_host\clock_sync.cpp" />
     <ClCompile Include="..\klipper_host\mcu_objects.cpp" />
+    <ClCompile Include="..\klipper_host\bus_objects.cpp" />
     <ClCompile Include="..\klipper_host\miniz_impl.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -94,6 +95,7 @@
     <ClInclude Include="..\klipper_host\klipper_mcu.h" />
     <ClInclude Include="..\klipper_host\clock_sync.h" />
     <ClInclude Include="..\klipper_host\mcu_objects.h" />
+    <ClInclude Include="..\klipper_host\bus_objects.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

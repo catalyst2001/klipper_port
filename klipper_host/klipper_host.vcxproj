@@ -135,6 +135,7 @@
     <ClCompile Include="klipper_mcu.cpp" />
     <ClCompile Include="clock_sync.cpp" />
     <ClCompile Include="mcu_objects.cpp" />
+    <ClCompile Include="bus_objects.cpp" />
     <ClCompile Include="miniz_impl.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -143,6 +144,7 @@
     <ClInclude Include="klipper_mcu.h" />
     <ClInclude Include="clock_sync.h" />
     <ClInclude Include="mcu_objects.h" />
+    <ClInclude Include="bus_objects.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\.editorconfig" />

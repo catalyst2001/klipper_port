@@ -14,6 +14,7 @@
 
 #include "../klipper_host/klipper_mcu.h"
 #include "../klipper_host/mcu_objects.h"
+#include "../klipper_host/bus_objects.h"
 
 #include <memory>
 
@@ -86,6 +87,23 @@ private:
     wxTextCtrl* m_adcPinCtrl = nullptr;
     wxTextCtrl* m_adcReportCtrl = nullptr;
 
+    // SPI/I2C/Thermocouple objects
+    std::vector<std::unique_ptr<MCU_SPI>> m_spiDevices;
+    std::vector<std::unique_ptr<MCU_I2C>> m_i2cDevices;
+    std::vector<std::unique_ptr<MCU_Thermocouple>> m_thermocouples;
+    struct TcReading { double temp = 0; uint8_t fault = 0; };
+    std::mutex m_tcMutex;
+    std::vector<TcReading> m_tcReadings;
+
+    // Bus UI
+    wxListCtrl* m_busList = nullptr;
+    wxTextCtrl* m_spiCsCtrl = nullptr;
+    wxTextCtrl* m_spiBusCtrl = nullptr;
+    wxButton* m_btnAddSpi = nullptr;
+    wxListCtrl* m_tcList = nullptr;
+    wxChoice* m_tcTypeCtrl = nullptr;
+    wxButton* m_btnAddThermocouple = nullptr;
+
     // Pin management
     int m_nextOid = 0;
 
@@ -120,6 +138,8 @@ private:
     void OnAddAdc(wxCommandEvent& evt);
     void OnFinalizeConfig(wxCommandEvent& evt);
     void OnToggleGpio(wxListEvent& evt);
+    void OnAddSpi(wxCommandEvent& evt);
+    void OnAddThermocouple(wxCommandEvent& evt);
 };
 
 // ---- App Implementation ----
@@ -146,6 +166,8 @@ enum {
     ID_ADD_ADC,
     ID_FINALIZE_CONFIG,
     ID_GPIO_LIST,
+    ID_ADD_SPI,
+    ID_ADD_THERMOCOUPLE,
 };
 
 KlipperFrame::KlipperFrame()
@@ -166,6 +188,8 @@ KlipperFrame::KlipperFrame()
     Bind(wxEVT_BUTTON, &KlipperFrame::OnAddAdc, this, ID_ADD_ADC);
     Bind(wxEVT_BUTTON, &KlipperFrame::OnFinalizeConfig, this, ID_FINALIZE_CONFIG);
     Bind(wxEVT_LIST_ITEM_ACTIVATED, &KlipperFrame::OnToggleGpio, this, ID_GPIO_LIST);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnAddSpi, this, ID_ADD_SPI);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnAddThermocouple, this, ID_ADD_THERMOCOUPLE);
     Bind(wxEVT_TIMER, &KlipperFrame::OnUITimer, this, ID_UI_TIMER);
     Bind(wxEVT_CLOSE_WINDOW, &KlipperFrame::OnClose, this);
 
@@ -302,6 +326,54 @@ void KlipperFrame::CreateUI() {
     adcPanel->SetSizer(adcSizer);
     notebook->AddPage(adcPanel, "ADC");
 
+    // SPI/I2C Buses tab
+    auto* busPanel = new wxPanel(notebook);
+    auto* busSizer = new wxBoxSizer(wxVERTICAL);
+    auto* busAddSizer = new wxBoxSizer(wxHORIZONTAL);
+    busAddSizer->Add(new wxStaticText(busPanel, wxID_ANY, "CS Pin:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_spiCsCtrl = new wxTextCtrl(busPanel, wxID_ANY, "PA5", wxDefaultPosition, wxSize(60, -1));
+    busAddSizer->Add(m_spiCsCtrl, 0, wxALL, 3);
+    busAddSizer->Add(new wxStaticText(busPanel, wxID_ANY, "SPI Bus:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_spiBusCtrl = new wxTextCtrl(busPanel, wxID_ANY, "spi0", wxDefaultPosition, wxSize(60, -1));
+    busAddSizer->Add(m_spiBusCtrl, 0, wxALL, 3);
+    m_btnAddSpi = new wxButton(busPanel, ID_ADD_SPI, "Add SPI");
+    busAddSizer->Add(m_btnAddSpi, 0, wxALL, 3);
+    busSizer->Add(busAddSizer, 0, wxEXPAND);
+    m_busList = new wxListCtrl(busPanel, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxLC_REPORT);
+    m_busList->AppendColumn("Type", wxLIST_FORMAT_LEFT, 60);
+    m_busList->AppendColumn("OID", wxLIST_FORMAT_LEFT, 50);
+    m_busList->AppendColumn("Bus", wxLIST_FORMAT_LEFT, 80);
+    m_busList->AppendColumn("Pin/Addr", wxLIST_FORMAT_LEFT, 100);
+    m_busList->AppendColumn("Status", wxLIST_FORMAT_LEFT, 150);
+    busSizer->Add(m_busList, 1, wxEXPAND | wxALL, 2);
+    busPanel->SetSizer(busSizer);
+    notebook->AddPage(busPanel, "Buses");
+
+    // Thermocouple tab
+    auto* tcPanel = new wxPanel(notebook);
+    auto* tcSizer = new wxBoxSizer(wxVERTICAL);
+    auto* tcAddSizer = new wxBoxSizer(wxHORIZONTAL);
+    tcAddSizer->Add(new wxStaticText(tcPanel, wxID_ANY, "Type:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_tcTypeCtrl = new wxChoice(tcPanel, wxID_ANY);
+    m_tcTypeCtrl->Append("MAX31855");
+    m_tcTypeCtrl->Append("MAX31856");
+    m_tcTypeCtrl->Append("MAX6675");
+    m_tcTypeCtrl->Append("MAX31865");
+    m_tcTypeCtrl->SetSelection(0);
+    tcAddSizer->Add(m_tcTypeCtrl, 0, wxALL, 3);
+    m_btnAddThermocouple = new wxButton(tcPanel, ID_ADD_THERMOCOUPLE, "Add Thermocouple (uses last SPI)");
+    tcAddSizer->Add(m_btnAddThermocouple, 0, wxALL, 3);
+    tcSizer->Add(tcAddSizer, 0, wxEXPAND);
+    m_tcList = new wxListCtrl(tcPanel, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxLC_REPORT);
+    m_tcList->AppendColumn("OID", wxLIST_FORMAT_LEFT, 50);
+    m_tcList->AppendColumn("Type", wxLIST_FORMAT_LEFT, 100);
+    m_tcList->AppendColumn("Temperature", wxLIST_FORMAT_LEFT, 120);
+    m_tcList->AppendColumn("Fault", wxLIST_FORMAT_LEFT, 80);
+    m_tcList->AppendColumn("Status", wxLIST_FORMAT_LEFT, 150);
+    tcSizer->Add(m_tcList, 1, wxEXPAND | wxALL, 2);
+    tcPanel->SetSizer(tcSizer);
+    notebook->AddPage(tcPanel, "Thermocouple");
+
     // Log panel
     m_logText = new wxTextCtrl(splitter, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
         wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2 | wxHSCROLL);
@@ -326,6 +398,8 @@ void KlipperFrame::CreateUI() {
     m_btnAddDigitalOut->Enable(false);
     m_btnAddAdc->Enable(false);
     m_btnFinalize->Enable(false);
+    m_btnAddSpi->Enable(false);
+    m_btnAddThermocouple->Enable(false);
 }
 
 void KlipperFrame::Log(const wxString& msg, const wxColour& color) {
@@ -385,6 +459,16 @@ void KlipperFrame::OnUITimer(wxTimerEvent&) {
             }
         }
     }
+
+    // Update thermocouple readings display
+    {
+        std::lock_guard<std::mutex> lock(m_tcMutex);
+        for (size_t i = 0; i < m_tcReadings.size() && i < static_cast<size_t>(m_tcList->GetItemCount()); i++) {
+            auto& r = m_tcReadings[i];
+            m_tcList->SetItem(static_cast<int>(i), 2, wxString::Format("%.1f C", r.temp));
+            m_tcList->SetItem(static_cast<int>(i), 3, r.fault ? wxString::Format("0x%02X", r.fault) : wxString("OK"));
+        }
+    }
 }
 
 void KlipperFrame::OnConnect(wxCommandEvent&) {
@@ -406,13 +490,21 @@ void KlipperFrame::OnConnect(wxCommandEvent&) {
         m_btnAddDigitalOut->Enable(false);
         m_btnAddAdc->Enable(false);
         m_btnFinalize->Enable(false);
+        m_btnAddSpi->Enable(false);
+        m_btnAddThermocouple->Enable(false);
         m_cmdList->DeleteAllItems();
         m_respList->DeleteAllItems();
         m_gpioList->DeleteAllItems();
         m_adcList->DeleteAllItems();
+        m_busList->DeleteAllItems();
+        m_tcList->DeleteAllItems();
         m_digitalOuts.clear();
         m_adcInputs.clear();
         m_adcReadings.clear();
+        m_spiDevices.clear();
+        m_i2cDevices.clear();
+        m_thermocouples.clear();
+        m_tcReadings.clear();
         Log("Disconnected.", *wxRED);
     }
     else {
@@ -463,6 +555,8 @@ void KlipperFrame::OnIdentify(wxCommandEvent&) {
         m_btnAddDigitalOut->Enable(true);
         m_btnAddAdc->Enable(true);
         m_btnFinalize->Enable(true);
+        m_btnAddSpi->Enable(true);
+        m_btnAddThermocouple->Enable(true);
 
         StartPolling();
 
@@ -811,10 +905,20 @@ void KlipperFrame::OnFinalizeConfig(wxCommandEvent&) {
         for (int i = 0; i < m_adcList->GetItemCount(); i++) {
             m_adcList->SetItem(i, 4, "active");
         }
+        // Update bus list status
+        for (int i = 0; i < m_busList->GetItemCount(); i++) {
+            m_busList->SetItem(i, 4, "active");
+        }
+        // Update thermocouple list status
+        for (int i = 0; i < m_tcList->GetItemCount(); i++) {
+            m_tcList->SetItem(i, 4, "active - sampling");
+        }
 
         m_btnAddDigitalOut->Enable(false);
         m_btnAddAdc->Enable(false);
         m_btnFinalize->Enable(false);
+        m_btnAddSpi->Enable(false);
+        m_btnAddThermocouple->Enable(false);
     } else {
         Log("Config finalization failed: " + wxString(m_mcu.getLastError()), *wxRED);
     }
@@ -837,6 +941,90 @@ void KlipperFrame::OnToggleGpio(wxListEvent& evt) {
             wxColour(0, 128, 0));
     } else {
         Log(wxString::Format("Failed to toggle GPIO OID=%d", dout->getOid()), *wxRED);
+    }
+}
+
+void KlipperFrame::OnAddSpi(wxCommandEvent&) {
+    if (!m_connected) return;
+    if (m_mcu.isConfigFinalized()) {
+        Log("Config already finalized.", *wxRED);
+        return;
+    }
+
+    wxString csPin = m_spiCsCtrl->GetValue().Trim();
+    wxString spiBus = m_spiBusCtrl->GetValue().Trim();
+
+    auto spi = std::make_unique<MCU_SPI>(m_mcu);
+    spi->setupPin(csPin.ToStdString(), false);
+    spi->setupBus(spiBus.ToStdString(), 0, 4000000);
+
+    std::lock_guard<std::mutex> lock(m_mcuMutex);
+    if (spi->buildConfig()) {
+        int row = m_busList->GetItemCount();
+        m_busList->InsertItem(row, "SPI");
+        m_busList->SetItem(row, 1, wxString::Format("%d", spi->getOid()));
+        m_busList->SetItem(row, 2, spiBus);
+        m_busList->SetItem(row, 3, csPin);
+        m_busList->SetItem(row, 4, "pending finalize");
+
+        Log(wxString::Format("Added SPI: OID=%d bus=%s cs=%s", spi->getOid(), spiBus, csPin),
+            wxColour(0, 128, 0));
+        m_spiDevices.push_back(std::move(spi));
+    } else {
+        Log("Failed to add SPI device", *wxRED);
+    }
+}
+
+void KlipperFrame::OnAddThermocouple(wxCommandEvent&) {
+    if (!m_connected) return;
+    if (m_mcu.isConfigFinalized()) {
+        Log("Config already finalized.", *wxRED);
+        return;
+    }
+    if (m_spiDevices.empty()) {
+        Log("Add an SPI device first (CS pin for the thermocouple chip).", *wxRED);
+        return;
+    }
+
+    int typeIdx = m_tcTypeCtrl->GetSelection();
+    auto sensorType = static_cast<MCU_Thermocouple::SensorType>(typeIdx);
+    wxString typeName = m_tcTypeCtrl->GetString(typeIdx);
+
+    auto tc = std::make_unique<MCU_Thermocouple>(m_mcu);
+    tc->setupSpi(*m_spiDevices.back());
+    tc->setupSensor(sensorType);
+    tc->setupReportTime(0.300);
+
+    size_t tcIdx = m_thermocouples.size();
+    {
+        std::lock_guard<std::mutex> lock(m_tcMutex);
+        m_tcReadings.push_back({0.0, 0});
+    }
+
+    tc->setCallback([this, tcIdx](double temp, uint8_t fault) {
+        std::lock_guard<std::mutex> lock(m_tcMutex);
+        if (tcIdx < m_tcReadings.size()) {
+            m_tcReadings[tcIdx] = {temp, fault};
+        }
+    });
+
+    std::lock_guard<std::mutex> lock(m_mcuMutex);
+    tc->initSensor();
+    if (tc->buildConfig()) {
+        int row = m_tcList->GetItemCount();
+        m_tcList->InsertItem(row, wxString::Format("%d", tc->getOid()));
+        m_tcList->SetItem(row, 1, typeName);
+        m_tcList->SetItem(row, 2, "---");
+        m_tcList->SetItem(row, 3, "---");
+        m_tcList->SetItem(row, 4, "pending finalize");
+
+        Log(wxString::Format("Added thermocouple: OID=%d type=%s", tc->getOid(), typeName),
+            wxColour(0, 128, 0));
+        m_thermocouples.push_back(std::move(tc));
+    } else {
+        Log("Failed to add thermocouple", *wxRED);
+        std::lock_guard<std::mutex> tcLock(m_tcMutex);
+        m_tcReadings.pop_back();
     }
 }
 

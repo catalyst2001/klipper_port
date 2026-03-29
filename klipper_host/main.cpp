@@ -3,6 +3,7 @@
 #include <iomanip>
 #include "klipper_mcu.h"
 #include "mcu_objects.h"
+#include "bus_objects.h"
 
 int main() {
     std::cout << "=== Klipper Host C++ Test ===" << std::endl;
@@ -179,6 +180,53 @@ int main() {
         } else {
             std::cout << "  ADC build failed" << std::endl;
         }
+    }
+
+    // Test: MCU_SPI (build config API test)
+    std::cout << "\n--- Testing MCU_SPI API ---" << std::endl;
+    {
+        MCU_SPI spi(mcu);
+        spi.setupPin("PA5", false);
+        spi.setupBus("spi0", 0, 4000000);
+        if (spi.buildConfig()) {
+            std::cout << "  SPI OID=" << spi.getOid() << " OK" << std::endl;
+        } else {
+            std::cout << "  SPI build failed" << std::endl;
+        }
+    }
+
+    // Test: MCU_I2C (build config API test)
+    std::cout << "\n--- Testing MCU_I2C API ---" << std::endl;
+    {
+        MCU_I2C i2c(mcu);
+        i2c.setupBus("twihs0", 100000, 0x48);
+        if (i2c.buildConfig()) {
+            std::cout << "  I2C OID=" << i2c.getOid() << " OK" << std::endl;
+        } else {
+            std::cout << "  I2C build failed" << std::endl;
+        }
+    }
+
+    // Test: TMC UART CRC and bit-framing
+    std::cout << "\n--- Testing TMC UART CRC ---" << std::endl;
+    {
+        uint8_t testData[] = {0xF5, 0x00, 0x06};
+        uint8_t crc = MCU_TMC_uart::calcCrc8(testData, 3);
+        std::cout << "  CRC8 of [F5,00,06] = 0x" << std::hex << (int)crc << std::dec << std::endl;
+    }
+
+    // Test: Thermocouple temperature conversion
+    std::cout << "\n--- Testing Thermocouple Conversions ---" << std::endl;
+    {
+        // MAX31855: 25.0C = 0x00190000 (100 << 18)
+        double t1 = MCU_Thermocouple::convertTemperature(
+            MCU_Thermocouple::SensorType::MAX31855, 100 << 18);
+        std::cout << "  MAX31855 raw 0x01900000 = " << t1 << " C" << std::endl;
+
+        // MAX6675: 25.0C = (100 << 3)
+        double t2 = MCU_Thermocouple::convertTemperature(
+            MCU_Thermocouple::SensorType::MAX6675, 100 << 3);
+        std::cout << "  MAX6675 raw 0x0320 = " << t2 << " C" << std::endl;
     }
 
     // Test: Config finalization (sends all config to MCU)
