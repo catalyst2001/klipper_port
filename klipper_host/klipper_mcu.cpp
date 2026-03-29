@@ -55,11 +55,15 @@ void KlipperMCU::disconnect() {
     m_responseById.clear();
     m_outputById.clear();
     m_enumerations.clear();
+    m_expandedEnums.clear();
     m_config.clear();
     m_configStrings.clear();
     m_identifyJson.clear();
     m_version.clear();
     m_buildVersions.clear();
+    m_isShutdown = false;
+    m_shutdownMsg.clear();
+    resetConfig();
 }
 
 bool KlipperMCU::isConnected() const {
@@ -223,6 +227,10 @@ std::vector<KlipperMCU::ParsedResponse> KlipperMCU::processIncoming(uint32_t tim
 
             if (payloadLen > 0) {
                 auto resp = decodeResponse(payloadStart, payloadLen);
+
+                // Check for shutdown/starting responses
+                checkShutdownResponse(resp);
+
                 results.push_back(std::move(resp));
 
                 if (m_responseCallback && !results.empty()) {
@@ -443,6 +451,9 @@ bool KlipperMCU::parseIdentifyData(const std::vector<uint8_t>& compressedData) {
         std::cout << "[KlipperMCU] Commands: " << m_commands.size() 
                   << ", Responses: " << m_responses.size() << std::endl;
 
+        // Expand enumeration ranges for pin resolution
+        expandEnumerations();
+
         return true;
     }
     catch (const std::exception& e) {
@@ -523,4 +534,412 @@ bool KlipperMCU::sendWithResponse(const std::string& cmdName,
             }
         }
     }
+}
+
+// ============================================================
+// Clock Sync
+// ============================================================
+
+bool KlipperMCU::initClockSync() {
+    return m_clockSync.connect(*this);
+}
+
+bool KlipperMCU::clockSyncPoll() {
+    if (!isConnected() || m_isShutdown) return false;
+
+    m_clockSync.incrementPending();
+
+    auto sentTime = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    std::map<std::string, int64_t> intP;
+    std::map<std::string, std::vector<uint8_t>> bufP;
+    if (!sendWithResponse("get_clock", "clock", intP, bufP, {}, {}, 2000)) {
+        return m_clockSync.isActive();
+    }
+
+    auto recvTime = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    uint32_t clock32 = static_cast<uint32_t>(intP["clock"]);
+    m_clockSync.handleClockResponse(clock32, sentTime, recvTime);
+
+    return true;
+}
+
+// ============================================================
+// OID Management
+// ============================================================
+
+int KlipperMCU::createOid() {
+    if (m_configFinalized) {
+        m_lastError = "Cannot create OID after config finalization";
+        return -1;
+    }
+    return m_oidCount++;
+}
+
+void KlipperMCU::addConfigCmd(const std::string& cmd) {
+    m_configCmds.push_back(cmd);
+}
+
+void KlipperMCU::addRestartCmd(const std::string& cmd) {
+    m_restartCmds.push_back(cmd);
+}
+
+void KlipperMCU::addInitCmd(const std::string& cmd) {
+    m_initCmds.push_back(cmd);
+}
+
+void KlipperMCU::resetConfig() {
+    m_oidCount = 0;
+    m_configFinalized = false;
+    m_configCmds.clear();
+    m_restartCmds.clear();
+    m_initCmds.clear();
+}
+
+bool KlipperMCU::finalizeConfig() {
+    if (m_configFinalized) {
+        m_lastError = "Config already finalized";
+        return false;
+    }
+
+    // Step 1: Query MCU's current config state
+    std::map<std::string, int64_t> configParams;
+    std::map<std::string, std::vector<uint8_t>> bufP;
+    if (!sendWithResponse("get_config", "config", configParams, bufP)) {
+        m_lastError = "Failed to query MCU config state";
+        return false;
+    }
+
+    bool isConfig = configParams["is_config"] != 0;
+    uint32_t mcuCrc = static_cast<uint32_t>(configParams["crc"]);
+
+    if (configParams["is_shutdown"] != 0) {
+        m_lastError = "MCU is in shutdown state, cannot configure";
+        return false;
+    }
+
+    // Step 2: Prepare config commands
+    // Prepend allocate_oids as first config command
+    m_configCmds.insert(m_configCmds.begin(),
+        "allocate_oids count=" + std::to_string(m_oidCount));
+
+    // Step 3: Resolve pin names in all command lists
+    for (auto* cmdList : {&m_configCmds, &m_restartCmds, &m_initCmds}) {
+        for (auto& cmd : *cmdList) {
+            cmd = resolvePinsInCommand(cmd);
+        }
+    }
+
+    // Step 4: Calculate CRC of config commands
+    std::string configStr;
+    for (size_t i = 0; i < m_configCmds.size(); i++) {
+        if (i > 0) configStr += '\n';
+        configStr += m_configCmds[i];
+    }
+    // Use zlib CRC32 (same as Python's zlib.crc32)
+    uint32_t configCrc = static_cast<uint32_t>(
+        mz_crc32(MZ_CRC32_INIT,
+                  reinterpret_cast<const uint8_t*>(configStr.data()),
+                  configStr.size()));
+
+    // Step 5: Append finalize_config
+    m_configCmds.push_back("finalize_config crc=" + std::to_string(configCrc));
+
+    // Step 6: Determine which commands to send
+    std::vector<std::string> cmdsToSend;
+    if (!isConfig) {
+        // MCU not configured → send full config + init
+        cmdsToSend.insert(cmdsToSend.end(), m_configCmds.begin(), m_configCmds.end());
+        cmdsToSend.insert(cmdsToSend.end(), m_initCmds.begin(), m_initCmds.end());
+        std::cout << "[KlipperMCU] Sending printer configuration (" 
+                  << cmdsToSend.size() << " commands)..." << std::endl;
+    }
+    else {
+        // MCU already configured
+        if (configCrc != mcuCrc) {
+            // CRC mismatch → need firmware restart
+            std::cout << "[KlipperMCU] CRC mismatch (host=" << configCrc 
+                      << " mcu=" << mcuCrc << "), attempting restart..." << std::endl;
+            firmwareRestart();
+            m_lastError = "MCU CRC mismatch, firmware restart issued";
+            return false;
+        }
+        // CRC matches → send restart + init commands only
+        cmdsToSend.insert(cmdsToSend.end(), m_restartCmds.begin(), m_restartCmds.end());
+        cmdsToSend.insert(cmdsToSend.end(), m_initCmds.begin(), m_initCmds.end());
+        std::cout << "[KlipperMCU] MCU already configured (CRC match), sending " 
+                  << cmdsToSend.size() << " restart/init commands..." << std::endl;
+    }
+
+    // Step 7: Send all commands
+    for (auto& cmd : cmdsToSend) {
+        if (!sendCommandString(cmd)) {
+            m_lastError = "Failed to send config command: " + cmd;
+            return false;
+        }
+    }
+
+    // Step 8: Verify configuration
+    configParams.clear();
+    bufP.clear();
+    if (!sendWithResponse("get_config", "config", configParams, bufP)) {
+        m_lastError = "Failed to verify MCU config";
+        return false;
+    }
+
+    if (configParams["is_config"] == 0) {
+        m_lastError = "MCU did not accept configuration";
+        return false;
+    }
+
+    m_configFinalized = true;
+    std::cout << "[KlipperMCU] Configuration finalized (CRC=" << configCrc 
+              << ", move_count=" << configParams["move_count"] << ")" << std::endl;
+    return true;
+}
+
+// ============================================================
+// Pin Resolution
+// ============================================================
+
+void KlipperMCU::expandEnumerations() {
+    m_expandedEnums.clear();
+    for (auto& [enumName, values] : m_enumerations) {
+        auto& expanded = m_expandedEnums[enumName];
+        for (auto& [valName, ev] : values) {
+            if (ev.isRange()) {
+                // Expand range: e.g. "PA0" with [0, 32] -> PA0=0, PA1=1, ..., PA31=31
+                // Find the numeric suffix of the base name
+                std::string root = valName;
+                int startIdx = 0;
+                while (!root.empty() && std::isdigit(root.back())) {
+                    root.pop_back();
+                }
+                if (root.size() < valName.size()) {
+                    startIdx = std::stoi(valName.substr(root.size()));
+                }
+                for (int i = 0; i < ev.count; i++) {
+                    expanded[root + std::to_string(startIdx + i)] = ev.value + i;
+                }
+            }
+            else {
+                expanded[valName] = ev.value;
+            }
+        }
+    }
+}
+
+int KlipperMCU::resolvePin(const std::string& pinName) const {
+    return resolveEnum("pin", pinName);
+}
+
+int KlipperMCU::resolveEnum(const std::string& enumName, const std::string& valueName) const {
+    auto enumIt = m_expandedEnums.find(enumName);
+    if (enumIt == m_expandedEnums.end()) return -1;
+
+    auto valIt = enumIt->second.find(valueName);
+    if (valIt == enumIt->second.end()) {
+        // Try as numeric
+        try {
+            return std::stoi(valueName);
+        }
+        catch (...) {
+            return -1;
+        }
+    }
+    return valIt->second;
+}
+
+std::string KlipperMCU::resolvePinsInCommand(const std::string& cmd) const {
+    // Replace pin=NAME patterns with pin=NUMBER
+    // Matches: " pin=NAME", "_pin=NAME" (space or underscore before 'pin=')
+    std::string result = cmd;
+    std::regex pinRegex(R"(([_ ]pin=)([^ ]+))");
+    std::string output;
+    std::sregex_iterator it(result.begin(), result.end(), pinRegex);
+    std::sregex_iterator end;
+    size_t lastPos = 0;
+
+    while (it != end) {
+        auto& match = *it;
+        output += result.substr(lastPos, match.position() - lastPos);
+
+        std::string prefix = match[1].str();
+        std::string pinName = match[2].str();
+
+        int pinNum = resolvePin(pinName);
+        if (pinNum >= 0) {
+            output += prefix + std::to_string(pinNum);
+        }
+        else {
+            output += match[0].str(); // keep as-is if not found
+        }
+
+        lastPos = match.position() + match.length();
+        ++it;
+    }
+    output += result.substr(lastPos);
+    return output;
+}
+
+bool KlipperMCU::sendCommandString(const std::string& cmdStr) {
+    // Parse a command string like "config_digital_out oid=0 pin=96 value=0 default_value=0 max_duration=0"
+    std::istringstream iss(cmdStr);
+    std::string cmdName;
+    iss >> cmdName;
+
+    auto cmdIt = m_commands.find(cmdName);
+    if (cmdIt == m_commands.end()) {
+        m_lastError = "Unknown command in string: " + cmdName;
+        return false;
+    }
+
+    // Parse key=value pairs
+    std::map<std::string, int64_t> intParams;
+    std::map<std::string, std::vector<uint8_t>> bufParams;
+
+    std::string token;
+    while (iss >> token) {
+        auto eqPos = token.find('=');
+        if (eqPos == std::string::npos) continue;
+
+        std::string key = token.substr(0, eqPos);
+        std::string valStr = token.substr(eqPos + 1);
+
+        // Find param type from format
+        char type = 'u';
+        for (auto& p : cmdIt->second.params) {
+            if (p.name == key) {
+                type = p.type;
+                break;
+            }
+        }
+
+        if (type == 's') {
+            // Buffer param
+            bufParams[key] = std::vector<uint8_t>(valStr.begin(), valStr.end());
+        }
+        else {
+            // Try as enumeration first, then as number
+            int64_t val = 0;
+            // Check if this parameter has an enumeration
+            int enumVal = -1;
+            // For pin parameters, use pin enum
+            if (key.find("pin") != std::string::npos) {
+                enumVal = resolvePin(valStr);
+            }
+            if (enumVal >= 0) {
+                val = enumVal;
+            }
+            else {
+                try {
+                    val = std::stoll(valStr);
+                }
+                catch (...) {
+                    m_lastError = "Invalid parameter value: " + key + "=" + valStr;
+                    return false;
+                }
+            }
+            intParams[key] = val;
+        }
+    }
+
+    return sendCommand(cmdName, intParams, bufParams);
+}
+
+// ============================================================
+// Shutdown / Restart
+// ============================================================
+
+void KlipperMCU::checkShutdownResponse(const ParsedResponse& resp) {
+    if (resp.name == "shutdown" || resp.name == "is_shutdown") {
+        if (m_isShutdown.load()) return;
+        m_isShutdown = true;
+
+        // Resolve static_string_id to message
+        std::string msg = "Unknown shutdown reason";
+        auto idIt = resp.intParams.find("static_string_id");
+        if (idIt != resp.intParams.end()) {
+            int stringId = static_cast<int>(idIt->second);
+            // Look up in static_string_id enumeration
+            auto enumIt = m_expandedEnums.find("static_string_id");
+            if (enumIt != m_expandedEnums.end()) {
+                for (auto& [name, val] : enumIt->second) {
+                    if (val == stringId) {
+                        msg = name;
+                        break;
+                    }
+                }
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_shutdownMutex);
+            m_shutdownMsg = msg;
+        }
+
+        std::cerr << "[KlipperMCU] !!! SHUTDOWN: " << msg << " !!!" << std::endl;
+
+        if (m_shutdownCallback) {
+            m_shutdownCallback(msg);
+        }
+    }
+    else if (resp.name == "starting") {
+        // MCU spontaneously restarted
+        if (!m_isShutdown.load()) {
+            m_isShutdown = true;
+            std::string msg = "MCU spontaneous restart";
+            {
+                std::lock_guard<std::mutex> lock(m_shutdownMutex);
+                m_shutdownMsg = msg;
+            }
+            std::cerr << "[KlipperMCU] !!! " << msg << " !!!" << std::endl;
+            if (m_shutdownCallback) {
+                m_shutdownCallback(msg);
+            }
+        }
+    }
+}
+
+std::string KlipperMCU::getShutdownMsg() const {
+    std::lock_guard<std::mutex> lock(m_shutdownMutex);
+    return m_shutdownMsg;
+}
+
+bool KlipperMCU::clearShutdown() {
+    if (!isConnected()) {
+        m_lastError = "Not connected";
+        return false;
+    }
+
+    if (sendCommand("clear_shutdown")) {
+        m_isShutdown = false;
+        {
+            std::lock_guard<std::mutex> lock(m_shutdownMutex);
+            m_shutdownMsg.clear();
+        }
+        return true;
+    }
+    return false;
+}
+
+bool KlipperMCU::firmwareRestart() {
+    if (!isConnected()) {
+        m_lastError = "Not connected";
+        return false;
+    }
+
+    // Try reset command first
+    if (m_commands.count("reset")) {
+        sendCommand("reset");
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        disconnect();
+        return true;
+    }
+
+    m_lastError = "No reset command available";
+    return false;
 }

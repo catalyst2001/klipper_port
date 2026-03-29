@@ -2,6 +2,7 @@
 
 #include "serial_port.h"
 #include "klipper_proto.h"
+#include "clock_sync.h"
 
 #include <string>
 #include <vector>
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <atomic>
 
 // Parsed command/response format
 struct MessageFormat {
@@ -94,6 +96,70 @@ public:
     // Get last error
     const std::string& getLastError() const { return m_lastError; }
 
+    // ---- Clock Sync ----
+    ClockSync& getClockSync() { return m_clockSync; }
+    const ClockSync& getClockSync() const { return m_clockSync; }
+
+    // Initialize clock synchronization (call after identify)
+    bool initClockSync();
+
+    // Send periodic get_clock for clock sync maintenance.
+    // Returns false if MCU is unresponsive.
+    bool clockSyncPoll();
+
+    // ---- OID Management ----
+    // Allocate a new OID. Returns the next sequential OID number.
+    int createOid();
+
+    // Get the current OID count
+    int getOidCount() const { return m_oidCount; }
+
+    // ---- Pin Resolution ----
+    // Resolve a pin name (e.g. "PA0", "PD5") to MCU pin number using enumerations.
+    // Returns -1 if not found.
+    int resolvePin(const std::string& pinName) const;
+
+    // Resolve an enumeration value by enum name and value name.
+    // Returns -1 if not found.
+    int resolveEnum(const std::string& enumName, const std::string& valueName) const;
+
+    // ---- Config Finalization ----
+    // Add a config command (sent only on first config, not on reconnect)
+    void addConfigCmd(const std::string& cmd);
+
+    // Add a restart command (sent on reconnect when CRC matches)
+    void addRestartCmd(const std::string& cmd);
+
+    // Add an init command (sent always, after config or restart commands)
+    void addInitCmd(const std::string& cmd);
+
+    // Finalize configuration: allocate_oids → config_cmds → finalize_config crc=X
+    // Sends all commands to MCU. Returns false on failure.
+    bool finalizeConfig();
+
+    // Check if config has been finalized
+    bool isConfigFinalized() const { return m_configFinalized; }
+
+    // Reset config state (for reconnection)
+    void resetConfig();
+
+    // ---- Shutdown/Restart ----
+    // Check if MCU is in shutdown state
+    bool isShutdown() const { return m_isShutdown.load(); }
+
+    // Get shutdown message
+    std::string getShutdownMsg() const;
+
+    // Clear shutdown state (sends clear_shutdown to MCU)
+    bool clearShutdown();
+
+    // Request firmware restart
+    bool firmwareRestart();
+
+    // Register a shutdown callback
+    using ShutdownCallback = std::function<void(const std::string& reason)>;
+    void setShutdownCallback(ShutdownCallback cb) { m_shutdownCallback = std::move(cb); }
+
 private:
     SerialPort m_serial;
     uint8_t m_sendSeq = 0;
@@ -119,6 +185,35 @@ private:
     std::map<std::string, std::string> m_configStrings;
 
     ResponseCallback m_responseCallback;
+
+    // Clock synchronization
+    ClockSync m_clockSync;
+
+    // OID management
+    int m_oidCount = 0;
+    bool m_configFinalized = false;
+    std::vector<std::string> m_configCmds;
+    std::vector<std::string> m_restartCmds;
+    std::vector<std::string> m_initCmds;
+
+    // Shutdown state
+    std::atomic<bool> m_isShutdown{false};
+    std::string m_shutdownMsg;
+    mutable std::mutex m_shutdownMutex;
+    ShutdownCallback m_shutdownCallback;
+
+    // Expanded enumerations (fully expanded ranges, e.g. PA0=0, PA1=1, ...)
+    std::map<std::string, std::map<std::string, int>> m_expandedEnums;
+    void expandEnumerations();
+
+    // Resolve pin names in a command string (e.g. "config_digital_out oid=0 pin=PA3" → "... pin=3")
+    std::string resolvePinsInCommand(const std::string& cmd) const;
+
+    // Parse and send a command string like "config_digital_out oid=0 pin=96 value=0"
+    bool sendCommandString(const std::string& cmdStr);
+
+    // Internal: check for shutdown/starting responses and handle them
+    void checkShutdownResponse(const ParsedResponse& resp);
 
     // Internal
     bool sendRawFrame(const std::vector<uint8_t>& payload);

@@ -84,6 +84,45 @@ int main() {
         std::cerr << "get_uptime failed: " << mcu.getLastError() << std::endl;
     }
 
+    // Test: Clock Synchronization
+    std::cout << "\n--- Testing Clock Sync ---" << std::endl;
+    if (mcu.initClockSync()) {
+        auto& cs = mcu.getClockSync();
+        auto dbg = cs.getDebugInfo();
+        std::cout << "Clock Sync OK:" << std::endl;
+        std::cout << "  MCU freq: " << std::fixed << std::setprecision(0) << cs.getMcuFreq() << " Hz" << std::endl;
+        std::cout << "  Estimated freq: " << std::setprecision(1) << dbg.freq << " Hz" << std::endl;
+        std::cout << "  Min half RTT: " << std::setprecision(6) << dbg.minHalfRtt * 1000.0 << " ms" << std::endl;
+        std::cout << "  Last clock: " << dbg.lastClock << std::endl;
+
+        // Test clock sync poll
+        if (mcu.clockSyncPoll()) {
+            dbg = cs.getDebugInfo();
+            std::cout << "  After poll - freq: " << std::setprecision(1) << dbg.freq << " Hz" << std::endl;
+        }
+    }
+    else {
+        std::cerr << "Clock sync failed: " << mcu.getLastError() << std::endl;
+    }
+
+    // Test: Pin Resolution
+    std::cout << "\n--- Testing Pin Resolution ---" << std::endl;
+    std::vector<std::string> testPins = {"PA0", "PA15", "PB0", "PC5", "PD0", "PD5", "PE0", "ADC_TEMPERATURE"};
+    for (auto& pin : testPins) {
+        int num = mcu.resolvePin(pin);
+        std::cout << "  " << pin << " = " << num << std::endl;
+    }
+
+    // Test: Enum Resolution
+    std::cout << "\n--- Testing Enum Resolution ---" << std::endl;
+    std::cout << "  spi_bus spi0 = " << mcu.resolveEnum("spi_bus", "spi0") << std::endl;
+    std::cout << "  i2c_bus twihs0 = " << mcu.resolveEnum("i2c_bus", "twihs0") << std::endl;
+
+    // Test: Shutdown detection (register callback)
+    mcu.setShutdownCallback([](const std::string& reason) {
+        std::cerr << "*** SHUTDOWN CALLBACK: " << reason << " ***" << std::endl;
+    });
+
     std::cout << "\n=== Done ===" << std::endl;
     mcu.disconnect();
     return 0;

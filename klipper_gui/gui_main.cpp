@@ -44,6 +44,10 @@ private:
     std::mutex m_logMutex;
     std::queue<LogEntry> m_logQueue;
 
+    // Clock sync polling
+    std::atomic<bool> m_clockSyncRunning{false};
+    std::thread m_clockSyncThread;
+
     // UI Controls
     wxTextCtrl* m_logText = nullptr;
     wxButton* m_btnConnect = nullptr;
@@ -57,6 +61,7 @@ private:
     wxTextCtrl* m_pinNumCtrl = nullptr;
     wxChoice* m_pinValueCtrl = nullptr;
     wxStaticText* m_statusLabel = nullptr;
+    wxStaticText* m_clockSyncLabel = nullptr;
     wxListCtrl* m_cmdList = nullptr;
     wxListCtrl* m_respList = nullptr;
     wxTimer m_uiTimer;
@@ -83,6 +88,10 @@ private:
     void StopPolling();
     void StartPolling();
     void PollThread();
+
+    void StopClockSync();
+    void StartClockSync();
+    void ClockSyncThread();
 
     void PopulateCommandList();
     void PopulateResponseList();
@@ -147,6 +156,12 @@ void KlipperFrame::CreateUI() {
     statusFont.SetWeight(wxFONTWEIGHT_BOLD);
     m_statusLabel->SetFont(statusFont);
     mainSizer->Add(m_statusLabel, 0, wxALL | wxEXPAND, 5);
+
+    // Clock sync status
+    m_clockSyncLabel = new wxStaticText(mainPanel, wxID_ANY, "Clock Sync: inactive");
+    m_clockSyncLabel->SetForegroundColour(wxColour(80, 80, 80));
+    m_clockSyncLabel->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+    mainSizer->Add(m_clockSyncLabel, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 5);
 
     // Top toolbar
     auto* toolSizer = new wxBoxSizer(wxHORIZONTAL);
@@ -252,16 +267,37 @@ void KlipperFrame::LogFromThread(const wxString& msg, const wxColour& color) {
 
 void KlipperFrame::OnUITimer(wxTimerEvent&) {
     // Process log messages from other threads
-    std::lock_guard<std::mutex> lock(m_logMutex);
-    while (!m_logQueue.empty()) {
-        auto& entry = m_logQueue.front();
-        Log(entry.text, entry.color);
-        m_logQueue.pop();
+    {
+        std::lock_guard<std::mutex> lock(m_logMutex);
+        while (!m_logQueue.empty()) {
+            auto& entry = m_logQueue.front();
+            Log(entry.text, entry.color);
+            m_logQueue.pop();
+        }
+    }
+
+    // Update clock sync display
+    if (m_connected && m_clockSyncRunning) {
+        auto info = m_mcu.getClockSync().getDebugInfo();
+        m_clockSyncLabel->SetLabel(wxString::Format(
+            "Clock Sync: freq=%.0f Hz | RTT=%.3f ms | clock=%lld | var=%.1f",
+            info.freq, info.minHalfRtt * 2000.0, info.lastClock, info.predictionVariance));
+        m_clockSyncLabel->SetForegroundColour(wxColour(0, 100, 0));
+    } else if (!m_connected) {
+        m_clockSyncLabel->SetLabel("Clock Sync: inactive");
+        m_clockSyncLabel->SetForegroundColour(wxColour(80, 80, 80));
+    }
+
+    // Check shutdown state
+    if (m_connected && m_mcu.isShutdown()) {
+        m_statusLabel->SetLabel(wxString::Format("Status: MCU SHUTDOWN - %s", m_mcu.getShutdownMsg()));
+        m_statusLabel->SetForegroundColour(*wxRED);
     }
 }
 
 void KlipperFrame::OnConnect(wxCommandEvent&) {
     if (m_connected) {
+        StopClockSync();
         StopPolling();
         m_mcu.disconnect();
         m_connected = false;
@@ -326,6 +362,22 @@ void KlipperFrame::OnIdentify(wxCommandEvent&) {
         m_btnReset->Enable(true);
 
         StartPolling();
+
+        // Initialize clock sync
+        Log("Initializing clock synchronization...");
+        if (m_mcu.initClockSync()) {
+            auto info = m_mcu.getClockSync().getDebugInfo();
+            Log(wxString::Format("Clock sync initialized: freq=%.0f Hz, RTT=%.3f ms",
+                info.freq, info.minHalfRtt * 2000.0), wxColour(0, 128, 0));
+            StartClockSync();
+        } else {
+            Log("Clock sync init failed: " + wxString(m_mcu.getLastError()), *wxRED);
+        }
+
+        // Register shutdown callback
+        m_mcu.setShutdownCallback([this](const std::string& reason) {
+            LogFromThread(wxString::Format("!!! MCU SHUTDOWN: %s !!!", reason), *wxRED);
+        });
     }
     else {
         Log("Identify failed: " + wxString(m_mcu.getLastError()), *wxRED);
@@ -524,7 +576,32 @@ void KlipperFrame::PollThread() {
     }
 }
 
+void KlipperFrame::StartClockSync() {
+    if (m_clockSyncRunning) return;
+    m_clockSyncRunning = true;
+    m_clockSyncThread = std::thread(&KlipperFrame::ClockSyncThread, this);
+}
+
+void KlipperFrame::StopClockSync() {
+    m_clockSyncRunning = false;
+    if (m_clockSyncThread.joinable()) {
+        m_clockSyncThread.join();
+    }
+}
+
+void KlipperFrame::ClockSyncThread() {
+    while (m_clockSyncRunning && m_connected) {
+        {
+            std::lock_guard<std::mutex> lock(m_mcuMutex);
+            m_mcu.clockSyncPoll();
+        }
+        // Poll at ~1 Hz (matching Klipper's QUERY_FREQ)
+        std::this_thread::sleep_for(std::chrono::milliseconds(984));
+    }
+}
+
 void KlipperFrame::OnClose(wxCloseEvent& evt) {
+    StopClockSync();
     StopPolling();
     m_mcu.disconnect();
     evt.Skip();
