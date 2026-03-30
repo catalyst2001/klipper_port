@@ -766,6 +766,35 @@ bool KlipperMCU::finalizeConfig() {
     // Step 5: Append finalize_config
     cfgCmds.push_back("finalize_config crc=" + std::to_string(configCrc));
 
+    // Step 5.5: Update stale clock values in restart/init commands.
+    // Commands like queue_digital_out, queue_pwm_out, query_analog_in contain
+    // clock=<value> that was computed at buildConfig() time. By now the MCU clock
+    // has advanced, so we must replace with a fresh future value.
+    {
+        std::map<std::string, int64_t> clkP;
+        std::map<std::string, std::vector<uint8_t>> clkBufP;
+        if (sendWithResponse("get_clock", "clock", clkP, clkBufP, {}, {}, 3000)) {
+            uint32_t now32 = static_cast<uint32_t>(clkP["clock"]);
+            // Schedule 250ms in the future, stagger each by 10ms
+            uint32_t offsetTicks = static_cast<uint32_t>(secondsToClock(0.25));
+            uint32_t staggerTicks = static_cast<uint32_t>(secondsToClock(0.01));
+            uint32_t nextClock = now32 + offsetTicks;
+
+            auto updateClock = [&](std::string& cmd) {
+                const std::string token = "clock=";
+                size_t pos = cmd.find(token);
+                if (pos == std::string::npos) return;
+                size_t numStart = pos + token.length();
+                size_t numEnd = cmd.find_first_of(" \t\n", numStart);
+                if (numEnd == std::string::npos) numEnd = cmd.length();
+                cmd.replace(numStart, numEnd - numStart, std::to_string(nextClock));
+                nextClock += staggerTicks;
+            };
+            for (auto& cmd : rstCmds)  updateClock(cmd);
+            for (auto& cmd : initCmds) updateClock(cmd);
+        }
+    }
+
     // Step 6: Determine which commands to send
     std::vector<std::string> cmdsToSend;
     if (!isConfig) {
