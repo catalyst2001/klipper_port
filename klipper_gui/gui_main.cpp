@@ -668,18 +668,19 @@ void KlipperFrame::OnIdentify(wxCommandEvent&) {
 
         m_btnLoadConfig->Enable(true);
 
-        StartPolling();
-
-        // Initialize clock sync
+        // Initialize clock sync BEFORE starting poll thread
+        // (poll thread would steal get_clock responses via processIncoming)
         Log("Initializing clock synchronization...");
         if (m_mcu.initClockSync()) {
             auto info = m_mcu.getClockSync().getDebugInfo();
             Log(wxString::Format("Clock sync initialized: freq=%.0f Hz, RTT=%.3f ms",
                 info.freq, info.minHalfRtt * 2000.0), wxColour(0, 128, 0));
-            StartClockSync();
         } else {
             Log("Clock sync init failed: " + wxString(m_mcu.getLastError()), *wxRED);
         }
+
+        StartPolling();
+        StartClockSync();
 
         // Register shutdown callback
         m_mcu.setShutdownCallback([this](const std::string& reason) {
@@ -1006,6 +1007,16 @@ void KlipperFrame::OnFinalizeConfig(wxCommandEvent&) {
     std::lock_guard<std::mutex> lock(m_mcuMutex);
     if (m_mcu.finalizeConfig()) {
         Log(wxString::Format("Config finalized! OIDs=%d", m_mcu.getOidCount()), wxColour(0, 128, 0));
+
+        // Re-initialize clock sync (may have been invalidated by MCU reset during finalization)
+        if (m_mcu.initClockSync()) {
+            auto csInfo = m_mcu.getClockSync().getDebugInfo();
+            Log(wxString::Format("Clock sync re-initialized: freq=%.0f Hz, RTT=%.3f ms",
+                csInfo.freq, csInfo.minHalfRtt * 2000.0), wxColour(0, 128, 0));
+        } else {
+            Log("Clock sync re-init failed (non-fatal): " + wxString(m_mcu.getLastError()),
+                wxColour(200, 100, 0));
+        }
 
         // Update GPIO list status
         for (int i = 0; i < m_gpioList->GetItemCount(); i++) {

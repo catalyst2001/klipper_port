@@ -26,14 +26,28 @@ bool ClockSync::connect(KlipperMCU& mcu) {
         return false;
     }
 
-    // Step 1: get_uptime to get initial 64-bit clock
+    // Step 1: get_uptime to get initial 64-bit clock (with retry)
     std::map<std::string, int64_t> intP;
     std::map<std::string, std::vector<uint8_t>> bufP;
-    double sentTime = hostTime();
-    if (!mcu.sendWithResponse("get_uptime", "uptime", intP, bufP)) {
+    double sentTime = 0, recvTime = 0;
+    bool gotUptime = false;
+    for (int retry = 0; retry < 3 && !gotUptime; retry++) {
+        if (retry > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // Drain any stale data
+            mcu.processIncoming(50);
+        }
+        sentTime = hostTime();
+        intP.clear();
+        bufP.clear();
+        if (mcu.sendWithResponse("get_uptime", "uptime", intP, bufP, {}, {}, 3000)) {
+            gotUptime = true;
+        }
+    }
+    if (!gotUptime) {
         return false;
     }
-    double recvTime = hostTime();
+    recvTime = hostTime();
 
     uint32_t high = static_cast<uint32_t>(intP["high"]);
     uint32_t clk = static_cast<uint32_t>(intP["clock"]);
@@ -46,6 +60,7 @@ bool ClockSync::connect(KlipperMCU& mcu) {
     m_predictionVariance = (0.001 * m_mcuFreq) * (0.001 * m_mcuFreq);
 
     // Step 2: Send 8 get_clock calls at 50ms intervals to seed regression
+    int successCount = 0;
     for (int i = 0; i < 8; i++) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -54,13 +69,27 @@ bool ClockSync::connect(KlipperMCU& mcu) {
         sentTime = hostTime();
         intP.clear();
         bufP.clear();
-        if (!mcu.sendWithResponse("get_clock", "clock", intP, bufP)) {
-            return false;
+        if (!mcu.sendWithResponse("get_clock", "clock", intP, bufP, {}, {}, 3000)) {
+            // Retry once on failure
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            mcu.processIncoming(50);
+            sentTime = hostTime();
+            intP.clear();
+            bufP.clear();
+            if (!mcu.sendWithResponse("get_clock", "clock", intP, bufP, {}, {}, 3000)) {
+                continue;  // Skip this sample instead of aborting
+            }
         }
         recvTime = hostTime();
 
         uint32_t clock32 = static_cast<uint32_t>(intP["clock"]);
         handleClockResponse(clock32, sentTime, recvTime);
+        successCount++;
+    }
+
+    if (successCount < 4) {
+        std::cout << "[ClockSync] Only got " << successCount << "/8 clock samples, failing" << std::endl;
+        return false;
     }
 
     std::cout << "[ClockSync] Initialized: freq=" << std::fixed
