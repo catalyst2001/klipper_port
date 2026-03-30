@@ -81,7 +81,12 @@ bool MCU_stepper::resetStepClock(int64_t clock) {
         {"oid", m_oid},
         {"clock", static_cast<int64_t>(static_cast<uint32_t>(clock))}
     };
-    return m_mcu.sendCommand("reset_step_clock", params);
+    bool ok = m_mcu.sendCommand("reset_step_clock", params);
+    if (ok) {
+        m_lastStepClock = clock;
+        m_clockInitialized = true;
+    }
+    return ok;
 }
 
 // ========== MCU_endstop ==========

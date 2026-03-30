@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <thread>
+#include <chrono>
 
 // ========== ToolHead ==========
 
@@ -155,9 +157,14 @@ void ToolHead::generateAxisSteps(int axis, const TrapMove& tm, bool needsReset) 
 
     double mcuFreq = m_mcu.getClockSync().getMcuFreq();
 
-    // Calculate total axis distance for this trap move
-    double totalDist = std::abs(axisR) *
-        (tm.start_v * tm.move_t + tm.half_accel * tm.move_t * tm.move_t);
+    // Axis-projected kinematic parameters
+    double v0 = std::abs(axisR) * tm.start_v;        // start velocity on this axis (mm/s)
+    double accel = std::abs(axisR) * 2.0 * tm.half_accel; // acceleration on this axis (mm/s²)
+
+    // Total axis distance for this phase
+    double totalDist = v0 * tm.move_t + 0.5 * accel * tm.move_t * tm.move_t;
+    if (totalDist < stepDist * 0.5) return;
+
     int numSteps = static_cast<int>(totalDist / stepDist + 0.5);
     if (numSteps <= 0) return;
 
@@ -165,50 +172,132 @@ void ToolHead::generateAxisSteps(int axis, const TrapMove& tm, bool needsReset) 
     bool forward = (axisR > 0);
     stepper->setNextStepDir(forward);
 
-    // Only reset step clock for the first phase; subsequent phases
-    // continue from the MCU's internal step clock position
+    // Absolute MCU clock at TrapMove start
+    int64_t tmStartClock = m_mcu.getClockSync().printTimeToClock(tm.print_time);
+
+    // Reset step clock if this is the first phase for this axis in this batch
     if (needsReset) {
-        int64_t startClock = m_mcu.getClockSync().printTimeToClock(tm.print_time);
-        stepper->resetStepClock(startClock);
+        stepper->resetStepClock(tmStartClock);
     }
 
-    if (std::abs(tm.half_accel) < 0.000001) {
-        // Constant velocity: uniform step intervals
-        double velocity = std::abs(axisR) * tm.start_v;
-        if (velocity < 0.001) return;
-        int64_t interval = static_cast<int64_t>(mcuFreq * stepDist / velocity);
-        if (interval < 1) interval = 1;
-        stepper->queueStep(interval, numSteps, 0);
+    // === Compute exact step times using kinematic equations ===
+    // Position along axis: p(t) = v0*t + 0.5*accel*t²
+    // Step n occurs when p(t_n) = (n+1) * stepDist
+    // Solve: t_n = (-v0 + sqrt(v0² + 2*accel*(n+1)*stepDist)) / accel
+    // For constant velocity: t_n = (n+1) * stepDist / v0
+
+    std::vector<int64_t> stepClocks(numSteps);
+
+    if (std::abs(accel) < 1e-6) {
+        // Constant velocity phase
+        double invV = 1.0 / std::max(v0, 1e-6);
+        for (int i = 0; i < numSteps; i++) {
+            double t = (i + 1) * stepDist * invV;
+            stepClocks[i] = tmStartClock + static_cast<int64_t>(t * mcuFreq + 0.5);
+        }
     } else {
-        // Accelerating/decelerating: use itersolve-like approach
-        // Step times computed using the secant method, but for queue_step
-        // we approximate with interval + add (linear interpolation)
-        double velocity_start = std::abs(axisR) * tm.start_v;
-        double velocity_end = std::abs(axisR) * tm.getVelocity(tm.move_t);
+        // Accelerating or decelerating phase
+        double v0sq = v0 * v0;
+        double inv_a = 1.0 / accel;
+        for (int i = 0; i < numSteps; i++) {
+            double pos = (i + 1) * stepDist;
+            double disc = v0sq + 2.0 * accel * pos;
+            if (disc < 0) {
+                // Deceleration: ran out of distance (rounding at boundary)
+                numSteps = i;
+                break;
+            }
+            double t = (-v0 + std::sqrt(disc)) * inv_a;
+            stepClocks[i] = tmStartClock + static_cast<int64_t>(t * mcuFreq + 0.5);
+        }
+        if (numSteps <= 0) return;
+    }
 
-        // Avoid division by zero
-        if (velocity_start < 0.001) velocity_start = 0.001;
-        if (velocity_end < 0.001) velocity_end = 0.001;
+    // === Compress step clocks into queue_step(interval, count, add) commands ===
+    // MCU constraints: interval is uint32 (practical max ~0x3FFFFFFF),
+    //                  count is uint16 (max 65535),
+    //                  add is int16 (range [-32768, 32767])
 
-        int64_t interval_start = static_cast<int64_t>(mcuFreq * stepDist / velocity_start);
-        int64_t interval_end = static_cast<int64_t>(mcuFreq * stepDist / velocity_end);
+    int64_t mcuClockPos = needsReset ? tmStartClock : stepper->getLastStepClock();
 
-        if (interval_start < 1) interval_start = 1;
-        if (interval_end < 1) interval_end = 1;
+    int pos = 0;
+    while (pos < numSteps) {
+        int64_t firstInterval = stepClocks[pos] - mcuClockPos;
+        if (firstInterval < 1) firstInterval = 1;
 
-        // add = (interval_end - interval_start) / (numSteps - 1)
-        int64_t add = 0;
-        if (numSteps > 1) {
-            add = (interval_end - interval_start) / (numSteps - 1);
+        if (pos + 1 >= numSteps) {
+            // Single step remaining
+            stepper->queueStep(firstInterval, 1, 0);
+            mcuClockPos += firstInterval;
+            pos++;
+            continue;
         }
 
-        stepper->queueStep(interval_start, numSteps, add);
+        // Compute add from first two step intervals
+        int64_t secondInterval = stepClocks[pos + 1] - stepClocks[pos];
+        if (secondInterval < 1) secondInterval = 1;
+        int64_t add64 = secondInterval - firstInterval;
+
+        // Clamp to int16 range
+        int16_t add = static_cast<int16_t>(
+            std::clamp(add64, (int64_t)-32768, (int64_t)32767));
+
+        // Extend batch: keep adding steps while model (interval + add*i) stays accurate
+        int count = 1;
+        int64_t modelClock = mcuClockPos + firstInterval;
+
+        while (pos + count < numSteps && count < 65535) {
+            int64_t modelInterval = firstInterval + (int64_t)add * count;
+            if (modelInterval < 1) break;
+
+            int64_t modelNext = modelClock + modelInterval;
+            int64_t actualClock = stepClocks[pos + count];
+            int64_t error = std::abs(modelNext - actualClock);
+
+            // Tolerance: allow up to 1/8 of interval or 300 ticks (1µs), whichever is larger
+            int64_t tolerance = std::max((int64_t)300, modelInterval / 8);
+            if (error > tolerance) break;
+
+            modelClock = modelNext;
+            count++;
+        }
+
+        stepper->queueStep(firstInterval, count, add);
+
+        // Advance MCU clock by the exact model time
+        // sum of intervals = count*firstInterval + count*(count-1)/2 * add
+        mcuClockPos += (int64_t)count * firstInterval
+                     + (int64_t)count * (count - 1) / 2 * (int64_t)add;
+        pos += count;
     }
+
+    // Track where the stepper's clock ended up (for next TrapMove continuation)
+    stepper->setLastStepClock(mcuClockPos);
 }
 
 bool ToolHead::generateSteps() {
     auto trapMoves = m_trapq.getAndClear();
     if (trapMoves.empty()) return true;
+
+    // Safety: ensure steppers are idle before we attempt reset_step_clock.
+    // If previous steps are still executing on the MCU, wait for them.
+    for (int axis = 0; axis < 3; ++axis) {
+        MCU_stepper* stepper = m_steppers[axis];
+        if (!stepper || !stepper->isClockInitialized()) continue;
+
+        int64_t lastClock = stepper->getLastStepClock();
+        int64_t nowClock = m_mcu.getClockSync().printTimeToClock(
+            m_mcu.getClockSync().estimatedPrintTime());
+
+        if (lastClock > nowClock) {
+            // Stepper may still be active — wait for steps to complete
+            double waitSec = static_cast<double>(lastClock - nowClock) / m_mcu.getClockSync().getMcuFreq();
+            if (waitSec > 0 && waitSec < 2.0) {
+                int waitMs = static_cast<int>(waitSec * 1000) + 20; // +20ms safety margin
+                std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+            }
+        }
+    }
 
     // Track whether each axis stepper has been reset for this batch.
     // Only the first TrapMove that moves a given axis should call

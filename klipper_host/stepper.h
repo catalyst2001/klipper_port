@@ -43,6 +43,11 @@ public:
     void setCommandedPosition(int64_t pos) { m_commandedPos = pos; }
     bool getCurrentDir() const { return m_curDir; }
 
+    // Step clock tracking for inter-move continuity
+    int64_t getLastStepClock() const { return m_lastStepClock; }
+    void setLastStepClock(int64_t clock) { m_lastStepClock = clock; m_clockInitialized = true; }
+    bool isClockInitialized() const { return m_clockInitialized; }
+
 private:
     KlipperMCU& m_mcu;
     std::string m_stepPin;
@@ -53,6 +58,8 @@ private:
     double m_stepDist = 0.0;  // mm per step
     int64_t m_commandedPos = 0;
     bool m_curDir = true;
+    int64_t m_lastStepClock = 0;  // absolute clock of last queued step
+    bool m_clockInitialized = false;
 };
 
 // MCU_endstop: OID-based endstop with trsync support for homing.
