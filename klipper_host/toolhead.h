@@ -84,5 +84,6 @@ private:
     void lookaheadFlush(bool forceFlush);
 
     // Generate steps for a single axis from a TrapMove
-    void generateAxisSteps(int axis, const TrapMove& tm);
+    // needsReset: if true, send reset_step_clock before queue_step
+    void generateAxisSteps(int axis, const TrapMove& tm, bool needsReset);
 };

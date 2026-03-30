@@ -137,7 +137,7 @@ void ToolHead::lookaheadFlush(bool forceFlush) {
     m_queue.clear();
 }
 
-void ToolHead::generateAxisSteps(int axis, const TrapMove& tm) {
+void ToolHead::generateAxisSteps(int axis, const TrapMove& tm, bool needsReset) {
     MCU_stepper* stepper = m_steppers[axis];
     if (!stepper) return;
 
@@ -165,9 +165,12 @@ void ToolHead::generateAxisSteps(int axis, const TrapMove& tm) {
     bool forward = (axisR > 0);
     stepper->setNextStepDir(forward);
 
-    // Reset step clock to the start of this move
-    int64_t startClock = m_mcu.getClockSync().printTimeToClock(tm.print_time);
-    stepper->resetStepClock(startClock);
+    // Only reset step clock for the first phase; subsequent phases
+    // continue from the MCU's internal step clock position
+    if (needsReset) {
+        int64_t startClock = m_mcu.getClockSync().printTimeToClock(tm.print_time);
+        stepper->resetStepClock(startClock);
+    }
 
     if (std::abs(tm.half_accel) < 0.000001) {
         // Constant velocity: uniform step intervals
@@ -207,9 +210,25 @@ bool ToolHead::generateSteps() {
     auto trapMoves = m_trapq.getAndClear();
     if (trapMoves.empty()) return true;
 
+    // Track whether each axis stepper has been reset for this batch.
+    // Only the first TrapMove that moves a given axis should call
+    // resetStepClock; subsequent phases continue from where queue_step
+    // left off (MCU auto-advances its internal step clock).
+    bool axisReset[3] = {false, false, false};
+
     for (auto& tm : trapMoves) {
         for (int axis = 0; axis < 3; ++axis) {
-            generateAxisSteps(axis, tm);
+            generateAxisSteps(axis, tm, !axisReset[axis]);
+            // Mark axis as reset if this TrapMove actually had motion on it
+            double axisR = 0;
+            switch (axis) {
+                case 0: axisR = tm.axes_r.x; break;
+                case 1: axisR = tm.axes_r.y; break;
+                case 2: axisR = tm.axes_r.z; break;
+            }
+            if (std::abs(axisR) > 0.000000001) {
+                axisReset[axis] = true;
+            }
         }
     }
 
