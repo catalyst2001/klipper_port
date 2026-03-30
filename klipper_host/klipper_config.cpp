@@ -285,7 +285,7 @@ ConfigResult KlipperConfig::buildObjects(KlipperMCU& mcu,
 
                 auto pwm = std::make_unique<MCU_pwm>(mcu);
                 pwm->setupPin(pin, inv);
-                pwm->setupCycleTime(0.100, true);
+                pwm->setupCycleTime(0.100, false);  // software PWM for heaters
                 pwm->setupMaxDuration(5.0);
                 pwm->setupStartValue(0.0, 0.0);
                 pwm->buildConfig();
@@ -319,7 +319,7 @@ ConfigResult KlipperConfig::buildObjects(KlipperMCU& mcu,
 
                 auto pwm = std::make_unique<MCU_pwm>(mcu);
                 pwm->setupPin(pin, inv);
-                pwm->setupCycleTime(0.100, true);
+                pwm->setupCycleTime(0.100, false);  // software PWM for heaters
                 pwm->setupMaxDuration(10.0);
                 pwm->setupStartValue(0.0, 0.0);
                 pwm->buildConfig();

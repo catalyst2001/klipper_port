@@ -714,7 +714,7 @@ bool KlipperMCU::finalizeConfig() {
     // Step 7: Send all commands
     for (auto& cmd : cmdsToSend) {
         if (!sendCommandString(cmd)) {
-            m_lastError = "Failed to send config command: " + cmd;
+            m_lastError = "Failed to send config command: " + cmd + " (" + m_lastError + ")";
             return false;
         }
     }
