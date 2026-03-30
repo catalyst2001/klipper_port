@@ -674,25 +674,56 @@ bool KlipperMCU::finalizeConfig() {
         }
 
         // Wait for MCU to reboot
-        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
 
-        // Purge stale data
+        // Reopen serial port (DTR toggle + purge, like initial connect)
+        m_serial.setDTR(false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        m_serial.setDTR(true);
+        m_serial.setRTS(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
         m_serial.purge();
         uint8_t dumpBuf[4096];
-        m_serial.read(dumpBuf, sizeof(dumpBuf), 200);
+        m_serial.read(dumpBuf, sizeof(dumpBuf), 300);
 
-        // Re-sync sequence numbers (MCU resets to seq 0 after reboot)
-        m_sendSeq = 0;
         m_needSync = true;
         m_recvBuf.clear();
 
-        // Re-query config
-        configParams.clear();
-        bufP.clear();
-        if (!sendWithResponse("get_config", "config", configParams, bufP, {}, {}, 5000)) {
-            m_lastError = "Failed to query MCU config after reset";
+        // Scan for correct sequence number (MCU may be at any seq after reboot)
+        bool seqSynced = false;
+        auto getCfgIt = m_commands.find("get_config");
+        if (getCfgIt == m_commands.end()) {
+            m_lastError = "get_config command not found after reset";
             return false;
         }
+
+        std::vector<uint8_t> probe = encodeCommand(getCfgIt->second, {}, {});
+
+        std::cout << "[KlipperMCU] Scanning for sequence number after reset..." << std::endl;
+        for (int seqTry = 0; seqTry < 16 && !seqSynced; seqTry++) {
+            m_sendSeq = static_cast<uint8_t>(seqTry);
+
+            auto frame = build_message_frame(m_sendSeq, probe);
+            m_sendSeq = (m_sendSeq + 1) & MESSAGE_SEQ_MASK;
+
+            m_serial.write(frame.data(), static_cast<int>(frame.size()));
+
+            auto responses = processIncoming(80);
+            for (auto& resp : responses) {
+                if (resp.name == "config") {
+                    configParams = std::move(resp.intParams);
+                    seqSynced = true;
+                    std::cout << "[KlipperMCU] Sequence synced at seq=" << seqTry << std::endl;
+                    break;
+                }
+            }
+        }
+
+        if (!seqSynced) {
+            m_lastError = "Failed to re-sync with MCU after reset (tried all 16 sequences)";
+            return false;
+        }
+
         isConfig = configParams["is_config"] != 0;
         mcuCrc = static_cast<uint32_t>(configParams["crc"]);
 
