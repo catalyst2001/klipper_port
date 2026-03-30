@@ -658,13 +658,44 @@ bool KlipperMCU::finalizeConfig() {
         return false;
     }
 
-    // Step 2: Prepare config commands
+    // Step 1.5: If MCU is not configured but has stale state (move_count > 0
+    // or previous partial config), firmware restart to clear it
+    if (!isConfig && configParams.count("move_count") && configParams["move_count"] > 0) {
+        std::cout << "[KlipperMCU] Stale MCU state detected (move_count="
+                  << configParams["move_count"] << "), restarting firmware..." << std::endl;
+        firmwareRestart();
+
+        // Wait for MCU to come back
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+
+        // Reconnect
+        if (!m_serial.isOpen()) {
+            m_lastError = "MCU disconnected after firmware restart";
+            return false;
+        }
+
+        // Re-query
+        configParams.clear();
+        bufP.clear();
+        if (!sendWithResponse("get_config", "config", configParams, bufP)) {
+            m_lastError = "Failed to query MCU config after restart";
+            return false;
+        }
+        isConfig = configParams["is_config"] != 0;
+        mcuCrc = static_cast<uint32_t>(configParams["crc"]);
+    }
+
+    // Step 2: Prepare config commands (work on copies to allow retry)
+    std::vector<std::string> cfgCmds = m_configCmds;
+    std::vector<std::string> rstCmds = m_restartCmds;
+    std::vector<std::string> initCmds = m_initCmds;
+
     // Prepend allocate_oids as first config command
-    m_configCmds.insert(m_configCmds.begin(),
+    cfgCmds.insert(cfgCmds.begin(),
         "allocate_oids count=" + std::to_string(m_oidCount));
 
     // Step 3: Resolve pin names in all command lists
-    for (auto* cmdList : {&m_configCmds, &m_restartCmds, &m_initCmds}) {
+    for (auto* cmdList : {&cfgCmds, &rstCmds, &initCmds}) {
         for (auto& cmd : *cmdList) {
             cmd = resolvePinsInCommand(cmd);
         }
@@ -672,9 +703,9 @@ bool KlipperMCU::finalizeConfig() {
 
     // Step 4: Calculate CRC of config commands
     std::string configStr;
-    for (size_t i = 0; i < m_configCmds.size(); i++) {
+    for (size_t i = 0; i < cfgCmds.size(); i++) {
         if (i > 0) configStr += '\n';
-        configStr += m_configCmds[i];
+        configStr += cfgCmds[i];
     }
     // Use zlib CRC32 (same as Python's zlib.crc32)
     uint32_t configCrc = static_cast<uint32_t>(
@@ -683,14 +714,14 @@ bool KlipperMCU::finalizeConfig() {
                   configStr.size()));
 
     // Step 5: Append finalize_config
-    m_configCmds.push_back("finalize_config crc=" + std::to_string(configCrc));
+    cfgCmds.push_back("finalize_config crc=" + std::to_string(configCrc));
 
     // Step 6: Determine which commands to send
     std::vector<std::string> cmdsToSend;
     if (!isConfig) {
         // MCU not configured → send full config + init
-        cmdsToSend.insert(cmdsToSend.end(), m_configCmds.begin(), m_configCmds.end());
-        cmdsToSend.insert(cmdsToSend.end(), m_initCmds.begin(), m_initCmds.end());
+        cmdsToSend.insert(cmdsToSend.end(), cfgCmds.begin(), cfgCmds.end());
+        cmdsToSend.insert(cmdsToSend.end(), initCmds.begin(), initCmds.end());
         std::cout << "[KlipperMCU] Sending printer configuration (" 
                   << cmdsToSend.size() << " commands)..." << std::endl;
     }
@@ -701,12 +732,12 @@ bool KlipperMCU::finalizeConfig() {
             std::cout << "[KlipperMCU] CRC mismatch (host=" << configCrc 
                       << " mcu=" << mcuCrc << "), attempting restart..." << std::endl;
             firmwareRestart();
-            m_lastError = "MCU CRC mismatch, firmware restart issued";
+            m_lastError = "MCU CRC mismatch, firmware restart issued. Try again.";
             return false;
         }
         // CRC matches → send restart + init commands only
-        cmdsToSend.insert(cmdsToSend.end(), m_restartCmds.begin(), m_restartCmds.end());
-        cmdsToSend.insert(cmdsToSend.end(), m_initCmds.begin(), m_initCmds.end());
+        cmdsToSend.insert(cmdsToSend.end(), rstCmds.begin(), rstCmds.end());
+        cmdsToSend.insert(cmdsToSend.end(), initCmds.begin(), initCmds.end());
         std::cout << "[KlipperMCU] MCU already configured (CRC match), sending " 
                   << cmdsToSend.size() << " restart/init commands..." << std::endl;
     }
