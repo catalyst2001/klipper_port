@@ -18,6 +18,9 @@
 #include "../klipper_host/stepper.h"
 #include "../klipper_host/toolhead.h"
 #include "../klipper_host/gcode.h"
+#include "../klipper_host/klipper_config.h"
+
+#include <wx/filedlg.h>
 
 #include <memory>
 
@@ -123,6 +126,11 @@ private:
     wxButton* m_btnHomeAll = nullptr;
     wxStaticText* m_motionStatus = nullptr;
 
+    // Config loading
+    wxButton* m_btnLoadConfig = nullptr;
+    wxStaticText* m_configPathLabel = nullptr;
+    std::unique_ptr<ConfigResult> m_configResult;
+
     // Pin management
     int m_nextOid = 0;
 
@@ -162,6 +170,7 @@ private:
     void OnAddStepper(wxCommandEvent& evt);
     void OnSendGcode(wxCommandEvent& evt);
     void OnHomeAll(wxCommandEvent& evt);
+    void OnLoadConfig(wxCommandEvent& evt);
 };
 
 // ---- App Implementation ----
@@ -193,6 +202,7 @@ enum {
     ID_ADD_STEPPER,
     ID_SEND_GCODE,
     ID_HOME_ALL,
+    ID_LOAD_CONFIG,
 };
 
 KlipperFrame::KlipperFrame()
@@ -218,6 +228,7 @@ KlipperFrame::KlipperFrame()
     Bind(wxEVT_BUTTON, &KlipperFrame::OnAddStepper, this, ID_ADD_STEPPER);
     Bind(wxEVT_BUTTON, &KlipperFrame::OnSendGcode, this, ID_SEND_GCODE);
     Bind(wxEVT_BUTTON, &KlipperFrame::OnHomeAll, this, ID_HOME_ALL);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnLoadConfig, this, ID_LOAD_CONFIG);
     Bind(wxEVT_TIMER, &KlipperFrame::OnUITimer, this, ID_UI_TIMER);
     Bind(wxEVT_CLOSE_WINDOW, &KlipperFrame::OnClose, this);
 
@@ -259,8 +270,11 @@ void KlipperFrame::CreateUI() {
     m_btnEmergencyStop->SetForegroundColour(*wxWHITE);
     m_btnReset = new wxButton(mainPanel, ID_RESET, "Reset MCU");
 
+    m_btnLoadConfig = new wxButton(mainPanel, ID_LOAD_CONFIG, "Load Config...");
+
     toolSizer->Add(m_btnConnect, 0, wxALL, 3);
     toolSizer->Add(m_btnIdentify, 0, wxALL, 3);
+    toolSizer->Add(m_btnLoadConfig, 0, wxALL, 3);
     toolSizer->Add(m_btnGetClock, 0, wxALL, 3);
     toolSizer->Add(m_btnGetUptime, 0, wxALL, 3);
     toolSizer->Add(m_btnGetConfig, 0, wxALL, 3);
@@ -268,6 +282,11 @@ void KlipperFrame::CreateUI() {
     toolSizer->Add(m_btnReset, 0, wxALL, 3);
     toolSizer->Add(m_btnEmergencyStop, 0, wxALL, 3);
     mainSizer->Add(toolSizer, 0, wxEXPAND);
+
+    // Config path label
+    m_configPathLabel = new wxStaticText(mainPanel, wxID_ANY, "Config: (none)");
+    m_configPathLabel->SetForegroundColour(wxColour(80, 80, 80));
+    mainSizer->Add(m_configPathLabel, 0, wxLEFT | wxRIGHT | wxEXPAND, 5);
 
     // Pin control row
     auto* pinSizer = new wxBoxSizer(wxHORIZONTAL);
@@ -476,6 +495,7 @@ void KlipperFrame::CreateUI() {
     m_btnAddStepper->Enable(false);
     m_btnSendGcode->Enable(false);
     m_btnHomeAll->Enable(false);
+    m_btnLoadConfig->Enable(false);
 }
 
 void KlipperFrame::Log(const wxString& msg, const wxColour& color) {
@@ -571,6 +591,7 @@ void KlipperFrame::OnConnect(wxCommandEvent&) {
         m_btnAddStepper->Enable(false);
         m_btnSendGcode->Enable(false);
         m_btnHomeAll->Enable(false);
+        m_btnLoadConfig->Enable(false);
         m_cmdList->DeleteAllItems();
         m_respList->DeleteAllItems();
         m_gpioList->DeleteAllItems();
@@ -589,6 +610,8 @@ void KlipperFrame::OnConnect(wxCommandEvent&) {
         m_endstopObjs.clear();
         m_toolhead.reset();
         m_gcode.reset();
+        m_configResult.reset();
+        m_configPathLabel->SetLabel("Config: (none)");
         Log("Disconnected.", *wxRED);
     }
     else {
@@ -642,6 +665,8 @@ void KlipperFrame::OnIdentify(wxCommandEvent&) {
         m_btnAddSpi->Enable(true);
         m_btnAddThermocouple->Enable(true);
         m_btnAddStepper->Enable(true);
+
+        m_btnLoadConfig->Enable(true);
 
         StartPolling();
 
@@ -1005,6 +1030,7 @@ void KlipperFrame::OnFinalizeConfig(wxCommandEvent&) {
         m_btnAddSpi->Enable(false);
         m_btnAddThermocouple->Enable(false);
         m_btnAddStepper->Enable(false);
+        m_btnLoadConfig->Enable(false);
 
         // Update stepper list status
         for (int i = 0; i < m_stepperList->GetItemCount(); i++) {
@@ -1014,9 +1040,17 @@ void KlipperFrame::OnFinalizeConfig(wxCommandEvent&) {
         // Create toolhead + gcode parser after finalization
         if (!m_stepperObjs.empty()) {
             m_toolhead = std::make_unique<ToolHead>(m_mcu);
-            m_toolhead->setMaxVelocity(100);
-            m_toolhead->setMaxAccel(1000);
-            m_toolhead->setSquareCornerVelocity(5.0);
+
+            // Use config settings if loaded, otherwise defaults
+            if (m_configResult) {
+                m_toolhead->setMaxVelocity(m_configResult->maxVelocity);
+                m_toolhead->setMaxAccel(m_configResult->maxAccel);
+                m_toolhead->setSquareCornerVelocity(m_configResult->squareCornerVelocity);
+            } else {
+                m_toolhead->setMaxVelocity(100);
+                m_toolhead->setMaxAccel(1000);
+                m_toolhead->setSquareCornerVelocity(5.0);
+            }
 
             for (size_t i = 0; i < m_stepperObjs.size() && i < 3; ++i) {
                 m_toolhead->addStepper(static_cast<int>(i), m_stepperObjs[i].get());
@@ -1212,6 +1246,120 @@ void KlipperFrame::OnHomeAll(wxCommandEvent&) {
     } else {
         Log(wxString::Format("Homing failed: %s", m_gcode->getLastMessage()), *wxRED);
     }
+}
+
+void KlipperFrame::OnLoadConfig(wxCommandEvent&) {
+    if (!m_connected) return;
+    if (m_mcu.isConfigFinalized()) {
+        Log("Config already finalized. Disconnect and reconnect to load a new config.", *wxRED);
+        return;
+    }
+
+    wxFileDialog dlg(this, "Open Klipper Config", "", "",
+                     "Klipper Config (*.cfg)|*.cfg|All Files (*.*)|*.*",
+                     wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+    if (dlg.ShowModal() == wxID_CANCEL)
+        return;
+
+    std::string path = dlg.GetPath().ToStdString();
+    Log(wxString::Format("Loading config: %s", path), wxColour(0, 0, 160));
+    wxBusyCursor wait;
+
+    std::lock_guard<std::mutex> lock(m_mcuMutex);
+
+    auto result = std::make_unique<ConfigResult>(KlipperConfig::load(m_mcu, path));
+    if (!result->ok()) {
+        Log(wxString::Format("Config load failed: %s", result->lastError), *wxRED);
+        return;
+    }
+
+    // Log warnings
+    for (auto& w : result->warnings) {
+        Log(wxString::Format("  Warning: %s", w), wxColour(200, 100, 0));
+    }
+
+    // Transfer steppers to GUI lists
+    for (auto& si : result->steppers) {
+        if (!si.stepper) continue;
+
+        int row = m_stepperList->GetItemCount();
+        m_stepperList->InsertItem(row, wxString::Format("%d", si.stepper->getOid()));
+        m_stepperList->SetItem(row, 1, si.stepper->getStepPinName());
+        m_stepperList->SetItem(row, 2, si.stepper->getDirPinName());
+        m_stepperList->SetItem(row, 3, wxString::Format("%.5f mm", si.stepper->getStepDist()));
+        m_stepperList->SetItem(row, 4, "pending finalize");
+
+        Log(wxString::Format("  [%s] stepper OID=%d step=%s dir=%s dist=%.5fmm",
+            si.name, si.stepper->getOid(),
+            si.stepper->getStepPinName(), si.stepper->getDirPinName(),
+            si.stepper->getStepDist()), wxColour(0, 128, 0));
+
+        if (si.endstop) {
+            m_endstopObjs.push_back(std::move(si.endstop));
+        }
+        m_stepperObjs.push_back(std::move(si.stepper));
+    }
+
+    // Transfer ADC inputs
+    for (auto& ai : result->adcInputs) {
+        if (!ai.adc) continue;
+
+        size_t adcIdx = m_adcInputs.size();
+        {
+            std::lock_guard<std::mutex> adcLock(m_adcMutex);
+            m_adcReadings.push_back({0.0, 0.0});
+        }
+
+        ai.adc->setupAdcCallback([this, adcIdx](double readTime, double value) {
+            std::lock_guard<std::mutex> adcLock(m_adcMutex);
+            if (adcIdx < m_adcReadings.size()) {
+                m_adcReadings[adcIdx] = {readTime, value};
+            }
+        });
+
+        int row = m_adcList->GetItemCount();
+        m_adcList->InsertItem(row, wxString::Format("%d", ai.adc->getOid()));
+        m_adcList->SetItem(row, 1, ai.pin);
+        m_adcList->SetItem(row, 2, "---");
+        m_adcList->SetItem(row, 3, "---");
+        m_adcList->SetItem(row, 4, "pending finalize");
+
+        Log(wxString::Format("  [%s] ADC OID=%d pin=%s", ai.name, ai.adc->getOid(), ai.pin),
+            wxColour(0, 128, 0));
+        m_adcInputs.push_back(std::move(ai.adc));
+    }
+
+    // Transfer digital outputs
+    for (auto& di : result->digitalOuts) {
+        if (!di.dout) continue;
+
+        int row = m_gpioList->GetItemCount();
+        m_gpioList->InsertItem(row, wxString::Format("%d", di.dout->getOid()));
+        m_gpioList->SetItem(row, 1, di.pin);
+        m_gpioList->SetItem(row, 2, "LOW");
+        m_gpioList->SetItem(row, 3, "pending finalize");
+
+        Log(wxString::Format("  [%s] digital out OID=%d pin=%s", di.name, di.dout->getOid(), di.pin),
+            wxColour(0, 128, 0));
+        m_digitalOuts.push_back(std::move(di.dout));
+    }
+
+    // Store printer settings
+    Log(wxString::Format("  Printer: %s vel=%.0f accel=%.0f scv=%.1f",
+        result->kinematics, result->maxVelocity, result->maxAccel,
+        result->squareCornerVelocity), wxColour(0, 128, 0));
+
+    m_configResult = std::move(result);
+    m_configPathLabel->SetLabel(wxString::Format("Config: %s", path));
+    m_configPathLabel->SetForegroundColour(wxColour(0, 100, 0));
+
+    Log(wxString::Format("Config loaded: %zu steppers, %zu ADCs, %zu digital outs, %zu PWMs",
+        m_configResult->steppers.size(), m_configResult->adcInputs.size(),
+        m_configResult->digitalOuts.size(), m_configResult->pwmOutputs.size()),
+        wxColour(0, 128, 0));
+
+    // Disable load config after loading (can only load once before finalize)
+    m_btnLoadConfig->Enable(false);
 }
 
 void KlipperFrame::OnClose(wxCloseEvent& evt) {

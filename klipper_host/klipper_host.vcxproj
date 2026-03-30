@@ -140,6 +140,7 @@
     <ClCompile Include="trapq.cpp" />
     <ClCompile Include="toolhead.cpp" />
     <ClCompile Include="gcode.cpp" />
+    <ClCompile Include="klipper_config.cpp" />
     <ClCompile Include="miniz_impl.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -153,6 +154,7 @@
     <ClInclude Include="trapq.h" />
     <ClInclude Include="toolhead.h" />
     <ClInclude Include="gcode.h" />
+    <ClInclude Include="klipper_config.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\.editorconfig" />
