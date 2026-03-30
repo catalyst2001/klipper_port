@@ -929,19 +929,21 @@ void KlipperFrame::StopPolling() {
 
 void KlipperFrame::PollThread() {
     while (m_pollRunning && m_connected) {
-        std::lock_guard<std::mutex> lock(m_mcuMutex);
-        auto responses = m_mcu.processIncoming(50);
-        for (auto& resp : responses) {
-            std::ostringstream ss;
-            ss << "<< [" << resp.msgId << "] " << resp.name;
-            for (auto& [k, v] : resp.intParams) {
-                ss << " " << k << "=" << v;
+        {
+            std::lock_guard<std::mutex> lock(m_mcuMutex);
+            auto responses = m_mcu.processIncoming(5);
+            for (auto& resp : responses) {
+                std::ostringstream ss;
+                ss << "<< [" << resp.msgId << "] " << resp.name;
+                for (auto& [k, v] : resp.intParams) {
+                    ss << " " << k << "=" << v;
+                }
+                for (auto& [k, v] : resp.bufParams) {
+                    ss << " " << k << "=[" << v.size() << " bytes]";
+                }
+                LogFromThread(wxString(ss.str()), wxColour(100, 0, 100));
             }
-            for (auto& [k, v] : resp.bufParams) {
-                ss << " " << k << "=[" << v.size() << " bytes]";
-            }
-            LogFromThread(wxString(ss.str()), wxColour(100, 0, 100));
-        }
+        } // mutex released here
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
@@ -1292,7 +1294,7 @@ void KlipperFrame::OnSendGcode(wxCommandEvent&) {
 
     // Advance print_time base to current MCU time so steps are in the future
     if (m_toolhead) {
-        double now = m_mcu.getClockSync().estimatedPrintTime() + 0.1;
+        double now = m_mcu.getClockSync().estimatedPrintTime() + 0.25;
         if (now > m_toolhead->getNextPrintTime())
             m_toolhead->setNextPrintTime(now);
     }
@@ -1369,7 +1371,7 @@ void KlipperFrame::OnJog(wxCommandEvent& evt) {
     std::lock_guard<std::mutex> lock(m_mcuMutex);
 
     // Advance print_time base to current MCU time so steps are in the future
-    double now = m_mcu.getClockSync().estimatedPrintTime() + 0.1;
+    double now = m_mcu.getClockSync().estimatedPrintTime() + 0.25;
     if (now > m_toolhead->getNextPrintTime())
         m_toolhead->setNextPrintTime(now);
 

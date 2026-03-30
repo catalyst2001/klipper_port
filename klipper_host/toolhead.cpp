@@ -5,8 +5,6 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
-#include <thread>
-#include <chrono>
 
 // ========== ToolHead ==========
 
@@ -175,11 +173,6 @@ void ToolHead::generateAxisSteps(int axis, const TrapMove& tm, bool needsReset) 
     // Absolute MCU clock at TrapMove start
     int64_t tmStartClock = m_mcu.getClockSync().printTimeToClock(tm.print_time);
 
-    // Reset step clock if this is the first phase for this axis in this batch
-    if (needsReset) {
-        stepper->resetStepClock(tmStartClock);
-    }
-
     // === Compute exact step times using kinematic equations ===
     // Position along axis: p(t) = v0*t + 0.5*accel*t²
     // Step n occurs when p(t_n) = (n+1) * stepDist
@@ -213,12 +206,36 @@ void ToolHead::generateAxisSteps(int axis, const TrapMove& tm, bool needsReset) 
         if (numSteps <= 0) return;
     }
 
+    // === Decide: reset_step_clock or chain from previous move ===
+    // Klipper architecture: reset_step_clock is called once at print start.
+    // Between moves, queue_step commands chain seamlessly — the MCU's internal
+    // step clock auto-advances after each step batch completes.
+    bool doReset = false;
+    if (needsReset) {
+        if (!stepper->isClockInitialized()) {
+            // First use ever: must reset
+            doReset = true;
+        } else {
+            // Check if we can chain from lastStepClock
+            int64_t gap = stepClocks[0] - stepper->getLastStepClock();
+            if (gap <= 0 || gap > 4'000'000'000LL) {
+                // Gap negative (scheduling error) or > ~13s: need reset
+                doReset = true;
+            }
+            // else: chain from lastStepClock (no reset needed)
+        }
+    }
+
+    if (doReset) {
+        stepper->resetStepClock(tmStartClock);
+    }
+
     // === Compress step clocks into queue_step(interval, count, add) commands ===
     // MCU constraints: interval is uint32 (practical max ~0x3FFFFFFF),
     //                  count is uint16 (max 65535),
     //                  add is int16 (range [-32768, 32767])
 
-    int64_t mcuClockPos = needsReset ? tmStartClock : stepper->getLastStepClock();
+    int64_t mcuClockPos = doReset ? tmStartClock : stepper->getLastStepClock();
 
     int pos = 0;
     while (pos < numSteps) {
@@ -278,26 +295,6 @@ void ToolHead::generateAxisSteps(int axis, const TrapMove& tm, bool needsReset) 
 bool ToolHead::generateSteps() {
     auto trapMoves = m_trapq.getAndClear();
     if (trapMoves.empty()) return true;
-
-    // Safety: ensure steppers are idle before we attempt reset_step_clock.
-    // If previous steps are still executing on the MCU, wait for them.
-    for (int axis = 0; axis < 3; ++axis) {
-        MCU_stepper* stepper = m_steppers[axis];
-        if (!stepper || !stepper->isClockInitialized()) continue;
-
-        int64_t lastClock = stepper->getLastStepClock();
-        int64_t nowClock = m_mcu.getClockSync().printTimeToClock(
-            m_mcu.getClockSync().estimatedPrintTime());
-
-        if (lastClock > nowClock) {
-            // Stepper may still be active — wait for steps to complete
-            double waitSec = static_cast<double>(lastClock - nowClock) / m_mcu.getClockSync().getMcuFreq();
-            if (waitSec > 0 && waitSec < 2.0) {
-                int waitMs = static_cast<int>(waitSec * 1000) + 20; // +20ms safety margin
-                std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
-            }
-        }
-    }
 
     // Track whether each axis stepper has been reset for this batch.
     // Only the first TrapMove that moves a given axis should call
