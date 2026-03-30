@@ -126,6 +126,11 @@ private:
     wxButton* m_btnHomeAll = nullptr;
     wxStaticText* m_motionStatus = nullptr;
 
+    // Jog controls
+    wxTextCtrl* m_jogDistXY = nullptr;
+    wxTextCtrl* m_jogDistZ = nullptr;
+    wxTextCtrl* m_jogSpeed = nullptr;
+
     // Config loading
     wxButton* m_btnLoadConfig = nullptr;
     wxStaticText* m_configPathLabel = nullptr;
@@ -171,6 +176,7 @@ private:
     void OnSendGcode(wxCommandEvent& evt);
     void OnHomeAll(wxCommandEvent& evt);
     void OnLoadConfig(wxCommandEvent& evt);
+    void OnJog(wxCommandEvent& evt);
 };
 
 // ---- App Implementation ----
@@ -203,6 +209,12 @@ enum {
     ID_SEND_GCODE,
     ID_HOME_ALL,
     ID_LOAD_CONFIG,
+    ID_JOG_XP,
+    ID_JOG_XN,
+    ID_JOG_YP,
+    ID_JOG_YN,
+    ID_JOG_ZP,
+    ID_JOG_ZN,
 };
 
 KlipperFrame::KlipperFrame()
@@ -229,6 +241,12 @@ KlipperFrame::KlipperFrame()
     Bind(wxEVT_BUTTON, &KlipperFrame::OnSendGcode, this, ID_SEND_GCODE);
     Bind(wxEVT_BUTTON, &KlipperFrame::OnHomeAll, this, ID_HOME_ALL);
     Bind(wxEVT_BUTTON, &KlipperFrame::OnLoadConfig, this, ID_LOAD_CONFIG);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnJog, this, ID_JOG_XP);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnJog, this, ID_JOG_XN);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnJog, this, ID_JOG_YP);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnJog, this, ID_JOG_YN);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnJog, this, ID_JOG_ZP);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnJog, this, ID_JOG_ZN);
     Bind(wxEVT_TIMER, &KlipperFrame::OnUITimer, this, ID_UI_TIMER);
     Bind(wxEVT_CLOSE_WINDOW, &KlipperFrame::OnClose, this);
 
@@ -457,6 +475,50 @@ void KlipperFrame::CreateUI() {
     m_btnSendGcode = new wxButton(motionPanel, ID_SEND_GCODE, "Send");
     gcodeSizer->Add(m_btnSendGcode, 0, wxALL, 3);
     motionSizer->Add(gcodeSizer, 0, wxEXPAND);
+
+    // ---- Jog Controls ----
+    auto* jogBox = new wxStaticBoxSizer(wxVERTICAL, motionPanel, "Jog Controls");
+
+    // Distance / speed inputs row
+    auto* jogParamSizer = new wxBoxSizer(wxHORIZONTAL);
+    jogParamSizer->Add(new wxStaticText(motionPanel, wxID_ANY, "XY dist (mm):"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_jogDistXY = new wxTextCtrl(motionPanel, wxID_ANY, "10", wxDefaultPosition, wxSize(50, -1));
+    jogParamSizer->Add(m_jogDistXY, 0, wxALL, 3);
+    jogParamSizer->Add(new wxStaticText(motionPanel, wxID_ANY, "Z dist (mm):"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_jogDistZ = new wxTextCtrl(motionPanel, wxID_ANY, "1", wxDefaultPosition, wxSize(50, -1));
+    jogParamSizer->Add(m_jogDistZ, 0, wxALL, 3);
+    jogParamSizer->Add(new wxStaticText(motionPanel, wxID_ANY, "Speed (mm/min):"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_jogSpeed = new wxTextCtrl(motionPanel, wxID_ANY, "3000", wxDefaultPosition, wxSize(60, -1));
+    jogParamSizer->Add(m_jogSpeed, 0, wxALL, 3);
+    jogBox->Add(jogParamSizer, 0, wxEXPAND);
+
+    // Buttons row: XY pad + Z pad
+    auto* jogBtnSizer = new wxBoxSizer(wxHORIZONTAL);
+
+    // XY pad using wxGridSizer 3x3
+    auto* xyGrid = new wxGridSizer(3, 3, 2, 2);
+    wxSize jogBtnSize(50, 35);
+    xyGrid->Add(0, 0);  // top-left empty
+    xyGrid->Add(new wxButton(motionPanel, ID_JOG_YP, "+Y", wxDefaultPosition, jogBtnSize), 0, wxEXPAND);
+    xyGrid->Add(0, 0);  // top-right empty
+    xyGrid->Add(new wxButton(motionPanel, ID_JOG_XN, "-X", wxDefaultPosition, jogBtnSize), 0, wxEXPAND);
+    xyGrid->Add(0, 0);  // center empty
+    xyGrid->Add(new wxButton(motionPanel, ID_JOG_XP, "+X", wxDefaultPosition, jogBtnSize), 0, wxEXPAND);
+    xyGrid->Add(0, 0);  // bottom-left empty
+    xyGrid->Add(new wxButton(motionPanel, ID_JOG_YN, "-Y", wxDefaultPosition, jogBtnSize), 0, wxEXPAND);
+    xyGrid->Add(0, 0);  // bottom-right empty
+    jogBtnSizer->Add(xyGrid, 0, wxALL, 5);
+
+    jogBtnSizer->AddSpacer(20);
+
+    // Z column
+    auto* zCol = new wxBoxSizer(wxVERTICAL);
+    zCol->Add(new wxButton(motionPanel, ID_JOG_ZP, "+Z", wxDefaultPosition, jogBtnSize), 0, wxALL, 2);
+    zCol->Add(new wxButton(motionPanel, ID_JOG_ZN, "-Z", wxDefaultPosition, jogBtnSize), 0, wxALL, 2);
+    jogBtnSizer->Add(zCol, 0, wxALIGN_CENTER_VERTICAL);
+
+    jogBox->Add(jogBtnSizer, 0, wxALL, 2);
+    motionSizer->Add(jogBox, 0, wxEXPAND | wxALL, 5);
 
     // Motion status
     m_motionStatus = new wxStaticText(motionPanel, wxID_ANY, "Motion: idle");
@@ -1256,6 +1318,53 @@ void KlipperFrame::OnHomeAll(wxCommandEvent&) {
             pos.x, pos.y, pos.z));
     } else {
         Log(wxString::Format("Homing failed: %s", m_gcode->getLastMessage()), *wxRED);
+    }
+}
+
+void KlipperFrame::OnJog(wxCommandEvent& evt) {
+    if (!m_connected || !m_gcode) return;
+
+    double distXY = 0, distZ = 0, speed = 0;
+    if (!m_jogDistXY->GetValue().ToDouble(&distXY) || distXY <= 0) {
+        Log("Invalid XY distance", *wxRED); return;
+    }
+    if (!m_jogDistZ->GetValue().ToDouble(&distZ) || distZ <= 0) {
+        Log("Invalid Z distance", *wxRED); return;
+    }
+    if (!m_jogSpeed->GetValue().ToDouble(&speed) || speed <= 0) {
+        Log("Invalid speed", *wxRED); return;
+    }
+
+    std::string axis;
+    double dist = 0;
+    switch (evt.GetId()) {
+        case ID_JOG_XP: axis = "X"; dist =  distXY; break;
+        case ID_JOG_XN: axis = "X"; dist = -distXY; break;
+        case ID_JOG_YP: axis = "Y"; dist =  distXY; break;
+        case ID_JOG_YN: axis = "Y"; dist = -distXY; break;
+        case ID_JOG_ZP: axis = "Z"; dist =  distZ;  break;
+        case ID_JOG_ZN: axis = "Z"; dist = -distZ;  break;
+        default: return;
+    }
+
+    // Use G91 (relative) → G1 → G90 (absolute) sequence
+    std::string gcode = "G91\nG1 " + axis + std::to_string(dist)
+                        + " F" + std::to_string(static_cast<int>(speed)) + "\nG90";
+
+    Log(wxString::Format("> Jog %s%+.3f mm @ F%d", axis, dist, static_cast<int>(speed)),
+        wxColour(0, 0, 160));
+
+    std::lock_guard<std::mutex> lock(m_mcuMutex);
+    if (m_gcode->executeBlock(gcode) > 0) {
+        m_toolhead->flush();
+        m_toolhead->generateSteps();
+
+        Vec3 pos = m_toolhead->getPosition();
+        m_motionStatus->SetLabel(wxString::Format(
+            "Motion: X=%.3f Y=%.3f Z=%.3f | F=%.0f mm/min",
+            pos.x, pos.y, pos.z, speed));
+    } else {
+        Log(wxString::Format("  Jog failed: %s", m_gcode->getLastMessage()), *wxRED);
     }
 }
 
