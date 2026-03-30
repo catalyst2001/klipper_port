@@ -653,36 +653,55 @@ bool KlipperMCU::finalizeConfig() {
     bool isConfig = configParams["is_config"] != 0;
     uint32_t mcuCrc = static_cast<uint32_t>(configParams["crc"]);
 
+    // Step 1.5: If MCU is in shutdown or has stale state, firmware restart to recover
+    bool needsRestart = false;
     if (configParams["is_shutdown"] != 0) {
-        m_lastError = "MCU is in shutdown state, cannot configure";
-        return false;
+        std::cout << "[KlipperMCU] MCU is in shutdown state, resetting..." << std::endl;
+        needsRestart = true;
+    } else if (!isConfig && configParams.count("move_count") && configParams["move_count"] > 0) {
+        std::cout << "[KlipperMCU] Stale MCU state detected (move_count="
+                  << configParams["move_count"] << "), resetting..." << std::endl;
+        needsRestart = true;
     }
 
-    // Step 1.5: If MCU is not configured but has stale state (move_count > 0
-    // or previous partial config), firmware restart to clear it
-    if (!isConfig && configParams.count("move_count") && configParams["move_count"] > 0) {
-        std::cout << "[KlipperMCU] Stale MCU state detected (move_count="
-                  << configParams["move_count"] << "), restarting firmware..." << std::endl;
-        firmwareRestart();
-
-        // Wait for MCU to come back
-        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-
-        // Reconnect
-        if (!m_serial.isOpen()) {
-            m_lastError = "MCU disconnected after firmware restart";
-            return false;
+    if (needsRestart) {
+        // Send reset to MCU
+        sendCommand("reset");
+        m_isShutdown = false;
+        {
+            std::lock_guard<std::mutex> lock(m_shutdownMutex);
+            m_shutdownMsg.clear();
         }
 
-        // Re-query
+        // Wait for MCU to reboot
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+
+        // Purge stale data
+        m_serial.purge();
+        uint8_t dumpBuf[4096];
+        m_serial.read(dumpBuf, sizeof(dumpBuf), 200);
+
+        // Re-sync sequence numbers (MCU resets to seq 0 after reboot)
+        m_sendSeq = 0;
+        m_needSync = true;
+        m_recvBuf.clear();
+
+        // Re-query config
         configParams.clear();
         bufP.clear();
-        if (!sendWithResponse("get_config", "config", configParams, bufP)) {
-            m_lastError = "Failed to query MCU config after restart";
+        if (!sendWithResponse("get_config", "config", configParams, bufP, {}, {}, 5000)) {
+            m_lastError = "Failed to query MCU config after reset";
             return false;
         }
         isConfig = configParams["is_config"] != 0;
         mcuCrc = static_cast<uint32_t>(configParams["crc"]);
+
+        if (configParams["is_shutdown"] != 0) {
+            m_lastError = "MCU still in shutdown after reset";
+            return false;
+        }
+        std::cout << "[KlipperMCU] MCU reset successful, is_config=" 
+                  << isConfig << std::endl;
     }
 
     // Step 2: Prepare config commands (work on copies to allow retry)
