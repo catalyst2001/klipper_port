@@ -807,18 +807,75 @@ bool KlipperMCU::finalizeConfig() {
     else {
         // MCU already configured
         if (configCrc != mcuCrc) {
-            // CRC mismatch → need firmware restart
+            // CRC mismatch → firmware restart + retry with new config
             std::cout << "[KlipperMCU] CRC mismatch (host=" << configCrc 
-                      << " mcu=" << mcuCrc << "), attempting restart..." << std::endl;
-            firmwareRestart();
-            m_lastError = "MCU CRC mismatch, firmware restart issued. Try again.";
-            return false;
+                      << " mcu=" << mcuCrc << "), restarting MCU..." << std::endl;
+            
+            // Use the same reset + resync path as the stale state handler above
+            sendCommand("reset");
+            m_isShutdown = false;
+            {
+                std::lock_guard<std::mutex> lock(m_shutdownMutex);
+                m_shutdownMsg.clear();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+
+            m_serial.setDTR(false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            m_serial.setDTR(true);
+            m_serial.setRTS(true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            m_serial.purge();
+            uint8_t dumpBuf2[4096];
+            m_serial.read(dumpBuf2, sizeof(dumpBuf2), 300);
+
+            m_needSync = true;
+            m_recvBuf.clear();
+
+            // Re-sync sequence number
+            bool seqSynced2 = false;
+            auto getCfgIt2 = m_commands.find("get_config");
+            if (getCfgIt2 == m_commands.end()) {
+                m_lastError = "get_config command not found after CRC mismatch restart";
+                return false;
+            }
+            auto probe2 = encodeCommand(getCfgIt2->second, {}, {});
+            for (int seqTry = 0; seqTry < 16 && !seqSynced2; seqTry++) {
+                m_sendSeq = static_cast<uint8_t>(seqTry);
+                auto frame = build_message_frame(m_sendSeq, probe2);
+                m_sendSeq = (m_sendSeq + 1) & MESSAGE_SEQ_MASK;
+                m_serial.write(frame.data(), static_cast<int>(frame.size()));
+                auto responses2 = processIncoming(80);
+                for (auto& resp : responses2) {
+                    if (resp.name == "config") {
+                        configParams = std::move(resp.intParams);
+                        seqSynced2 = true;
+                        break;
+                    }
+                }
+            }
+            if (!seqSynced2) {
+                m_lastError = "Failed to re-sync after CRC mismatch restart";
+                return false;
+            }
+
+            isConfig = configParams["is_config"] != 0;
+            // After reset, MCU is unconfigured — fall through to send full config
+            if (isConfig) {
+                m_lastError = "MCU still configured after CRC mismatch restart";
+                return false;
+            }
+            cmdsToSend.insert(cmdsToSend.end(), cfgCmds.begin(), cfgCmds.end());
+            cmdsToSend.insert(cmdsToSend.end(), initCmds.begin(), initCmds.end());
+            std::cout << "[KlipperMCU] Re-sending config after CRC mismatch (" 
+                      << cmdsToSend.size() << " commands)..." << std::endl;
+        } else {
+            // CRC matches → send restart + init commands only
+            cmdsToSend.insert(cmdsToSend.end(), rstCmds.begin(), rstCmds.end());
+            cmdsToSend.insert(cmdsToSend.end(), initCmds.begin(), initCmds.end());
+            std::cout << "[KlipperMCU] MCU already configured (CRC match), sending " 
+                      << cmdsToSend.size() << " restart/init commands..." << std::endl;
         }
-        // CRC matches → send restart + init commands only
-        cmdsToSend.insert(cmdsToSend.end(), rstCmds.begin(), rstCmds.end());
-        cmdsToSend.insert(cmdsToSend.end(), initCmds.begin(), initCmds.end());
-        std::cout << "[KlipperMCU] MCU already configured (CRC match), sending " 
-                  << cmdsToSend.size() << " restart/init commands..." << std::endl;
     }
 
     // Step 7: Send all commands

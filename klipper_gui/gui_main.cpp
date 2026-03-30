@@ -1114,6 +1114,10 @@ void KlipperFrame::OnFinalizeConfig(wxCommandEvent&) {
         if (!m_stepperObjs.empty()) {
             m_toolhead = std::make_unique<ToolHead>(m_mcu);
 
+            // Initialize print_time base from actual MCU clock
+            double basePrintTime = m_mcu.getClockSync().estimatedPrintTime() + 0.25;
+            m_toolhead->setNextPrintTime(basePrintTime);
+
             // Use config settings if loaded, otherwise defaults
             if (m_configResult) {
                 m_toolhead->setMaxVelocity(m_configResult->maxVelocity);
@@ -1285,6 +1289,14 @@ void KlipperFrame::OnSendGcode(wxCommandEvent&) {
     Log(wxString::Format("> %s", cmd), wxColour(0, 0, 160));
 
     std::lock_guard<std::mutex> lock(m_mcuMutex);
+
+    // Advance print_time base to current MCU time so steps are in the future
+    if (m_toolhead) {
+        double now = m_mcu.getClockSync().estimatedPrintTime() + 0.1;
+        if (now > m_toolhead->getNextPrintTime())
+            m_toolhead->setNextPrintTime(now);
+    }
+
     if (m_gcode->executeLine(cmd.ToStdString())) {
         // Flush and generate steps
         m_toolhead->flush();
@@ -1355,6 +1367,12 @@ void KlipperFrame::OnJog(wxCommandEvent& evt) {
         wxColour(0, 0, 160));
 
     std::lock_guard<std::mutex> lock(m_mcuMutex);
+
+    // Advance print_time base to current MCU time so steps are in the future
+    double now = m_mcu.getClockSync().estimatedPrintTime() + 0.1;
+    if (now > m_toolhead->getNextPrintTime())
+        m_toolhead->setNextPrintTime(now);
+
     if (m_gcode->executeBlock(gcode) > 0) {
         m_toolhead->flush();
         m_toolhead->generateSteps();

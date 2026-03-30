@@ -46,8 +46,9 @@ public:
     double getMaxAccel() const { return m_maxAccel; }
     double getJunctionDeviation() const { return m_junctionDeviation; }
 
-    // Get next print time for scheduling
+    // Get/set next print time for scheduling
     double getNextPrintTime() const { return m_nextPrintTime; }
+    void setNextPrintTime(double t) { m_nextPrintTime = t; }
 
     // Stats
     size_t getQueueSize() const { return m_queue.size(); }
