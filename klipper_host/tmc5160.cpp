@@ -197,7 +197,7 @@ bool TMC5160::initRegisters() {
 
     std::cout << "[TMC5160:" << m_name << "] Initializing registers..." << std::endl;
 
-    // Read and clear GSTAT (clear-on-read)
+    // Read and clear GSTAT (write-1-to-clear: write back read value to clear latched bits)
     uint32_t gstat = 0;
     if (readRegister(TMC5160Reg::GSTAT, gstat)) {
         std::cout << "  GSTAT=0x" << std::hex << gstat << std::dec;
@@ -205,6 +205,10 @@ bool TMC5160::initRegisters() {
         if (gstat & 2) std::cout << " [DRV_ERR]";
         if (gstat & 4) std::cout << " [UV_CP]";
         std::cout << std::endl;
+        if (gstat & 0x07) {
+            writeRegister(TMC5160Reg::GSTAT, gstat & 0x07);
+            std::cout << "  GSTAT cleared" << std::endl;
+        }
     }
 
     // 1. GLOBALSCALER
@@ -280,6 +284,9 @@ TMC5160::RegisterDump TMC5160::readAllRegisters() {
 
     readRegister(TMC5160Reg::GCONF, d.gconf);
     readRegister(TMC5160Reg::GSTAT, d.gstat);
+    // GSTAT is write-1-to-clear: write back to clear any latched error bits
+    if (d.gstat & 0x07)
+        writeRegister(TMC5160Reg::GSTAT, d.gstat & 0x07);
     readRegister(TMC5160Reg::IOIN, d.ioin);
     readRegister(TMC5160Reg::IHOLD_IRUN, d.ihold_irun);
     readRegister(TMC5160Reg::CHOPCONF, d.chopconf);

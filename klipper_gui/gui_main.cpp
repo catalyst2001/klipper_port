@@ -5,6 +5,7 @@
 #include <wx/splitter.h>
 #include <wx/notebook.h>
 #include <wx/stattext.h>
+#include <wx/spinctrl.h>
 #include <wx/grid.h>
 #include <thread>
 #include <mutex>
@@ -112,16 +113,24 @@ private:
         wxCheckBox* cb;
         uint8_t reg;   // register address
         uint8_t bit;   // bit position
+        bool writable;
     };
     struct TmcFieldLabel {
-        wxStaticText* label;
+        wxStaticText* label;  // read-only display
         uint8_t reg;
         uint8_t bitLow;  // low bit
         uint8_t bitHigh; // high bit (inclusive)
     };
+    struct TmcFieldSpin {
+        wxSpinCtrl* spin;     // writable control
+        uint8_t reg;
+        uint8_t bitLow;
+        uint8_t bitHigh;
+    };
     struct TmcDriverUI {
         std::vector<TmcBitCheckbox> bits;
-        std::vector<TmcFieldLabel> fields;
+        std::vector<TmcFieldLabel> fields;      // read-only fields
+        std::vector<TmcFieldSpin> writeFields;  // writable fields
         wxStaticText* statusLabel = nullptr;
     };
     std::vector<TmcDriverUI> m_tmcUI;
@@ -169,6 +178,7 @@ private:
     void CreateUI();
     void buildTmcDriverTabs();
     bool updateTmcRegisterUI();  // returns true if any driver unpowered
+    void writeTmcRegisterFromUI(size_t driverIdx, uint8_t reg);
     void Log(const wxString& msg, const wxColour& color = *wxBLACK);
     void LogFromThread(const wxString& msg, const wxColour& color = *wxBLACK);
 
@@ -708,16 +718,17 @@ void KlipperFrame::buildTmcDriverTabs() {
         size_t numBits;
         const FieldDef* fields;
         size_t numFields;
+        bool writable;
     };
 
     static const RegGroup groups[] = {
-        {"GCONF",      gconfBits,     std::size(gconfBits),     nullptr, 0},
-        {"GSTAT",      gstatBits,     std::size(gstatBits),     nullptr, 0},
-        {"IOIN",       ioinBits,      std::size(ioinBits),      ioinFields, std::size(ioinFields)},
-        {"IHOLD_IRUN", nullptr,       0,                        iholdIrunFields, std::size(iholdIrunFields)},
-        {"CHOPCONF",   chopconfBits,  std::size(chopconfBits),  chopconfFields, std::size(chopconfFields)},
-        {"DRV_STATUS", drvStatusBits, std::size(drvStatusBits), drvStatusFields, std::size(drvStatusFields)},
-        {"PWMCONF",    pwmconfBits,   std::size(pwmconfBits),   pwmconfFields, std::size(pwmconfFields)},
+        {"GCONF",      gconfBits,     std::size(gconfBits),     nullptr, 0,                          true},
+        {"GSTAT",      gstatBits,     std::size(gstatBits),     nullptr, 0,                          false},
+        {"IOIN",       ioinBits,      std::size(ioinBits),      ioinFields, std::size(ioinFields),   false},
+        {"IHOLD_IRUN", nullptr,       0,                        iholdIrunFields, std::size(iholdIrunFields), true},
+        {"CHOPCONF",   chopconfBits,  std::size(chopconfBits),  chopconfFields, std::size(chopconfFields), true},
+        {"DRV_STATUS", drvStatusBits, std::size(drvStatusBits), drvStatusFields, std::size(drvStatusFields), false},
+        {"PWMCONF",    pwmconfBits,   std::size(pwmconfBits),   pwmconfFields, std::size(pwmconfFields), true},
     };
 
     for (size_t di = 0; di < m_tmcDrivers.size(); ++di) {
@@ -736,21 +747,48 @@ void KlipperFrame::buildTmcDriverTabs() {
             for (size_t bi = 0; bi < grp.numBits; ++bi) {
                 auto& bd = grp.bits[bi];
                 auto* cb = new wxCheckBox(box->GetStaticBox(), wxID_ANY, bd.name);
-                cb->Disable();  // read-only
+                if (!grp.writable) {
+                    cb->Disable();  // read-only
+                } else {
+                    // Bind checkbox toggle → write register
+                    cb->Bind(wxEVT_CHECKBOX, [this, di, reg = bd.reg](wxCommandEvent&) {
+                        writeTmcRegisterFromUI(di, reg);
+                    });
+                }
                 box->Add(cb, 0, wxLEFT | wxRIGHT, 3);
-                dui.bits.push_back({cb, bd.reg, bd.bit});
+                dui.bits.push_back({cb, bd.reg, bd.bit, grp.writable});
             }
 
-            // Multi-bit fields as labels
+            // Multi-bit fields
             for (size_t fi = 0; fi < grp.numFields; ++fi) {
                 auto& fd = grp.fields[fi];
-                auto* label = new wxStaticText(box->GetStaticBox(), wxID_ANY,
-                    wxString::Format("%s: ---", fd.name));
-                auto font = label->GetFont();
-                font.SetPointSize(8);
-                label->SetFont(font);
-                box->Add(label, 0, wxLEFT | wxRIGHT | wxTOP, 3);
-                dui.fields.push_back({label, fd.reg, fd.lo, fd.hi});
+                if (grp.writable) {
+                    // Writable: use wxSpinCtrl
+                    int maxVal = (1 << (fd.hi - fd.lo + 1)) - 1;
+                    auto* fieldSizer = new wxBoxSizer(wxHORIZONTAL);
+                    auto* lbl = new wxStaticText(box->GetStaticBox(), wxID_ANY, wxString(fd.name) + ":");
+                    auto lblFont = lbl->GetFont();
+                    lblFont.SetPointSize(8);
+                    lbl->SetFont(lblFont);
+                    auto* spin = new wxSpinCtrl(box->GetStaticBox(), wxID_ANY, "0",
+                        wxDefaultPosition, wxSize(60, -1), wxSP_ARROW_KEYS, 0, maxVal, 0);
+                    spin->Bind(wxEVT_SPINCTRL, [this, di, reg = fd.reg](wxSpinEvent&) {
+                        writeTmcRegisterFromUI(di, reg);
+                    });
+                    fieldSizer->Add(lbl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 3);
+                    fieldSizer->Add(spin, 0, 0, 0);
+                    box->Add(fieldSizer, 0, wxLEFT | wxRIGHT | wxTOP, 3);
+                    dui.writeFields.push_back({spin, fd.reg, fd.lo, fd.hi});
+                } else {
+                    // Read-only: use wxStaticText
+                    auto* label = new wxStaticText(box->GetStaticBox(), wxID_ANY,
+                        wxString::Format("%s: ---", fd.name));
+                    auto font = label->GetFont();
+                    font.SetPointSize(8);
+                    label->SetFont(font);
+                    box->Add(label, 0, wxLEFT | wxRIGHT | wxTOP, 3);
+                    dui.fields.push_back({label, fd.reg, fd.lo, fd.hi});
+                }
             }
 
             hSizer->Add(box, 0, wxALL | wxEXPAND, 3);
@@ -810,7 +848,7 @@ bool KlipperFrame::updateTmcRegisterUI() {
             bc.cb->SetValue((regVal >> bc.bit) & 1);
         }
 
-        // Update multi-bit field labels
+        // Update read-only multi-bit field labels
         for (auto& fl : dui.fields) {
             uint32_t regVal = getRegValue(dump, fl.reg);
             uint32_t mask = ((1U << (fl.bitHigh - fl.bitLow + 1)) - 1);
@@ -818,6 +856,15 @@ bool KlipperFrame::updateTmcRegisterUI() {
             wxString current = fl.label->GetLabel();
             wxString name = current.BeforeFirst(':');
             fl.label->SetLabel(wxString::Format("%s: %u", name, fieldVal));
+        }
+
+        // Update writable spin controls (skip if user is editing)
+        for (auto& wf : dui.writeFields) {
+            if (wf.spin->HasFocus()) continue;
+            uint32_t regVal = getRegValue(dump, wf.reg);
+            uint32_t mask = ((1U << (wf.bitHigh - wf.bitLow + 1)) - 1);
+            uint32_t fieldVal = (regVal >> wf.bitLow) & mask;
+            wf.spin->SetValue(static_cast<int>(fieldVal));
         }
 
         // Update status summary + log errors
@@ -862,6 +909,37 @@ bool KlipperFrame::updateTmcRegisterUI() {
     }
 
     return anyUnpowered;
+}
+
+void KlipperFrame::writeTmcRegisterFromUI(size_t driverIdx, uint8_t reg) {
+    if (driverIdx >= m_tmcDrivers.size() || driverIdx >= m_tmcUI.size()) return;
+
+    auto& dui = m_tmcUI[driverIdx];
+    uint32_t value = 0;
+
+    // Collect single-bit checkbox values for this register
+    for (auto& bc : dui.bits) {
+        if (bc.reg != reg || !bc.writable) continue;
+        if (bc.cb->GetValue())
+            value |= (1U << bc.bit);
+    }
+
+    // Collect multi-bit field values from writable spin controls
+    for (auto& wf : dui.writeFields) {
+        if (wf.reg != reg) continue;
+        uint32_t fieldVal = static_cast<uint32_t>(wf.spin->GetValue());
+        value |= (fieldVal << wf.bitLow);
+    }
+
+    // Write to hardware
+    {
+        std::lock_guard<std::mutex> lock(m_mcuMutex);
+        m_tmcDrivers[driverIdx]->writeRegister(reg, value);
+    }
+
+    Log(wxString::Format("[TMC5160:%s] Write reg 0x%02X = 0x%08X",
+        m_tmcDrivers[driverIdx]->getName(), reg, value),
+        wxColour(0, 0, 180));
 }
 
 void KlipperFrame::Log(const wxString& msg, const wxColour& color) {
