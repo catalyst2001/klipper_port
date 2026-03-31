@@ -141,6 +141,7 @@
     <ClCompile Include="toolhead.cpp" />
     <ClCompile Include="gcode.cpp" />
     <ClCompile Include="klipper_config.cpp" />
+    <ClCompile Include="tmc5160.cpp" />
     <ClCompile Include="miniz_impl.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -155,6 +156,7 @@
     <ClInclude Include="toolhead.h" />
     <ClInclude Include="gcode.h" />
     <ClInclude Include="klipper_config.h" />
+    <ClInclude Include="tmc5160.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\.editorconfig" />

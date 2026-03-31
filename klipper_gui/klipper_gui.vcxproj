@@ -92,6 +92,7 @@
     <ClCompile Include="..\klipper_host\toolhead.cpp" />
     <ClCompile Include="..\klipper_host\gcode.cpp" />
     <ClCompile Include="..\klipper_host\klipper_config.cpp" />
+    <ClCompile Include="..\klipper_host\tmc5160.cpp" />
     <ClCompile Include="..\klipper_host\miniz_impl.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -106,6 +107,7 @@
     <ClInclude Include="..\klipper_host\toolhead.h" />
     <ClInclude Include="..\klipper_host\gcode.h" />
     <ClInclude Include="..\klipper_host\klipper_config.h" />
+    <ClInclude Include="..\klipper_host\tmc5160.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

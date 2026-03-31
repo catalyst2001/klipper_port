@@ -68,6 +68,22 @@ struct ConfigResult {
     double maxAccel = 3000;
     double squareCornerVelocity = 5.0;
 
+    // TMC5160 driver configurations
+    struct TMC5160Config {
+        std::string name;              // e.g. "stepper_x"
+        std::string csPin;
+        std::string spiBus;
+        int chainPosition = 0;
+        int chainLength = 0;
+        double runCurrent = 1.0;
+        double holdCurrent = 0.5;
+        double senseResistor = 0.075;
+        int microsteps = 256;
+        bool interpolate = true;
+        bool stealthChop = true;
+    };
+    std::vector<TMC5160Config> tmcConfigs;
+
     // Error messages
     std::vector<std::string> warnings;
     std::string lastError;

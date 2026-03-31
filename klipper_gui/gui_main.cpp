@@ -19,6 +19,7 @@
 #include "../klipper_host/toolhead.h"
 #include "../klipper_host/gcode.h"
 #include "../klipper_host/klipper_config.h"
+#include "../klipper_host/tmc5160.h"
 
 #include <wx/filedlg.h>
 
@@ -98,6 +99,11 @@ private:
     std::vector<std::unique_ptr<MCU_I2C>> m_i2cDevices;
     std::vector<std::unique_ptr<MCU_Thermocouple>> m_thermocouples;
     struct TcReading { double temp = 0; uint8_t fault = 0; };
+
+    // TMC5160 driver objects
+    std::vector<std::unique_ptr<TMC5160>> m_tmcDrivers;
+    int m_tmcPollCounter = 0;
+    bool m_tmcUnpoweredLogged = false;  // avoid spamming "VMot off"
     std::mutex m_tcMutex;
     std::vector<TcReading> m_tcReadings;
 
@@ -627,6 +633,40 @@ void KlipperFrame::OnUITimer(wxTimerEvent&) {
             m_tcList->SetItem(static_cast<int>(i), 3, r.fault ? wxString::Format("0x%02X", r.fault) : wxString("OK"));
         }
     }
+
+    // TMC5160 status polling (~every 2 seconds at 10Hz timer)
+    if (m_connected && m_mcu.isConfigFinalized() && !m_tmcDrivers.empty()) {
+        m_tmcPollCounter++;
+        if (m_tmcPollCounter >= 20) {
+            m_tmcPollCounter = 0;
+            std::lock_guard<std::mutex> lock(m_mcuMutex);
+
+            // Check if any driver is unpowered
+            bool anyUnpowered = false;
+            for (auto& tmc : m_tmcDrivers) {
+                auto status = tmc->readStatus();
+                if (status.isUnpowered()) {
+                    anyUnpowered = true;
+                } else if (status.hasError()) {
+                    Log(wxString::Format("[TMC5160:%s] ERROR: %s",
+                        tmc->getName(), TMC5160::formatErrors(status)), *wxRED);
+                } else if (status.hasWarning()) {
+                    Log(wxString::Format("[TMC5160:%s] Warning: %s",
+                        tmc->getName(), TMC5160::formatErrors(status)), wxColour(200, 100, 0));
+                }
+            }
+
+            if (anyUnpowered && !m_tmcUnpoweredLogged) {
+                Log("TMC5160: Drivers unpowered (VMot off) - status monitoring paused",
+                    wxColour(200, 100, 0));
+                m_tmcUnpoweredLogged = true;
+            } else if (!anyUnpowered && m_tmcUnpoweredLogged) {
+                Log("TMC5160: Drivers powered - status monitoring active",
+                    wxColour(0, 128, 0));
+                m_tmcUnpoweredLogged = false;
+            }
+        }
+    }
 }
 
 void KlipperFrame::OnConnect(wxCommandEvent&) {
@@ -668,6 +708,8 @@ void KlipperFrame::OnConnect(wxCommandEvent&) {
         m_i2cDevices.clear();
         m_thermocouples.clear();
         m_tcReadings.clear();
+        m_tmcDrivers.clear();
+        m_tmcUnpoweredLogged = false;
         m_stepperObjs.clear();
         m_endstopObjs.clear();
         m_toolhead.reset();
@@ -1140,6 +1182,29 @@ void KlipperFrame::OnFinalizeConfig(wxCommandEvent&) {
             m_btnHomeAll->Enable(true);
             Log("Toolhead + G-code parser initialized", wxColour(0, 128, 0));
         }
+
+        // Initialize TMC5160 drivers (after finalize, SPI is now operational)
+        if (!m_tmcDrivers.empty()) {
+            Log(wxString::Format("Initializing %zu TMC5160 driver(s)...", m_tmcDrivers.size()));
+            for (auto& tmc : m_tmcDrivers) {
+                if (tmc->initRegisters()) {
+                    auto status = tmc->readStatus();
+                    wxString msg = wxString::Format("  [TMC5160:%s] Init OK - %s",
+                        tmc->getName(), TMC5160::formatStatus(status));
+                    if (status.hasError()) {
+                        msg += " ERRORS: " + TMC5160::formatErrors(status);
+                        Log(msg, *wxRED);
+                    } else if (status.hasWarning()) {
+                        msg += " WARN: " + TMC5160::formatErrors(status);
+                        Log(msg, wxColour(200, 100, 0));
+                    } else {
+                        Log(msg, wxColour(0, 128, 0));
+                    }
+                } else {
+                    Log(wxString::Format("  [TMC5160:%s] Init FAILED", tmc->getName()), *wxRED);
+                }
+            }
+        }
     } else {
         Log("Config finalization failed: " + wxString(m_mcu.getLastError()), *wxRED);
     }
@@ -1484,6 +1549,62 @@ void KlipperFrame::OnLoadConfig(wxCommandEvent&) {
         m_digitalOuts.push_back(std::move(di.dout));
     }
 
+    // Create TMC5160 drivers (group by SPI bus for daisy chain sharing)
+    if (!result->tmcConfigs.empty()) {
+        struct SpiBusEntry { std::string csPin; std::string spiBus; MCU_SPI* spi; };
+        std::vector<SpiBusEntry> spiBuses;
+
+        for (auto& tc : result->tmcConfigs) {
+            // Find or create SPI for this (csPin, spiBus) combination
+            MCU_SPI* spi = nullptr;
+            for (auto& entry : spiBuses) {
+                if (entry.csPin == tc.csPin && entry.spiBus == tc.spiBus) {
+                    spi = entry.spi;
+                    break;
+                }
+            }
+
+            if (!spi) {
+                auto newSpi = std::make_unique<MCU_SPI>(m_mcu);
+                newSpi->setupPin(tc.csPin, false);
+                newSpi->setupBus(tc.spiBus, 3, 4000000);  // SPI mode 3, 4MHz
+                if (!newSpi->buildConfig()) {
+                    Log(wxString::Format("Failed to create SPI for TMC bus=%s cs=%s",
+                        tc.spiBus, tc.csPin), *wxRED);
+                    continue;
+                }
+                spi = newSpi.get();
+                spiBuses.push_back({tc.csPin, tc.spiBus, spi});
+
+                int row = m_busList->GetItemCount();
+                m_busList->InsertItem(row, "SPI-TMC");
+                m_busList->SetItem(row, 1, wxString::Format("%d", newSpi->getOid()));
+                m_busList->SetItem(row, 2, tc.spiBus);
+                m_busList->SetItem(row, 3, tc.csPin);
+                m_busList->SetItem(row, 4, "pending finalize");
+
+                m_spiDevices.push_back(std::move(newSpi));
+            }
+
+            auto driver = std::make_unique<TMC5160>(tc.name);
+            driver->setSpi(spi, tc.chainPosition, tc.chainLength);
+            driver->setCurrent(tc.runCurrent, tc.holdCurrent, tc.senseResistor);
+            driver->setMicrosteps(tc.microsteps, tc.interpolate);
+            driver->setStealthChop(tc.stealthChop);
+
+            Log(wxString::Format("  [TMC5160:%s] pos=%d/%d run=%.1fA hold=%.1fA ms=%d%s",
+                tc.name, tc.chainPosition, tc.chainLength,
+                tc.runCurrent, tc.holdCurrent, tc.microsteps,
+                tc.stealthChop ? " StealthChop" : " SpreadCycle"),
+                wxColour(0, 128, 0));
+
+            m_tmcDrivers.push_back(std::move(driver));
+        }
+
+        Log(wxString::Format("  TMC5160: %zu driver(s) on %zu SPI bus(es)",
+            m_tmcDrivers.size(), spiBuses.size()), wxColour(0, 128, 0));
+    }
+
     // Store printer settings
     Log(wxString::Format("  Printer: %s vel=%.0f accel=%.0f scv=%.1f",
         result->kinematics, result->maxVelocity, result->maxAccel,
@@ -1493,9 +1614,9 @@ void KlipperFrame::OnLoadConfig(wxCommandEvent&) {
     m_configPathLabel->SetLabel(wxString::Format("Config: %s", path));
     m_configPathLabel->SetForegroundColour(wxColour(0, 100, 0));
 
-    Log(wxString::Format("Config loaded: %zu steppers, %zu ADCs, %zu digital outs, %zu PWMs",
+    Log(wxString::Format("Config loaded: %zu steppers, %zu ADCs, %zu digital outs, %zu TMC drivers",
         m_configResult->steppers.size(), m_configResult->adcInputs.size(),
-        m_configResult->digitalOuts.size(), m_configResult->pwmOutputs.size()),
+        m_configResult->digitalOuts.size(), m_configResult->tmcConfigs.size()),
         wxColour(0, 128, 0));
 
     // Disable load config after loading (can only load once before finalize)

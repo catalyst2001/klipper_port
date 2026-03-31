@@ -370,9 +370,46 @@ ConfigResult KlipperConfig::buildObjects(KlipperMCU& mcu,
                       << " vel=" << result.maxVelocity
                       << " accel=" << result.maxAccel << std::endl;
         }
-        // TMC5160 sections (informational only for now)
-        else if (type.substr(0, 7) == "tmc5160" || type.substr(0, 7) == "tmc2209") {
-            std::cout << "[Config] Noted driver config: " << type << std::endl;
+        // TMC5160 sections
+        else if (type.substr(0, 7) == "tmc5160") {
+            // [tmc5160 stepper_x] → name = "stepper_x"
+            std::string driverName = type.length() > 8 ? type.substr(8) : type;
+
+            ConfigResult::TMC5160Config tmc;
+            tmc.name = driverName;
+            tmc.csPin = section.get("cs_pin", "");
+            tmc.spiBus = section.get("spi_bus", "usart1");
+            tmc.chainPosition = section.getInt("chain_position", 0);
+            tmc.chainLength = section.getInt("chain_length", 0);
+            tmc.runCurrent = section.getFloat("run_current", 1.0);
+            tmc.holdCurrent = section.getFloat("hold_current", tmc.runCurrent * 0.5);
+            tmc.senseResistor = section.getFloat("sense_resistor", 0.075);
+            tmc.interpolate = section.getBool("interpolate", true);
+            tmc.stealthChop = section.getBool("stealthchop_threshold", false)
+                              ? true : section.getBool("en_pwm_mode", true);
+
+            // Microsteps: get from the corresponding stepper section
+            tmc.microsteps = section.getInt("microsteps", 0);
+            if (tmc.microsteps <= 0) {
+                // Try to find from the stepper section with matching name
+                for (auto& s : sections) {
+                    if (s.type == driverName && s.has("microsteps")) {
+                        tmc.microsteps = s.getInt("microsteps", 256);
+                        break;
+                    }
+                }
+                if (tmc.microsteps <= 0) tmc.microsteps = 256;
+            }
+
+            result.tmcConfigs.push_back(tmc);
+            std::cout << "[Config] TMC5160 [" << driverName << "]: "
+                      << tmc.runCurrent << "A cs=" << tmc.csPin
+                      << " chain=" << tmc.chainPosition << "/" << tmc.chainLength
+                      << " µsteps=" << tmc.microsteps << std::endl;
+        }
+        // TMC2209 sections (not yet supported)
+        else if (type.substr(0, 7) == "tmc2209") {
+            std::cout << "[Config] Noted driver config: " << type << " (not yet supported)" << std::endl;
         }
         // Other sections: log as skipped
         else {
