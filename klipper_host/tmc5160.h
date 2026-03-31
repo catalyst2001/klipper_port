@@ -69,7 +69,6 @@ public:
         uint8_t csActual = 0;    // actual current scale (0-31)
         uint16_t sgResult = 0;   // stallGuard result
 
-        bool isUnpowered() const; // all bits set = VMot off
         bool hasError() const;
         bool hasWarning() const;
     };
@@ -89,6 +88,9 @@ public:
         uint32_t pwmconf = 0;
         uint32_t pwm_scale = 0;
         bool valid = false;
+
+        // GSTAT bit 2: charge pump undervoltage (VMot off or too low)
+        bool uvCp() const { return (gstat >> 2) & 1; }
     };
     RegisterDump readAllRegisters();
 

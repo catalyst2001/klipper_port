@@ -313,25 +313,15 @@ TMC5160::DriverStatus TMC5160::readStatus() {
     return s;
 }
 
-bool TMC5160::DriverStatus::isUnpowered() const {
-    // When VMot is off, DRV_STATUS reads all 1s (0xFFFFFFFF)
-    // Check all error/warning bits set simultaneously — impossible in normal operation
-    return ot && otpw && s2gA && s2gB && s2vsA && s2vsB && olA && olB;
-}
-
 bool TMC5160::DriverStatus::hasError() const {
-    if (isUnpowered()) return false;  // not a real error
     return ot || s2gA || s2gB || s2vsA || s2vsB;
 }
 
 bool TMC5160::DriverStatus::hasWarning() const {
-    if (isUnpowered()) return false;  // not a real warning
     return otpw || olA || olB;
 }
 
 std::string TMC5160::formatStatus(const DriverStatus& s) {
-    if (s.isUnpowered())
-        return "Driver unpowered (VMot off)";
     std::ostringstream ss;
     ss << "CS=" << (int)s.csActual
        << " SG=" << s.sgResult;
@@ -342,8 +332,6 @@ std::string TMC5160::formatStatus(const DriverStatus& s) {
 }
 
 std::string TMC5160::formatErrors(const DriverStatus& s) {
-    if (s.isUnpowered())
-        return "Driver unpowered (VMot off)";
     std::ostringstream ss;
     bool first = true;
     auto add = [&](const char* msg) {

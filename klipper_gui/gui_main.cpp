@@ -800,8 +800,8 @@ bool KlipperFrame::updateTmcRegisterUI() {
             continue;
         }
 
-        // Check unpowered (DRV_STATUS all 1s)
-        bool unpowered = (dump.drv_status == 0xFFFFFFFF);
+        // GSTAT bit 2 (uv_cp): charge pump undervoltage = VMot off or too low
+        bool unpowered = dump.uvCp();
         if (unpowered) anyUnpowered = true;
 
         // Update single-bit checkboxes
@@ -820,10 +820,10 @@ bool KlipperFrame::updateTmcRegisterUI() {
             fl.label->SetLabel(wxString::Format("%s: %u", name, fieldVal));
         }
 
-        // Update status summary + log errors (using DRV_STATUS from dump, no extra SPI read)
+        // Update status summary + log errors
         if (dui.statusLabel) {
             if (unpowered) {
-                dui.statusLabel->SetLabel("Status: Driver unpowered (VMot off)");
+                dui.statusLabel->SetLabel("Status: Charge pump undervoltage (GSTAT.uv_cp) - VMot off?");
                 dui.statusLabel->SetForegroundColour(wxColour(200, 100, 0));
             } else {
                 // Parse DRV_STATUS bits directly from dump
@@ -943,11 +943,11 @@ void KlipperFrame::OnUITimer(wxTimerEvent&) {
             bool anyUnpowered = updateTmcRegisterUI();
 
             if (anyUnpowered && !m_tmcUnpoweredLogged) {
-                Log("TMC5160: Drivers unpowered (VMot off) - status monitoring paused",
+                Log("TMC5160: Charge pump undervoltage (GSTAT.uv_cp set) - VMot off or too low",
                     wxColour(200, 100, 0));
                 m_tmcUnpoweredLogged = true;
             } else if (!anyUnpowered && m_tmcUnpoweredLogged) {
-                Log("TMC5160: Drivers powered - status monitoring active",
+                Log("TMC5160: Charge pump OK (GSTAT.uv_cp cleared) - VMot restored",
                     wxColour(0, 128, 0));
                 m_tmcUnpoweredLogged = false;
             }
