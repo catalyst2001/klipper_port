@@ -5,6 +5,157 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <climits>
+
+// ========== Step Compression (port of Klipper's stepcompress.c) ==========
+
+namespace {
+
+struct StepMove {
+    uint32_t interval;
+    uint16_t count;
+    int16_t add;
+};
+
+struct MinMaxPoint {
+    int32_t minp, maxp;
+};
+
+inline int32_t sc_idiv_up(int32_t n, int32_t d) {
+    return (n >= 0) ? (n + d - 1) / d : (n / d);
+}
+
+inline int32_t sc_idiv_down(int32_t n, int32_t d) {
+    return (n >= 0) ? (n / d) : (n - d + 1) / d;
+}
+
+// Compute the acceptable position range for a step relative to lastStepClock.
+// Matches Klipper's minmax_point from stepcompress.c
+MinMaxPoint sc_minmax_point(const int64_t* stepClocks, int idx, int startIdx,
+                            int64_t lastStepClock, uint32_t maxError) {
+    int64_t diff = stepClocks[idx] - lastStepClock;
+    uint32_t point = static_cast<uint32_t>(std::max(diff, (int64_t)0));
+    uint32_t prevpoint = (idx > startIdx)
+        ? static_cast<uint32_t>(std::max(stepClocks[idx - 1] - lastStepClock, (int64_t)0))
+        : 0;
+    uint32_t halfGap = (point - prevpoint) / 2;
+    if (halfGap > maxError) halfGap = maxError;
+    return { static_cast<int32_t>(point - halfGap), static_cast<int32_t>(point) };
+}
+
+// The maximum add delta between two valid quadratic sequences of the
+// form "add*count*(count-1)/2 + interval*count" is "(6 + 4*sqrt(2)) *
+// maxerror / (count*count)".  Using 11 works well in practice.
+constexpr int32_t QUADRATIC_DEV = 11;
+
+// Find optimal (interval, count, add) for a batch of steps.
+// Direct port of Klipper's compress_bisect_add from stepcompress.c
+StepMove sc_compress_bisect_add(const int64_t* stepClocks, int startIdx, int endIdx,
+                                int64_t lastStepClock, uint32_t maxError) {
+    int qlast = endIdx;
+    if (qlast > startIdx + 65535)
+        qlast = startIdx + 65535;
+
+    auto point = sc_minmax_point(stepClocks, startIdx, startIdx, lastStepClock, maxError);
+    int32_t outer_mininterval = point.minp, outer_maxinterval = point.maxp;
+    int32_t add = 0, minadd = -0x8000, maxadd = 0x7FFF;
+    int32_t bestinterval = 0, bestcount = 1, bestadd = 1, bestreach = INT32_MIN;
+    int32_t zerointerval = 0, zerocount = 0;
+
+    for (;;) {
+        // Find longest valid sequence with the given 'add'
+        MinMaxPoint nextpoint{};
+        int32_t nextmininterval = outer_mininterval;
+        int32_t nextmaxinterval = outer_maxinterval, interval = nextmaxinterval;
+        int32_t nextcount = 1;
+
+        for (;;) {
+            nextcount++;
+            if (startIdx + nextcount - 1 >= qlast) {
+                int32_t count = nextcount - 1;
+                return { static_cast<uint32_t>(interval),
+                         static_cast<uint16_t>(count),
+                         static_cast<int16_t>(add) };
+            }
+            nextpoint = sc_minmax_point(stepClocks, startIdx + nextcount - 1,
+                                        startIdx, lastStepClock, maxError);
+            int32_t nextaddfactor = nextcount * (nextcount - 1) / 2;
+            int32_t c = add * nextaddfactor;
+            if (nextmininterval * nextcount < nextpoint.minp - c)
+                nextmininterval = sc_idiv_up(nextpoint.minp - c, nextcount);
+            if (nextmaxinterval * nextcount > nextpoint.maxp - c)
+                nextmaxinterval = sc_idiv_down(nextpoint.maxp - c, nextcount);
+            if (nextmininterval > nextmaxinterval)
+                break;
+            interval = nextmaxinterval;
+        }
+
+        // Check if this is the best sequence found so far
+        int32_t count = nextcount - 1;
+        int32_t addfactor = count * (count - 1) / 2;
+        int32_t reach = add * addfactor + interval * count;
+        if (reach > bestreach
+            || (reach == bestreach && interval > bestinterval)) {
+            bestinterval = interval;
+            bestcount = count;
+            bestadd = add;
+            bestreach = reach;
+            if (!add) {
+                zerointerval = interval;
+                zerocount = count;
+            }
+            if (count > 0x200)
+                // No 'add' will improve sequence; avoid integer overflow
+                break;
+        }
+
+        // Check if a greater or lesser add could extend the sequence
+        int32_t nextaddfactor = nextcount * (nextcount - 1) / 2;
+        int32_t nextreach = add * nextaddfactor + interval * nextcount;
+        if (nextreach < nextpoint.minp) {
+            minadd = add + 1;
+            outer_maxinterval = nextmaxinterval;
+        } else {
+            maxadd = add - 1;
+            outer_mininterval = nextmininterval;
+        }
+
+        // The maximum valid deviation between two quadratic sequences
+        // can be calculated and used to further limit the add range.
+        if (count > 1) {
+            int32_t errdelta = static_cast<int32_t>(maxError) * QUADRATIC_DEV
+                             / (count * count);
+            if (minadd < add - errdelta)
+                minadd = add - errdelta;
+            if (maxadd > add + errdelta)
+                maxadd = add + errdelta;
+        }
+
+        // See if next point would further limit the add range
+        int32_t c2 = outer_maxinterval * nextcount;
+        int32_t nextaddfactor2 = nextcount * (nextcount - 1) / 2;
+        if (minadd * nextaddfactor2 < nextpoint.minp - c2)
+            minadd = sc_idiv_up(nextpoint.minp - c2, nextaddfactor2);
+        c2 = outer_mininterval * nextcount;
+        if (maxadd * nextaddfactor2 > nextpoint.maxp - c2)
+            maxadd = sc_idiv_down(nextpoint.maxp - c2, nextaddfactor2);
+
+        // Bisect valid add range and try again with new 'add'
+        if (minadd > maxadd)
+            break;
+        add = maxadd - (maxadd - minadd) / 4;
+    }
+
+    if (zerocount + zerocount / 16 >= bestcount)
+        // Prefer add=0 if it's similar to the best found sequence
+        return { static_cast<uint32_t>(zerointerval),
+                 static_cast<uint16_t>(zerocount), 0 };
+    return { static_cast<uint32_t>(bestinterval),
+             static_cast<uint16_t>(bestcount),
+             static_cast<int16_t>(bestadd) };
+}
+
+} // anonymous namespace
 
 // ========== ToolHead ==========
 
@@ -231,65 +382,43 @@ void ToolHead::generateAxisSteps(int axis, const TrapMove& tm, bool needsReset) 
     }
 
     // === Compress step clocks into queue_step(interval, count, add) commands ===
-    // MCU constraints: interval is uint32 (practical max ~0x3FFFFFFF),
-    //                  count is uint16 (max 65535),
-    //                  add is int16 (range [-32768, 32767])
+    // Uses Klipper's compress_bisect_add algorithm for optimal batch sizes.
+    // max_error: 25% of step distance in clock ticks (matches Klipper)
 
-    int64_t mcuClockPos = doReset ? tmStartClock : stepper->getLastStepClock();
+    int64_t lastStepClock = doReset ? tmStartClock : stepper->getLastStepClock();
+    uint32_t maxError = static_cast<uint32_t>(stepDist * 0.25 * mcuFreq);
+    static constexpr uint32_t CLOCK_DIFF_MAX = 3U << 28;
 
     int pos = 0;
     while (pos < numSteps) {
-        int64_t firstInterval = stepClocks[pos] - mcuClockPos;
-        if (firstInterval < 1) firstInterval = 1;
-
-        if (pos + 1 >= numSteps) {
-            // Single step remaining
-            stepper->queueStep(firstInterval, 1, 0);
-            mcuClockPos += firstInterval;
+        // Check for step far from lastStepClock (> ~2.7 seconds)
+        int64_t clockDiff = stepClocks[pos] - lastStepClock;
+        if (clockDiff <= 0) {
+            pos++;
+            continue;
+        }
+        if (static_cast<uint64_t>(clockDiff) >= CLOCK_DIFF_MAX) {
+            stepper->queueStep(static_cast<uint32_t>(clockDiff), 1, 0);
+            lastStepClock = stepClocks[pos];
             pos++;
             continue;
         }
 
-        // Compute add from first two step intervals
-        int64_t secondInterval = stepClocks[pos + 1] - stepClocks[pos];
-        if (secondInterval < 1) secondInterval = 1;
-        int64_t add64 = secondInterval - firstInterval;
+        StepMove move = sc_compress_bisect_add(stepClocks.data(), pos, numSteps,
+                                               lastStepClock, maxError);
 
-        // Clamp to int16 range
-        int16_t add = static_cast<int16_t>(
-            std::clamp(add64, (int64_t)-32768, (int64_t)32767));
+        stepper->queueStep(move.interval, move.count, move.add);
 
-        // Extend batch: keep adding steps while model (interval + add*i) stays accurate
-        int count = 1;
-        int64_t modelClock = mcuClockPos + firstInterval;
-
-        while (pos + count < numSteps && count < 65535) {
-            int64_t modelInterval = firstInterval + (int64_t)add * count;
-            if (modelInterval < 1) break;
-
-            int64_t modelNext = modelClock + modelInterval;
-            int64_t actualClock = stepClocks[pos + count];
-            int64_t error = std::abs(modelNext - actualClock);
-
-            // Tolerance: allow up to 1/8 of interval or 300 ticks (1µs), whichever is larger
-            int64_t tolerance = std::max((int64_t)300, modelInterval / 8);
-            if (error > tolerance) break;
-
-            modelClock = modelNext;
-            count++;
-        }
-
-        stepper->queueStep(firstInterval, count, add);
-
-        // Advance MCU clock by the exact model time
-        // sum of intervals = count*firstInterval + count*(count-1)/2 * add
-        mcuClockPos += (int64_t)count * firstInterval
-                     + (int64_t)count * (count - 1) / 2 * (int64_t)add;
-        pos += count;
+        // Update lastStepClock using the model's total advance
+        // last_clock = lastStepClock + interval*count + add*count*(count-1)/2
+        int64_t totalTicks = (int64_t)move.interval * move.count
+                           + (int64_t)move.add * ((int64_t)move.count * (move.count - 1) / 2);
+        lastStepClock += totalTicks;
+        pos += move.count;
     }
 
     // Track where the stepper's clock ended up (for next TrapMove continuation)
-    stepper->setLastStepClock(mcuClockPos);
+    stepper->setLastStepClock(lastStepClock);
 }
 
 bool ToolHead::generateSteps() {

@@ -140,6 +140,9 @@ public:
     // Check if config has been finalized
     bool isConfigFinalized() const { return m_configFinalized; }
 
+    // MCU move queue capacity (from get_config after finalization)
+    int getMcuMoveCount() const { return m_mcuMoveCount; }
+
     // Reset config state (for reconnection)
     void resetConfig();
 
@@ -209,6 +212,7 @@ private:
     // OID management
     int m_oidCount = 0;
     int m_moveQueueSlots = 0;
+    int m_mcuMoveCount = 0;
     bool m_configFinalized = false;
     std::vector<std::string> m_configCmds;
     std::vector<std::string> m_restartCmds;

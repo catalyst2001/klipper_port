@@ -900,6 +900,7 @@ bool KlipperMCU::finalizeConfig() {
     }
 
     m_configFinalized = true;
+    m_mcuMoveCount = static_cast<int>(configParams["move_count"]);
     std::cout << "[KlipperMCU] Configuration finalized (CRC=" << configCrc 
               << ", move_count=" << configParams["move_count"] << ")" << std::endl;
     return true;
