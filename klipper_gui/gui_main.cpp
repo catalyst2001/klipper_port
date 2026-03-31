@@ -104,6 +104,27 @@ private:
     std::vector<std::unique_ptr<TMC5160>> m_tmcDrivers;
     int m_tmcPollCounter = 0;
     bool m_tmcUnpoweredLogged = false;  // avoid spamming "VMot off"
+
+    // TMC5160 register UI: per-driver checkboxes and labels
+    wxNotebook* m_tmcNotebook = nullptr;  // sub-notebook for driver tabs
+
+    struct TmcBitCheckbox {
+        wxCheckBox* cb;
+        uint8_t reg;   // register address
+        uint8_t bit;   // bit position
+    };
+    struct TmcFieldLabel {
+        wxStaticText* label;
+        uint8_t reg;
+        uint8_t bitLow;  // low bit
+        uint8_t bitHigh; // high bit (inclusive)
+    };
+    struct TmcDriverUI {
+        std::vector<TmcBitCheckbox> bits;
+        std::vector<TmcFieldLabel> fields;
+        wxStaticText* statusLabel = nullptr;
+    };
+    std::vector<TmcDriverUI> m_tmcUI;
     std::mutex m_tcMutex;
     std::vector<TcReading> m_tcReadings;
 
@@ -146,6 +167,8 @@ private:
     int m_nextOid = 0;
 
     void CreateUI();
+    void buildTmcDriverTabs();
+    bool updateTmcRegisterUI();  // returns true if any driver unpowered
     void Log(const wxString& msg, const wxColour& color = *wxBLACK);
     void LogFromThread(const wxString& msg, const wxColour& color = *wxBLACK);
 
@@ -534,6 +557,14 @@ void KlipperFrame::CreateUI() {
     motionPanel->SetSizer(motionSizer);
     notebook->AddPage(motionPanel, "Motion");
 
+    // ---- Stepper Drivers tab (TMC5160 registers) ----
+    auto* driversPanel = new wxPanel(notebook);
+    auto* driversSizer = new wxBoxSizer(wxVERTICAL);
+    m_tmcNotebook = new wxNotebook(driversPanel, wxID_ANY);
+    driversSizer->Add(m_tmcNotebook, 1, wxEXPAND | wxALL, 2);
+    driversPanel->SetSizer(driversSizer);
+    notebook->AddPage(driversPanel, "Stepper Drivers");
+
     // Log panel
     m_logText = new wxTextCtrl(splitter, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
         wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2 | wxHSCROLL);
@@ -564,6 +595,273 @@ void KlipperFrame::CreateUI() {
     m_btnSendGcode->Enable(false);
     m_btnHomeAll->Enable(false);
     m_btnLoadConfig->Enable(false);
+}
+
+void KlipperFrame::buildTmcDriverTabs() {
+    if (!m_tmcNotebook) return;
+
+    // Clear any previous tabs
+    m_tmcNotebook->DeleteAllPages();
+    m_tmcUI.clear();
+
+    // Register bit definitions: { register_addr, bit_pos, name }
+    struct BitDef { uint8_t reg; uint8_t bit; const char* name; };
+    // Register multi-bit field definitions: { register_addr, low_bit, high_bit, name }
+    struct FieldDef { uint8_t reg; uint8_t lo; uint8_t hi; const char* name; };
+
+    // GCONF bits
+    static const BitDef gconfBits[] = {
+        {TMC5160Reg::GCONF, 0, "recalibrate"},
+        {TMC5160Reg::GCONF, 1, "faststandstill"},
+        {TMC5160Reg::GCONF, 2, "en_pwm_mode"},
+        {TMC5160Reg::GCONF, 3, "multistep_filt"},
+        {TMC5160Reg::GCONF, 4, "shaft"},
+        {TMC5160Reg::GCONF, 5, "diag0_error"},
+        {TMC5160Reg::GCONF, 6, "diag0_otpw"},
+        {TMC5160Reg::GCONF, 7, "diag0_stall"},
+        {TMC5160Reg::GCONF, 8, "diag1_stall"},
+        {TMC5160Reg::GCONF, 9, "diag1_index"},
+        {TMC5160Reg::GCONF, 10, "diag1_onstate"},
+        {TMC5160Reg::GCONF, 12, "diag0_pushpull"},
+        {TMC5160Reg::GCONF, 13, "diag1_pushpull"},
+        {TMC5160Reg::GCONF, 14, "small_hysteresis"},
+        {TMC5160Reg::GCONF, 15, "stop_enable"},
+        {TMC5160Reg::GCONF, 16, "direct_mode"},
+    };
+    // GSTAT bits
+    static const BitDef gstatBits[] = {
+        {TMC5160Reg::GSTAT, 0, "reset"},
+        {TMC5160Reg::GSTAT, 1, "drv_err"},
+        {TMC5160Reg::GSTAT, 2, "uv_cp"},
+    };
+    // DRV_STATUS bits
+    static const BitDef drvStatusBits[] = {
+        {TMC5160Reg::DRV_STATUS, 12, "s2vsA"},
+        {TMC5160Reg::DRV_STATUS, 13, "s2vsB"},
+        {TMC5160Reg::DRV_STATUS, 14, "stealth"},
+        {TMC5160Reg::DRV_STATUS, 24, "stallGuard"},
+        {TMC5160Reg::DRV_STATUS, 25, "ot"},
+        {TMC5160Reg::DRV_STATUS, 26, "otpw"},
+        {TMC5160Reg::DRV_STATUS, 27, "s2gA"},
+        {TMC5160Reg::DRV_STATUS, 28, "s2gB"},
+        {TMC5160Reg::DRV_STATUS, 29, "olA"},
+        {TMC5160Reg::DRV_STATUS, 30, "olB"},
+        {TMC5160Reg::DRV_STATUS, 31, "stst"},
+    };
+    static const FieldDef drvStatusFields[] = {
+        {TMC5160Reg::DRV_STATUS, 0, 9, "SG_RESULT"},
+        {TMC5160Reg::DRV_STATUS, 16, 20, "CS_ACTUAL"},
+    };
+    // CHOPCONF bits
+    static const BitDef chopconfBits[] = {
+        {TMC5160Reg::CHOPCONF, 28, "intpol"},
+        {TMC5160Reg::CHOPCONF, 29, "dedge"},
+        {TMC5160Reg::CHOPCONF, 30, "diss2g"},
+        {TMC5160Reg::CHOPCONF, 31, "diss2vs"},
+    };
+    static const FieldDef chopconfFields[] = {
+        {TMC5160Reg::CHOPCONF, 0, 3, "toff"},
+        {TMC5160Reg::CHOPCONF, 4, 6, "hstrt"},
+        {TMC5160Reg::CHOPCONF, 7, 10, "hend"},
+        {TMC5160Reg::CHOPCONF, 15, 16, "tbl"},
+        {TMC5160Reg::CHOPCONF, 20, 23, "tpfd"},
+        {TMC5160Reg::CHOPCONF, 24, 27, "mres"},
+    };
+    // IHOLD_IRUN fields
+    static const FieldDef iholdIrunFields[] = {
+        {TMC5160Reg::IHOLD_IRUN, 0, 4, "IHOLD"},
+        {TMC5160Reg::IHOLD_IRUN, 8, 12, "IRUN"},
+        {TMC5160Reg::IHOLD_IRUN, 16, 19, "IHOLDDELAY"},
+    };
+    // PWMCONF bits
+    static const BitDef pwmconfBits[] = {
+        {TMC5160Reg::PWMCONF, 18, "pwm_autoscale"},
+        {TMC5160Reg::PWMCONF, 19, "pwm_autograd"},
+    };
+    static const FieldDef pwmconfFields[] = {
+        {TMC5160Reg::PWMCONF, 0, 7, "pwm_ofs"},
+        {TMC5160Reg::PWMCONF, 8, 15, "pwm_grad"},
+        {TMC5160Reg::PWMCONF, 16, 17, "pwm_freq"},
+        {TMC5160Reg::PWMCONF, 20, 21, "freewheel"},
+        {TMC5160Reg::PWMCONF, 24, 27, "pwm_reg"},
+        {TMC5160Reg::PWMCONF, 28, 31, "pwm_lim"},
+    };
+    // IOIN bits
+    static const BitDef ioinBits[] = {
+        {TMC5160Reg::IOIN, 0, "refl_step"},
+        {TMC5160Reg::IOIN, 1, "refr_dir"},
+        {TMC5160Reg::IOIN, 2, "encb_dcen"},
+        {TMC5160Reg::IOIN, 3, "enca_dcin"},
+        {TMC5160Reg::IOIN, 4, "drv_enn"},
+        {TMC5160Reg::IOIN, 5, "enc_n"},
+        {TMC5160Reg::IOIN, 6, "sd_mode"},
+        {TMC5160Reg::IOIN, 7, "swcomp_in"},
+    };
+    static const FieldDef ioinFields[] = {
+        {TMC5160Reg::IOIN, 24, 31, "VERSION"},
+    };
+
+    // Register group descriptor
+    struct RegGroup {
+        const char* name;
+        const BitDef* bits;
+        size_t numBits;
+        const FieldDef* fields;
+        size_t numFields;
+    };
+
+    static const RegGroup groups[] = {
+        {"GCONF",      gconfBits,     std::size(gconfBits),     nullptr, 0},
+        {"GSTAT",      gstatBits,     std::size(gstatBits),     nullptr, 0},
+        {"IOIN",       ioinBits,      std::size(ioinBits),      ioinFields, std::size(ioinFields)},
+        {"IHOLD_IRUN", nullptr,       0,                        iholdIrunFields, std::size(iholdIrunFields)},
+        {"CHOPCONF",   chopconfBits,  std::size(chopconfBits),  chopconfFields, std::size(chopconfFields)},
+        {"DRV_STATUS", drvStatusBits, std::size(drvStatusBits), drvStatusFields, std::size(drvStatusFields)},
+        {"PWMCONF",    pwmconfBits,   std::size(pwmconfBits),   pwmconfFields, std::size(pwmconfFields)},
+    };
+
+    for (size_t di = 0; di < m_tmcDrivers.size(); ++di) {
+        auto& tmc = m_tmcDrivers[di];
+        TmcDriverUI dui;
+
+        auto* scrollWin = new wxScrolledWindow(m_tmcNotebook, wxID_ANY);
+        scrollWin->SetScrollRate(10, 10);
+
+        auto* hSizer = new wxBoxSizer(wxHORIZONTAL);
+
+        for (auto& grp : groups) {
+            auto* box = new wxStaticBoxSizer(wxVERTICAL, scrollWin, grp.name);
+
+            // Single-bit checkboxes
+            for (size_t bi = 0; bi < grp.numBits; ++bi) {
+                auto& bd = grp.bits[bi];
+                auto* cb = new wxCheckBox(box->GetStaticBox(), wxID_ANY, bd.name);
+                cb->Disable();  // read-only
+                box->Add(cb, 0, wxLEFT | wxRIGHT, 3);
+                dui.bits.push_back({cb, bd.reg, bd.bit});
+            }
+
+            // Multi-bit fields as labels
+            for (size_t fi = 0; fi < grp.numFields; ++fi) {
+                auto& fd = grp.fields[fi];
+                auto* label = new wxStaticText(box->GetStaticBox(), wxID_ANY,
+                    wxString::Format("%s: ---", fd.name));
+                auto font = label->GetFont();
+                font.SetPointSize(8);
+                label->SetFont(font);
+                box->Add(label, 0, wxLEFT | wxRIGHT | wxTOP, 3);
+                dui.fields.push_back({label, fd.reg, fd.lo, fd.hi});
+            }
+
+            hSizer->Add(box, 0, wxALL | wxEXPAND, 3);
+        }
+
+        // Status summary label at end
+        dui.statusLabel = new wxStaticText(scrollWin, wxID_ANY, "Status: waiting...");
+        auto* vSizer = new wxBoxSizer(wxVERTICAL);
+        vSizer->Add(hSizer, 0, wxEXPAND);
+        vSizer->Add(dui.statusLabel, 0, wxALL, 5);
+
+        scrollWin->SetSizer(vSizer);
+        vSizer->FitInside(scrollWin);
+
+        m_tmcNotebook->AddPage(scrollWin, tmc->getName());
+        m_tmcUI.push_back(std::move(dui));
+    }
+}
+
+bool KlipperFrame::updateTmcRegisterUI() {
+    if (m_tmcDrivers.empty() || m_tmcUI.empty()) return false;
+
+    bool anyUnpowered = false;
+
+    // Map register address to RegisterDump field
+    auto getRegValue = [](const TMC5160::RegisterDump& d, uint8_t reg) -> uint32_t {
+        switch (reg) {
+            case TMC5160Reg::GCONF:      return d.gconf;
+            case TMC5160Reg::GSTAT:       return d.gstat;
+            case TMC5160Reg::IOIN:        return d.ioin;
+            case TMC5160Reg::IHOLD_IRUN:  return d.ihold_irun;
+            case TMC5160Reg::CHOPCONF:    return d.chopconf;
+            case TMC5160Reg::DRV_STATUS:  return d.drv_status;
+            case TMC5160Reg::PWMCONF:     return d.pwmconf;
+            case TMC5160Reg::PWM_SCALE:   return d.pwm_scale;
+            default: return 0;
+        }
+    };
+
+    for (size_t di = 0; di < m_tmcDrivers.size() && di < m_tmcUI.size(); ++di) {
+        auto dump = m_tmcDrivers[di]->readAllRegisters();
+        auto& dui = m_tmcUI[di];
+
+        if (!dump.valid) {
+            if (dui.statusLabel)
+                dui.statusLabel->SetLabel("Status: SPI read failed");
+            continue;
+        }
+
+        // Check unpowered (DRV_STATUS all 1s)
+        bool unpowered = (dump.drv_status == 0xFFFFFFFF);
+        if (unpowered) anyUnpowered = true;
+
+        // Update single-bit checkboxes
+        for (auto& bc : dui.bits) {
+            uint32_t regVal = getRegValue(dump, bc.reg);
+            bc.cb->SetValue((regVal >> bc.bit) & 1);
+        }
+
+        // Update multi-bit field labels
+        for (auto& fl : dui.fields) {
+            uint32_t regVal = getRegValue(dump, fl.reg);
+            uint32_t mask = ((1U << (fl.bitHigh - fl.bitLow + 1)) - 1);
+            uint32_t fieldVal = (regVal >> fl.bitLow) & mask;
+            wxString current = fl.label->GetLabel();
+            wxString name = current.BeforeFirst(':');
+            fl.label->SetLabel(wxString::Format("%s: %u", name, fieldVal));
+        }
+
+        // Update status summary + log errors (using DRV_STATUS from dump, no extra SPI read)
+        if (dui.statusLabel) {
+            if (unpowered) {
+                dui.statusLabel->SetLabel("Status: Driver unpowered (VMot off)");
+                dui.statusLabel->SetForegroundColour(wxColour(200, 100, 0));
+            } else {
+                // Parse DRV_STATUS bits directly from dump
+                TMC5160::DriverStatus status;
+                status.raw       = dump.drv_status;
+                status.sgResult  = dump.drv_status & 0x3FF;
+                status.s2vsA     = (dump.drv_status >> 12) & 1;
+                status.s2vsB     = (dump.drv_status >> 13) & 1;
+                status.stealthChop = (dump.drv_status >> 14) & 1;
+                status.csActual  = (dump.drv_status >> 16) & 0x1F;
+                status.stallGuard = (dump.drv_status >> 24) & 1;
+                status.ot        = (dump.drv_status >> 25) & 1;
+                status.otpw      = (dump.drv_status >> 26) & 1;
+                status.s2gA      = (dump.drv_status >> 27) & 1;
+                status.s2gB      = (dump.drv_status >> 28) & 1;
+                status.olA       = (dump.drv_status >> 29) & 1;
+                status.olB       = (dump.drv_status >> 30) & 1;
+                status.stst      = (dump.drv_status >> 31) & 1;
+
+                if (status.hasError()) {
+                    dui.statusLabel->SetLabel("Status: ERROR - " + TMC5160::formatErrors(status));
+                    dui.statusLabel->SetForegroundColour(*wxRED);
+                    Log(wxString::Format("[TMC5160:%s] ERROR: %s",
+                        m_tmcDrivers[di]->getName(), TMC5160::formatErrors(status)), *wxRED);
+                } else if (status.hasWarning()) {
+                    dui.statusLabel->SetLabel("Status: WARNING - " + TMC5160::formatErrors(status));
+                    dui.statusLabel->SetForegroundColour(wxColour(200, 100, 0));
+                    Log(wxString::Format("[TMC5160:%s] Warning: %s",
+                        m_tmcDrivers[di]->getName(), TMC5160::formatErrors(status)), wxColour(200, 100, 0));
+                } else {
+                    dui.statusLabel->SetLabel("Status: OK - " + TMC5160::formatStatus(status));
+                    dui.statusLabel->SetForegroundColour(wxColour(0, 128, 0));
+                }
+            }
+        }
+    }
+
+    return anyUnpowered;
 }
 
 void KlipperFrame::Log(const wxString& msg, const wxColour& color) {
@@ -641,20 +939,8 @@ void KlipperFrame::OnUITimer(wxTimerEvent&) {
             m_tmcPollCounter = 0;
             std::lock_guard<std::mutex> lock(m_mcuMutex);
 
-            // Check if any driver is unpowered
-            bool anyUnpowered = false;
-            for (auto& tmc : m_tmcDrivers) {
-                auto status = tmc->readStatus();
-                if (status.isUnpowered()) {
-                    anyUnpowered = true;
-                } else if (status.hasError()) {
-                    Log(wxString::Format("[TMC5160:%s] ERROR: %s",
-                        tmc->getName(), TMC5160::formatErrors(status)), *wxRED);
-                } else if (status.hasWarning()) {
-                    Log(wxString::Format("[TMC5160:%s] Warning: %s",
-                        tmc->getName(), TMC5160::formatErrors(status)), wxColour(200, 100, 0));
-                }
-            }
+            // Update register UI and get unpowered state
+            bool anyUnpowered = updateTmcRegisterUI();
 
             if (anyUnpowered && !m_tmcUnpoweredLogged) {
                 Log("TMC5160: Drivers unpowered (VMot off) - status monitoring paused",
@@ -710,6 +996,8 @@ void KlipperFrame::OnConnect(wxCommandEvent&) {
         m_tcReadings.clear();
         m_tmcDrivers.clear();
         m_tmcUnpoweredLogged = false;
+        m_tmcUI.clear();
+        if (m_tmcNotebook) m_tmcNotebook->DeleteAllPages();
         m_stepperObjs.clear();
         m_endstopObjs.clear();
         m_toolhead.reset();
@@ -1603,6 +1891,9 @@ void KlipperFrame::OnLoadConfig(wxCommandEvent&) {
 
         Log(wxString::Format("  TMC5160: %zu driver(s) on %zu SPI bus(es)",
             m_tmcDrivers.size(), spiBuses.size()), wxColour(0, 128, 0));
+
+        // Build register UI for each driver
+        buildTmcDriverTabs();
     }
 
     // Store printer settings

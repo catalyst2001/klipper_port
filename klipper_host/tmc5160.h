@@ -78,6 +78,20 @@ public:
     static std::string formatStatus(const DriverStatus& s);
     static std::string formatErrors(const DriverStatus& s);
 
+    // Bulk register read for UI display
+    struct RegisterDump {
+        uint32_t gconf = 0;
+        uint32_t gstat = 0;
+        uint32_t ioin = 0;
+        uint32_t ihold_irun = 0;
+        uint32_t chopconf = 0;
+        uint32_t drv_status = 0;
+        uint32_t pwmconf = 0;
+        uint32_t pwm_scale = 0;
+        bool valid = false;
+    };
+    RegisterDump readAllRegisters();
+
 private:
     std::string m_name;
     MCU_SPI* m_spi = nullptr;

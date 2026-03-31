@@ -274,6 +274,22 @@ bool TMC5160::initRegisters() {
     return true;
 }
 
+TMC5160::RegisterDump TMC5160::readAllRegisters() {
+    RegisterDump d;
+    if (!m_spi) return d;
+
+    readRegister(TMC5160Reg::GCONF, d.gconf);
+    readRegister(TMC5160Reg::GSTAT, d.gstat);
+    readRegister(TMC5160Reg::IOIN, d.ioin);
+    readRegister(TMC5160Reg::IHOLD_IRUN, d.ihold_irun);
+    readRegister(TMC5160Reg::CHOPCONF, d.chopconf);
+    readRegister(TMC5160Reg::DRV_STATUS, d.drv_status);
+    readRegister(TMC5160Reg::PWMCONF, d.pwmconf);
+    readRegister(TMC5160Reg::PWM_SCALE, d.pwm_scale);
+    d.valid = true;
+    return d;
+}
+
 TMC5160::DriverStatus TMC5160::readStatus() {
     DriverStatus s;
     uint32_t raw = 0;
