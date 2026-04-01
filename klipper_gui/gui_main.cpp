@@ -12,6 +12,7 @@
 #include <atomic>
 #include <queue>
 #include <sstream>
+#include <fstream>
 
 #include "../klipper_host/klipper_mcu.h"
 #include "../klipper_host/mcu_objects.h"
@@ -23,6 +24,8 @@
 #include "../klipper_host/tmc5160.h"
 
 #include <wx/filedlg.h>
+#include <wx/filename.h>
+#include <wx/gauge.h>
 
 #include <memory>
 
@@ -152,6 +155,10 @@ private:
     std::unique_ptr<ToolHead> m_toolhead;
     std::unique_ptr<GCodeParser> m_gcode;
 
+    // PrinterRail objects (for homing + endstop queries)
+    std::vector<std::unique_ptr<PrinterRail>> m_rails;
+    int m_endstopPollCounter = 0;
+
     // Motion UI
     wxListCtrl* m_stepperList = nullptr;
     wxTextCtrl* m_stepPinCtrl = nullptr;
@@ -172,12 +179,35 @@ private:
     wxStaticText* m_configPathLabel = nullptr;
     std::unique_ptr<ConfigResult> m_configResult;
 
+    // Endstop status display
+    wxStaticText* m_endstopStatus = nullptr;
+
+    // Print tab
+    wxStaticText* m_printFileLabel = nullptr;
+    wxButton* m_btnPrintLoad = nullptr;
+    wxButton* m_btnPrintStart = nullptr;
+    wxButton* m_btnPrintPause = nullptr;
+    wxButton* m_btnPrintStop = nullptr;
+    wxGauge* m_printProgress = nullptr;
+    wxStaticText* m_printStatus = nullptr;
+    wxTextCtrl* m_printGcodeView = nullptr;
+    std::string m_printFilePath;
+    std::vector<std::string> m_printLines;
+    std::atomic<bool> m_printing{false};
+    std::atomic<bool> m_printPaused{false};
+    std::atomic<bool> m_printStop{false};
+    std::thread m_printThread;
+    std::atomic<size_t> m_printCurrentLine{0};
+
+    // Driver error ignore
+    wxCheckBox* m_cbIgnoreTmcErrors = nullptr;
+
     // Pin management
     int m_nextOid = 0;
 
     void CreateUI();
     void buildTmcDriverTabs();
-    bool updateTmcRegisterUI();  // returns true if any driver unpowered
+    bool updateTmcRegisterUI(bool ignoreErrors = false);  // returns true if any driver unpowered
     void writeTmcRegisterFromUI(size_t driverIdx, uint8_t reg);
     void Log(const wxString& msg, const wxColour& color = *wxBLACK);
     void LogFromThread(const wxString& msg, const wxColour& color = *wxBLACK);
@@ -216,6 +246,11 @@ private:
     void OnHomeAll(wxCommandEvent& evt);
     void OnLoadConfig(wxCommandEvent& evt);
     void OnJog(wxCommandEvent& evt);
+    void OnPrintLoad(wxCommandEvent& evt);
+    void OnPrintStart(wxCommandEvent& evt);
+    void OnPrintPause(wxCommandEvent& evt);
+    void OnPrintStop(wxCommandEvent& evt);
+    void PrintThread();
 };
 
 // ---- App Implementation ----
@@ -254,6 +289,10 @@ enum {
     ID_JOG_YN,
     ID_JOG_ZP,
     ID_JOG_ZN,
+    ID_PRINT_LOAD,
+    ID_PRINT_START,
+    ID_PRINT_PAUSE,
+    ID_PRINT_STOP,
 };
 
 KlipperFrame::KlipperFrame()
@@ -286,6 +325,10 @@ KlipperFrame::KlipperFrame()
     Bind(wxEVT_BUTTON, &KlipperFrame::OnJog, this, ID_JOG_YN);
     Bind(wxEVT_BUTTON, &KlipperFrame::OnJog, this, ID_JOG_ZP);
     Bind(wxEVT_BUTTON, &KlipperFrame::OnJog, this, ID_JOG_ZN);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnPrintLoad, this, ID_PRINT_LOAD);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnPrintStart, this, ID_PRINT_START);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnPrintPause, this, ID_PRINT_PAUSE);
+    Bind(wxEVT_BUTTON, &KlipperFrame::OnPrintStop, this, ID_PRINT_STOP);
     Bind(wxEVT_TIMER, &KlipperFrame::OnUITimer, this, ID_UI_TIMER);
     Bind(wxEVT_CLOSE_WINDOW, &KlipperFrame::OnClose, this);
 
@@ -564,16 +607,72 @@ void KlipperFrame::CreateUI() {
     m_motionStatus->SetForegroundColour(wxColour(80, 80, 80));
     motionSizer->Add(m_motionStatus, 0, wxALL, 5);
 
+    // Endstop status
+    m_endstopStatus = new wxStaticText(motionPanel, wxID_ANY, "Endstops: (not configured)");
+    m_endstopStatus->SetForegroundColour(wxColour(80, 80, 80));
+    motionSizer->Add(m_endstopStatus, 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+
     motionPanel->SetSizer(motionSizer);
     notebook->AddPage(motionPanel, "Motion");
 
     // ---- Stepper Drivers tab (TMC5160 registers) ----
     auto* driversPanel = new wxPanel(notebook);
     auto* driversSizer = new wxBoxSizer(wxVERTICAL);
+    m_cbIgnoreTmcErrors = new wxCheckBox(driversPanel, wxID_ANY, "Ignore driver errors (suppress warnings/errors)");
+    driversSizer->Add(m_cbIgnoreTmcErrors, 0, wxALL, 5);
     m_tmcNotebook = new wxNotebook(driversPanel, wxID_ANY);
     driversSizer->Add(m_tmcNotebook, 1, wxEXPAND | wxALL, 2);
     driversPanel->SetSizer(driversSizer);
     notebook->AddPage(driversPanel, "Stepper Drivers");
+
+    // ---- Print tab (G-code file execution) ----
+    auto* printPanel = new wxPanel(notebook);
+    auto* printSizer = new wxBoxSizer(wxVERTICAL);
+
+    // File selection row
+    auto* printFileSizer = new wxBoxSizer(wxHORIZONTAL);
+    m_btnPrintLoad = new wxButton(printPanel, ID_PRINT_LOAD, "Load G-code...");
+    printFileSizer->Add(m_btnPrintLoad, 0, wxALL, 3);
+    m_printFileLabel = new wxStaticText(printPanel, wxID_ANY, "File: (none)");
+    m_printFileLabel->SetForegroundColour(wxColour(80, 80, 80));
+    printFileSizer->Add(m_printFileLabel, 1, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    printSizer->Add(printFileSizer, 0, wxEXPAND);
+
+    // Control buttons row
+    auto* printCtrlSizer = new wxBoxSizer(wxHORIZONTAL);
+    m_btnPrintStart = new wxButton(printPanel, ID_PRINT_START, "Start");
+    m_btnPrintStart->SetBackgroundColour(wxColour(200, 255, 200));
+    m_btnPrintPause = new wxButton(printPanel, ID_PRINT_PAUSE, "Pause");
+    m_btnPrintStop = new wxButton(printPanel, ID_PRINT_STOP, "Stop");
+    m_btnPrintStop->SetBackgroundColour(wxColour(255, 200, 200));
+    printCtrlSizer->Add(m_btnPrintStart, 0, wxALL, 3);
+    printCtrlSizer->Add(m_btnPrintPause, 0, wxALL, 3);
+    printCtrlSizer->Add(m_btnPrintStop, 0, wxALL, 3);
+    printSizer->Add(printCtrlSizer, 0, wxEXPAND);
+
+    // Progress bar
+    m_printProgress = new wxGauge(printPanel, wxID_ANY, 100, wxDefaultPosition, wxSize(-1, 20));
+    printSizer->Add(m_printProgress, 0, wxEXPAND | wxALL, 5);
+
+    // Print status
+    m_printStatus = new wxStaticText(printPanel, wxID_ANY, "Print: idle");
+    m_printStatus->SetForegroundColour(wxColour(80, 80, 80));
+    printSizer->Add(m_printStatus, 0, wxALL, 5);
+
+    // G-code preview
+    m_printGcodeView = new wxTextCtrl(printPanel, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
+        wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2 | wxHSCROLL);
+    m_printGcodeView->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+    printSizer->Add(m_printGcodeView, 1, wxEXPAND | wxALL, 2);
+
+    printPanel->SetSizer(printSizer);
+    notebook->AddPage(printPanel, "Print");
+
+    // Initial print button states
+    m_btnPrintLoad->Enable(false);
+    m_btnPrintStart->Enable(false);
+    m_btnPrintPause->Enable(false);
+    m_btnPrintStop->Enable(false);
 
     // Log panel
     m_logText = new wxTextCtrl(splitter, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
@@ -808,7 +907,7 @@ void KlipperFrame::buildTmcDriverTabs() {
     }
 }
 
-bool KlipperFrame::updateTmcRegisterUI() {
+bool KlipperFrame::updateTmcRegisterUI(bool ignoreErrors) {
     if (m_tmcDrivers.empty() || m_tmcUI.empty()) return false;
 
     bool anyUnpowered = false;
@@ -890,7 +989,10 @@ bool KlipperFrame::updateTmcRegisterUI() {
                 status.olB       = (dump.drv_status >> 30) & 1;
                 status.stst      = (dump.drv_status >> 31) & 1;
 
-                if (status.hasError()) {
+                if (ignoreErrors) {
+                    dui.statusLabel->SetLabel("Status: " + TMC5160::formatStatus(status) + " [errors ignored]");
+                    dui.statusLabel->SetForegroundColour(wxColour(120, 120, 120));
+                } else if (status.hasError()) {
                     dui.statusLabel->SetLabel("Status: ERROR - " + TMC5160::formatErrors(status));
                     dui.statusLabel->SetForegroundColour(*wxRED);
                     Log(wxString::Format("[TMC5160:%s] ERROR: %s",
@@ -1015,20 +1117,64 @@ void KlipperFrame::OnUITimer(wxTimerEvent&) {
         m_tmcPollCounter++;
         if (m_tmcPollCounter >= 20) {
             m_tmcPollCounter = 0;
+            bool ignoreTmc = m_cbIgnoreTmcErrors && m_cbIgnoreTmcErrors->GetValue();
             std::lock_guard<std::mutex> lock(m_mcuMutex);
 
             // Update register UI and get unpowered state
-            bool anyUnpowered = updateTmcRegisterUI();
+            bool anyUnpowered = updateTmcRegisterUI(ignoreTmc);
 
-            if (anyUnpowered && !m_tmcUnpoweredLogged) {
-                Log("TMC5160: Charge pump undervoltage (GSTAT.uv_cp set) - VMot off or too low",
-                    wxColour(200, 100, 0));
-                m_tmcUnpoweredLogged = true;
-            } else if (!anyUnpowered && m_tmcUnpoweredLogged) {
-                Log("TMC5160: Charge pump OK (GSTAT.uv_cp cleared) - VMot restored",
-                    wxColour(0, 128, 0));
-                m_tmcUnpoweredLogged = false;
+            if (!ignoreTmc) {
+                if (anyUnpowered && !m_tmcUnpoweredLogged) {
+                    Log("TMC5160: Charge pump undervoltage (GSTAT.uv_cp set) - VMot off or too low",
+                        wxColour(200, 100, 0));
+                    m_tmcUnpoweredLogged = true;
+                } else if (!anyUnpowered && m_tmcUnpoweredLogged) {
+                    Log("TMC5160: Charge pump OK (GSTAT.uv_cp cleared) - VMot restored",
+                        wxColour(0, 128, 0));
+                    m_tmcUnpoweredLogged = false;
+                }
             }
+        }
+    }
+
+    // Endstop polling (~every 500ms at 10Hz timer)
+    if (m_connected && m_mcu.isConfigFinalized() && !m_endstopObjs.empty()) {
+        m_endstopPollCounter++;
+        if (m_endstopPollCounter >= 5) {
+            m_endstopPollCounter = 0;
+            std::lock_guard<std::mutex> lock(m_mcuMutex);
+
+            wxString endstopStr = "Endstops:";
+            const char* axisNames[] = {"X", "Y", "Z"};
+            for (size_t i = 0; i < m_endstopObjs.size() && i < 3; ++i) {
+                bool triggered = false;
+                if (m_endstopObjs[i]->queryState(triggered)) {
+                    endstopStr += wxString::Format("  %s=%s", axisNames[i],
+                        triggered ? "TRIGGERED" : "open");
+                } else {
+                    endstopStr += wxString::Format("  %s=?", axisNames[i]);
+                }
+            }
+            if (m_endstopStatus) {
+                m_endstopStatus->SetLabel(endstopStr);
+                m_endstopStatus->SetForegroundColour(
+                    endstopStr.Contains("TRIGGERED") ? *wxRED : wxColour(0, 128, 0));
+            }
+        }
+    }
+
+    // Print progress update
+    if (m_printing) {
+        size_t current = m_printCurrentLine;
+        size_t total = m_printLines.size();
+        if (total > 0) {
+            int pct = static_cast<int>((current * 100) / total);
+            m_printProgress->SetValue(pct);
+            m_printStatus->SetLabel(wxString::Format("Print: line %zu / %zu (%d%%)%s",
+                current, total, pct,
+                m_printPaused.load() ? " [PAUSED]" : ""));
+            m_printStatus->SetForegroundColour(
+                m_printPaused.load() ? wxColour(200, 100, 0) : wxColour(0, 128, 0));
         }
     }
 }
@@ -1078,10 +1224,29 @@ void KlipperFrame::OnConnect(wxCommandEvent&) {
         if (m_tmcNotebook) m_tmcNotebook->DeleteAllPages();
         m_stepperObjs.clear();
         m_endstopObjs.clear();
+        m_rails.clear();
         m_toolhead.reset();
         m_gcode.reset();
         m_configResult.reset();
         m_configPathLabel->SetLabel("Config: (none)");
+        // Stop any active print
+        if (m_printing) {
+            m_printStop = true;
+            if (m_printThread.joinable()) m_printThread.join();
+            m_printing = false;
+            m_printStop = false;
+        }
+        m_printLines.clear();
+        m_printFilePath.clear();
+        m_printCurrentLine = 0;
+        if (m_printProgress) m_printProgress->SetValue(0);
+        if (m_printStatus) m_printStatus->SetLabel("Print: idle");
+        if (m_printFileLabel) m_printFileLabel->SetLabel("File: (none)");
+        if (m_btnPrintLoad) m_btnPrintLoad->Enable(false);
+        if (m_btnPrintStart) m_btnPrintStart->Enable(false);
+        if (m_btnPrintPause) m_btnPrintPause->Enable(false);
+        if (m_btnPrintStop) m_btnPrintStop->Enable(false);
+        if (m_endstopStatus) m_endstopStatus->SetLabel("Endstops: (not configured)");
         Log("Disconnected.", *wxRED);
     }
     else {
@@ -1544,9 +1709,21 @@ void KlipperFrame::OnFinalizeConfig(wxCommandEvent&) {
             }
 
             m_gcode = std::make_unique<GCodeParser>(*m_toolhead, m_mcu);
+
+            // Register rails for homing (G28) support
+            for (size_t i = 0; i < m_rails.size() && i < 3; ++i) {
+                m_gcode->addRail(static_cast<int>(i), m_rails[i].get());
+            }
+
             m_btnSendGcode->Enable(true);
             m_btnHomeAll->Enable(true);
+            m_btnPrintLoad->Enable(true);
             Log("Toolhead + G-code parser initialized", wxColour(0, 128, 0));
+
+            if (!m_rails.empty()) {
+                Log(wxString::Format("  %zu axis rail(s) registered for homing", m_rails.size()),
+                    wxColour(0, 128, 0));
+            }
         }
 
         // Initialize TMC5160 drivers (after finalize, SPI is now operational)
@@ -1801,6 +1978,29 @@ void KlipperFrame::OnJog(wxCommandEvent& evt) {
 
     std::lock_guard<std::mutex> lock(m_mcuMutex);
 
+    // Check endstop before moving: refuse to move toward a triggered endstop
+    {
+        int axisIdx = (axis == "X") ? 0 : (axis == "Y") ? 1 : 2;
+        if (axisIdx < static_cast<int>(m_endstopObjs.size())) {
+            bool triggered = false;
+            if (m_endstopObjs[axisIdx]->queryState(triggered) && triggered) {
+                // Check if moving toward endstop (toward position_endstop)
+                double endstopPos = 0.0;
+                if (axisIdx < static_cast<int>(m_rails.size())) {
+                    endstopPos = m_rails[axisIdx]->getPositionEndstop();
+                }
+                Vec3 curPos = m_toolhead->getPosition();
+                double curAxisPos = (axisIdx == 0) ? curPos.x : (axisIdx == 1) ? curPos.y : curPos.z;
+                bool movingToward = (endstopPos <= curAxisPos) ? (dist < 0) : (dist > 0);
+                if (movingToward) {
+                    Log(wxString::Format("Jog blocked: %s endstop is triggered! Move away first.", axis),
+                        *wxRED);
+                    return;
+                }
+            }
+        }
+    }
+
     // Advance print_time base to current MCU time so steps are in the future
     double now = m_mcu.getClockSync().estimatedPrintTime() + 0.25;
     if (now > m_toolhead->getNextPrintTime())
@@ -1867,6 +2067,9 @@ void KlipperFrame::OnLoadConfig(wxCommandEvent&) {
 
         if (si.endstop) {
             m_endstopObjs.push_back(std::move(si.endstop));
+        }
+        if (si.rail) {
+            m_rails.push_back(std::move(si.rail));
         }
         m_stepperObjs.push_back(std::move(si.stepper));
     }
@@ -1992,7 +2195,205 @@ void KlipperFrame::OnLoadConfig(wxCommandEvent&) {
     m_btnLoadConfig->Enable(false);
 }
 
+void KlipperFrame::OnPrintLoad(wxCommandEvent&) {
+    if (!m_connected || !m_gcode) return;
+
+    wxFileDialog dlg(this, "Open G-code File", "", "",
+                     "G-code Files (*.gcode;*.gco;*.g)|*.gcode;*.gco;*.g|All Files (*.*)|*.*",
+                     wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+    if (dlg.ShowModal() == wxID_CANCEL)
+        return;
+
+    std::string path = dlg.GetPath().ToStdString();
+
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        Log("Failed to open G-code file: " + wxString(path), *wxRED);
+        return;
+    }
+
+    m_printLines.clear();
+    std::string line;
+    while (std::getline(file, line)) {
+        // Strip \r from Windows line endings
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        m_printLines.push_back(line);
+    }
+
+    m_printFilePath = path;
+    m_printCurrentLine = 0;
+
+    // Update UI
+    wxString filename = wxFileName(path).GetFullName();
+    m_printFileLabel->SetLabel(wxString::Format("File: %s (%zu lines)", filename, m_printLines.size()));
+    m_printFileLabel->SetForegroundColour(wxColour(0, 100, 0));
+    m_printProgress->SetValue(0);
+    m_printStatus->SetLabel(wxString::Format("Print: loaded %zu lines, ready to start", m_printLines.size()));
+    m_printStatus->SetForegroundColour(wxColour(0, 0, 160));
+
+    // Show preview (first 200 lines)
+    m_printGcodeView->Clear();
+    size_t previewLines = std::min(m_printLines.size(), size_t(200));
+    for (size_t i = 0; i < previewLines; ++i) {
+        m_printGcodeView->AppendText(wxString::Format("%5zu: %s\n", i + 1, m_printLines[i]));
+    }
+    if (m_printLines.size() > 200) {
+        m_printGcodeView->AppendText(wxString::Format("... (%zu more lines)\n",
+            m_printLines.size() - 200));
+    }
+
+    m_btnPrintStart->Enable(true);
+    m_btnPrintPause->Enable(false);
+    m_btnPrintStop->Enable(false);
+
+    Log(wxString::Format("Loaded G-code: %s (%zu lines)", filename, m_printLines.size()),
+        wxColour(0, 128, 0));
+}
+
+void KlipperFrame::OnPrintStart(wxCommandEvent&) {
+    if (!m_connected || !m_gcode || m_printLines.empty()) return;
+
+    if (m_printing) {
+        // Resume from pause
+        m_printPaused = false;
+        m_btnPrintPause->SetLabel("Pause");
+        Log("Print resumed", wxColour(0, 128, 0));
+        return;
+    }
+
+    m_printing = true;
+    m_printPaused = false;
+    m_printStop = false;
+    m_printCurrentLine = 0;
+
+    m_btnPrintStart->Enable(false);
+    m_btnPrintPause->Enable(true);
+    m_btnPrintStop->Enable(true);
+    m_btnPrintLoad->Enable(false);
+
+    Log(wxString::Format("Starting print: %s (%zu lines)", m_printFilePath, m_printLines.size()),
+        wxColour(0, 128, 0));
+
+    // Start print thread
+    if (m_printThread.joinable()) m_printThread.join();
+    m_printThread = std::thread(&KlipperFrame::PrintThread, this);
+}
+
+void KlipperFrame::OnPrintPause(wxCommandEvent&) {
+    if (!m_printing) return;
+
+    m_printPaused = !m_printPaused;
+    m_btnPrintPause->SetLabel(m_printPaused ? "Resume" : "Pause");
+    m_btnPrintStart->Enable(m_printPaused.load());
+    Log(m_printPaused ? "Print paused" : "Print resumed", wxColour(200, 100, 0));
+}
+
+void KlipperFrame::OnPrintStop(wxCommandEvent&) {
+    if (!m_printing) return;
+
+    m_printStop = true;
+    m_printPaused = false;  // unblock if paused
+    Log("Print stop requested...", *wxRED);
+}
+
+void KlipperFrame::PrintThread() {
+    size_t batchSize = 10;  // execute multiple lines per batch for efficiency
+
+    for (size_t i = 0; i < m_printLines.size(); ++i) {
+        // Check stop
+        if (m_printStop) break;
+
+        // Handle pause
+        while (m_printPaused && !m_printStop) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (m_printStop) break;
+
+        const auto& line = m_printLines[i];
+        m_printCurrentLine = i + 1;
+
+        // Skip empty lines and comments
+        if (line.empty() || line[0] == ';') continue;
+
+        // Skip lines that are only comments after stripping
+        auto commentPos = line.find(';');
+        std::string cmd = (commentPos != std::string::npos) ? line.substr(0, commentPos) : line;
+        // Trim whitespace
+        while (!cmd.empty() && (cmd.back() == ' ' || cmd.back() == '\t'))
+            cmd.pop_back();
+        if (cmd.empty()) continue;
+
+        {
+            std::lock_guard<std::mutex> lock(m_mcuMutex);
+
+            // Advance print_time base
+            double now = m_mcu.getClockSync().estimatedPrintTime() + 0.25;
+            if (now > m_toolhead->getNextPrintTime())
+                m_toolhead->setNextPrintTime(now);
+
+            if (!m_gcode->executeLine(cmd)) {
+                LogFromThread(wxString::Format("Print error at line %zu: %s",
+                    i + 1, m_gcode->getLastMessage()), *wxRED);
+                // Continue on unknown commands, stop on real errors
+                if (m_gcode->getLastMessage().find("Unknown") == std::string::npos) {
+                    break;
+                }
+                continue;
+            }
+
+            // Flush and generate steps periodically
+            if ((i % batchSize) == 0 || i == m_printLines.size() - 1) {
+                m_toolhead->flush();
+                m_toolhead->generateSteps();
+
+                // Small delay to let MCU process steps
+                double moveTime = 0.05;
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(static_cast<int>(moveTime * 1000)));
+            }
+        }
+    }
+
+    // Final flush
+    {
+        std::lock_guard<std::mutex> lock(m_mcuMutex);
+        m_toolhead->flush();
+        m_toolhead->generateSteps();
+    }
+
+    bool stopped = m_printStop.load();
+    m_printing = false;
+    m_printStop = false;
+
+    if (stopped) {
+        LogFromThread("Print stopped by user", *wxRED);
+    } else {
+        LogFromThread(wxString::Format("Print complete! %zu lines executed", m_printLines.size()),
+            wxColour(0, 128, 0));
+    }
+
+    // Re-enable buttons from the main thread via log queue (will be processed in timer)
+    // Use CallAfter for thread-safe UI updates
+    CallAfter([this, stopped]() {
+        m_btnPrintStart->Enable(false);
+        m_btnPrintPause->Enable(false);
+        m_btnPrintStop->Enable(false);
+        m_btnPrintLoad->Enable(true);
+        m_btnPrintPause->SetLabel("Pause");
+        m_printProgress->SetValue(stopped ? m_printProgress->GetValue() : 100);
+        m_printStatus->SetLabel(stopped ? "Print: stopped" : "Print: complete");
+        m_printStatus->SetForegroundColour(stopped ? *wxRED : wxColour(0, 128, 0));
+    });
+}
+
 void KlipperFrame::OnClose(wxCloseEvent& evt) {
+    // Stop any active print
+    if (m_printing) {
+        m_printStop = true;
+        m_printPaused = false;
+        if (m_printThread.joinable()) m_printThread.join();
+    }
     StopClockSync();
     StopPolling();
     m_mcu.disconnect();
