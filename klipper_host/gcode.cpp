@@ -5,7 +5,12 @@
 #include <iostream>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <regex>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 // ========== GCodeParser ==========
 
@@ -59,7 +64,13 @@ GCodeParser::ParsedLine GCodeParser::parseLine(const std::string& line) {
         size_t numStart = pos;
         while (pos < cleaned.size() && std::isdigit(static_cast<unsigned char>(cleaned[pos])))
             pos++;
-        result.command = std::string(1, cmdLetter) + cleaned.substr(numStart, pos - numStart);
+        // Normalize: strip leading zeros so G00->G0, G01->G1, etc.
+        std::string numPart = cleaned.substr(numStart, pos - numStart);
+        // Convert to integer and back to remove leading zeros
+        if (!numPart.empty()) {
+            try { numPart = std::to_string(std::stoi(numPart)); } catch (...) {}
+        }
+        result.command = std::string(1, cmdLetter) + numPart;
     }
 
     // Skip whitespace
@@ -111,6 +122,8 @@ bool GCodeParser::executeLine(const std::string& line) {
     // Built-in commands
     if (parsed.command == "G0" || parsed.command == "G1") {
         return cmdG0G1(parsed.params);
+    } else if (parsed.command == "G2" || parsed.command == "G3") {
+        return cmdG2G3(parsed.command == "G2", parsed.params);
     } else if (parsed.command == "G28") {
         return cmdG28(parsed.params);
     } else if (parsed.command == "G90") {
@@ -127,6 +140,11 @@ bool GCodeParser::executeLine(const std::string& line) {
         return cmdM112(parsed.params);
     } else if (parsed.command == "M400") {
         return cmdM400(parsed.params);
+    }
+
+    // Silently ignore common non-motion commands (M-codes for temp, fan, etc.)
+    if (parsed.command[0] == 'M' || parsed.command == "G4" || parsed.command == "G21" || parsed.command == "G20") {
+        return true; // silently skip
     }
 
     m_lastMsg = "Unknown command: " + parsed.command;
@@ -176,6 +194,97 @@ bool GCodeParser::cmdG0G1(const std::map<char, double>& params) {
     }
 
     m_toolhead.moveAbsolute(target, m_feedrate);
+    return true;
+}
+
+// G2/G3: Arc move (clockwise / counterclockwise)
+// Linearizes arc into small line segments
+bool GCodeParser::cmdG2G3(bool clockwise, const std::map<char, double>& params) {
+    // Handle feedrate
+    auto fIt = params.find('F');
+    if (fIt != params.end()) {
+        m_feedrate = fIt->second / 60.0;
+        if (m_feedrate <= 0) m_feedrate = 1.0;
+    }
+
+    Vec3 curPos = m_toolhead.getPosition();
+    double startX = curPos.x;
+    double startY = curPos.y;
+
+    // Target position
+    double endX = startX, endY = startY;
+    double endZ = curPos.z;
+
+    if (m_absoluteMode) {
+        auto xIt = params.find('X');
+        if (xIt != params.end()) endX = xIt->second + m_basePos.x;
+        auto yIt = params.find('Y');
+        if (yIt != params.end()) endY = yIt->second + m_basePos.y;
+        auto zIt = params.find('Z');
+        if (zIt != params.end()) endZ = zIt->second + m_basePos.z;
+    } else {
+        auto xIt = params.find('X');
+        if (xIt != params.end()) endX += xIt->second;
+        auto yIt = params.find('Y');
+        if (yIt != params.end()) endY += yIt->second;
+        auto zIt = params.find('Z');
+        if (zIt != params.end()) endZ += zIt->second;
+    }
+
+    // I, J are always relative offsets from current position to arc center
+    double i = 0.0, j = 0.0;
+    auto iIt = params.find('I');
+    if (iIt != params.end()) i = iIt->second;
+    auto jIt = params.find('J');
+    if (jIt != params.end()) j = jIt->second;
+
+    double centerX = startX + i;
+    double centerY = startY + j;
+
+    double r1 = std::hypot(startX - centerX, startY - centerY);
+    double r2 = std::hypot(endX - centerX, endY - centerY);
+    double radius = (r1 + r2) / 2.0;
+
+    if (radius < 1e-6) {
+        // Degenerate arc — treat as linear move
+        Vec3 target{endX, endY, endZ};
+        m_toolhead.moveAbsolute(target, m_feedrate);
+        return true;
+    }
+
+    double startAngle = std::atan2(startY - centerY, startX - centerX);
+    double endAngle = std::atan2(endY - centerY, endX - centerX);
+
+    double sweep;
+    if (clockwise) {
+        sweep = startAngle - endAngle;
+        if (sweep <= 0) sweep += 2.0 * M_PI;
+        sweep = -sweep; // negative for CW
+    } else {
+        sweep = endAngle - startAngle;
+        if (sweep <= 0) sweep += 2.0 * M_PI;
+    }
+
+    // Number of segments: ~1mm per segment or at least 8
+    int segments = static_cast<int>(std::abs(sweep) * radius / 1.0);
+    if (segments < 8) segments = 8;
+    if (segments > 360) segments = 360;
+
+    double zStep = (endZ - curPos.z) / segments;
+
+    for (int s = 1; s <= segments; s++) {
+        double frac = static_cast<double>(s) / segments;
+        double angle = startAngle + sweep * frac;
+        Vec3 pt;
+        pt.x = centerX + radius * std::cos(angle);
+        pt.y = centerY + radius * std::sin(angle);
+        pt.z = curPos.z + zStep * s;
+        m_toolhead.moveAbsolute(pt, m_feedrate);
+    }
+
+    // Ensure we end exactly at the target
+    Vec3 finalPt{endX, endY, endZ};
+    m_toolhead.moveAbsolute(finalPt, m_feedrate);
     return true;
 }
 

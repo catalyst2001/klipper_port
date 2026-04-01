@@ -337,6 +337,12 @@ KlipperFrame::KlipperFrame()
 }
 
 KlipperFrame::~KlipperFrame() {
+    // Stop any active print thread before destruction
+    if (m_printing) {
+        m_printStop = true;
+        m_printPaused = false;
+    }
+    if (m_printThread.joinable()) m_printThread.join();
     StopPolling();
 }
 

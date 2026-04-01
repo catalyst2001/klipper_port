@@ -87,4 +87,5 @@ private:
     bool cmdM84(const std::map<char, double>& params);
     bool cmdM112(const std::map<char, double>& params);
     bool cmdM400(const std::map<char, double>& params);
+    bool cmdG2G3(bool clockwise, const std::map<char, double>& params);
 };
