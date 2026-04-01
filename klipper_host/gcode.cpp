@@ -79,8 +79,16 @@ GCodeParser::ParsedLine GCodeParser::parseLine(const std::string& line) {
                    (std::isdigit(static_cast<unsigned char>(cleaned[pos])) || cleaned[pos] == '.'))
                 pos++;
             if (pos > numStart) {
-                double val = std::stod(cleaned.substr(numStart, pos - numStart));
-                result.params[paramLetter] = val;
+                std::string numStr = cleaned.substr(numStart, pos - numStart);
+                // Guard against strings like "-", "+", "." that aren't valid numbers
+                try {
+                    size_t idx = 0;
+                    double val = std::stod(numStr, &idx);
+                    if (idx > 0)
+                        result.params[paramLetter] = val;
+                } catch (...) {
+                    // Skip unparseable parameter value
+                }
             }
         } else {
             pos++;
