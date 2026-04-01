@@ -1,5 +1,6 @@
 #include "klipper_config.h"
 #include "klipper_mcu.h"
+#include <set>
 #include "mcu_objects.h"
 #include "stepper.h"
 #include "toolhead.h"
@@ -206,13 +207,9 @@ ConfigResult::StepperInfo KlipperConfig::buildStepper(
     info.stepper->setupStepDist(rotationDist, fullSteps, microsteps, gearRatio);
     info.stepper->buildConfig();
 
-    // Enable pin → digital out
+    // Enable pin → store raw value for dedup in buildObjects
     if (section.has("enable_pin")) {
-        bool invertEn = false, pullUpEn = false;
-        std::string enPin = cleanPin(section.get("enable_pin"), invertEn, pullUpEn);
-        // Enable pins are typically active-low (! prefix means invert)
-        // We create it as a digital out, start with enabled state = !invert
-        // (most Klipper configs use "!PA9" meaning the enable is active low)
+        info.enablePinRaw = section.get("enable_pin");
     }
 
     // Endstop
@@ -415,6 +412,29 @@ ConfigResult KlipperConfig::buildObjects(KlipperMCU& mcu,
         else {
             if (type != "mcu" && type.substr(0, 10) != "adc_scaled")
                 result.warnings.push_back("Skipped section: [" + type + "]");
+        }
+    }
+
+    // Create unique enable pin digital outputs (dedup shared pins like !PA9)
+    {
+        std::set<std::string> createdEnablePins;
+        for (auto& si : result.steppers) {
+            if (si.enablePinRaw.empty()) continue;
+            if (createdEnablePins.count(si.enablePinRaw)) continue;
+            createdEnablePins.insert(si.enablePinRaw);
+
+            bool invertEn = false, pullUpEn = false;
+            std::string enPin = cleanPin(si.enablePinRaw, invertEn, pullUpEn);
+
+            auto dout = std::make_unique<MCU_digital_out>(mcu);
+            dout->setupPin(enPin, invertEn);
+            dout->setupMaxDuration(0.0);         // no safety timeout
+            dout->setupStartValue(true, false);  // start enabled, shutdown disabled
+            if (dout->buildConfig()) {
+                std::cout << "[Config] Stepper enable pin: " << si.enablePinRaw
+                          << " (OID=" << dout->getOid() << ")" << std::endl;
+                result.digitalOuts.push_back({"stepper_enable", enPin, std::move(dout)});
+            }
         }
     }
 

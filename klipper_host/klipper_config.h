@@ -35,6 +35,7 @@ struct ConfigResult {
         std::unique_ptr<MCU_stepper> stepper;
         std::unique_ptr<MCU_endstop> endstop;
         std::unique_ptr<PrinterRail> rail;
+        std::string enablePinRaw;  // raw enable_pin from config (e.g. "!PA9")
     };
     std::vector<StepperInfo> steppers;
 

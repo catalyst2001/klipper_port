@@ -131,8 +131,11 @@ bool TMC5160::writeRegister(uint8_t reg, uint32_t value) {
 
     if (m_chainLength > 0 && m_chainPosition > 0) {
         // Daisy chain: build full frame with NOP for other positions
+        // SPI shifts data through: first byte sent ends up at farthest driver.
+        // Position 1 (closest) = data at END of buffer, position N (farthest) = START.
+        // Matches Klipper's: offset = (chain_len - chain_pos) * 5
         std::vector<uint8_t> frame(m_chainLength * 5, 0x00);
-        int offset = (m_chainPosition - 1) * 5;
+        int offset = (m_chainLength - m_chainPosition) * 5;
         std::copy(regData.begin(), regData.end(), frame.begin() + offset);
         return m_spi->spiSend(frame);
     }
@@ -148,9 +151,9 @@ bool TMC5160::readRegister(uint8_t reg, uint32_t& value) {
     std::vector<uint8_t> regData = { reg, 0x00, 0x00, 0x00, 0x00 };
 
     if (m_chainLength > 0 && m_chainPosition > 0) {
-        // Daisy chain read
+        // Daisy chain read: offset = (chain_len - chain_pos) * 5
         std::vector<uint8_t> frame(m_chainLength * 5, 0x00);
-        int offset = (m_chainPosition - 1) * 5;
+        int offset = (m_chainLength - m_chainPosition) * 5;
         std::copy(regData.begin(), regData.end(), frame.begin() + offset);
 
         // First send: initiate read (response comes on NEXT transfer)
@@ -162,11 +165,11 @@ bool TMC5160::readRegister(uint8_t reg, uint32_t& value) {
         std::copy(regData.begin(), regData.end(), frame.begin() + offset);
         if (!m_spi->spiTransfer(frame, response)) return false;
 
-        if (response.size() < static_cast<size_t>((m_chainPosition) * 5))
+        if (response.size() < static_cast<size_t>((m_chainLength - m_chainPosition + 1) * 5))
             return false;
 
-        // Response for our position
-        int respOffset = (m_chainPosition - 1) * 5;
+        // Response for our position (same offset as send)
+        int respOffset = (m_chainLength - m_chainPosition) * 5;
         value = (static_cast<uint32_t>(response[respOffset + 1]) << 24) |
                 (static_cast<uint32_t>(response[respOffset + 2]) << 16) |
                 (static_cast<uint32_t>(response[respOffset + 3]) << 8) |
