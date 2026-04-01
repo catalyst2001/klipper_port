@@ -14,6 +14,7 @@ class MCU_adc;
 class PrinterRail;
 class ToolHead;
 class GCodeParser;
+enum class ShaperType;
 
 // Parsed section from a Klipper .cfg file
 struct ConfigSection {
@@ -84,6 +85,17 @@ struct ConfigResult {
         bool stealthChop = true;
     };
     std::vector<TMC5160Config> tmcConfigs;
+
+    // Input shaper configuration
+    struct InputShaperConfig {
+        std::string shaperTypeX = "none";
+        std::string shaperTypeY = "none";
+        double shaperFreqX = 0.0;
+        double shaperFreqY = 0.0;
+        double dampingRatioX = 0.1;
+        double dampingRatioY = 0.1;
+    };
+    InputShaperConfig inputShaper;
 
     // Error messages
     std::vector<std::string> warnings;

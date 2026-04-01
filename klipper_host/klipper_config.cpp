@@ -408,6 +408,24 @@ ConfigResult KlipperConfig::buildObjects(KlipperMCU& mcu,
         else if (type.substr(0, 7) == "tmc2209") {
             std::cout << "[Config] Noted driver config: " << type << " (not yet supported)" << std::endl;
         }
+        // Input shaper
+        else if (type == "input_shaper") {
+            result.inputShaper.shaperTypeX = section.get("shaper_type_x",
+                section.get("shaper_type", "mzv"));
+            result.inputShaper.shaperTypeY = section.get("shaper_type_y",
+                section.get("shaper_type", "mzv"));
+            result.inputShaper.shaperFreqX = section.getFloat("shaper_freq_x", 0.0);
+            result.inputShaper.shaperFreqY = section.getFloat("shaper_freq_y", 0.0);
+            result.inputShaper.dampingRatioX = section.getFloat("damping_ratio_x",
+                section.getFloat("damping_ratio", 0.1));
+            result.inputShaper.dampingRatioY = section.getFloat("damping_ratio_y",
+                section.getFloat("damping_ratio", 0.1));
+
+            std::cout << "[Config] Input shaper: X=" << result.inputShaper.shaperTypeX
+                      << " @ " << result.inputShaper.shaperFreqX << "Hz"
+                      << ", Y=" << result.inputShaper.shaperTypeY
+                      << " @ " << result.inputShaper.shaperFreqY << "Hz" << std::endl;
+        }
         // Other sections: log as skipped
         else {
             if (type != "mcu" && type.substr(0, 10) != "adc_scaled")

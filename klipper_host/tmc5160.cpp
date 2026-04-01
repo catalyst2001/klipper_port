@@ -328,6 +328,9 @@ bool TMC5160::DriverStatus::hasError() const {
 }
 
 bool TMC5160::DriverStatus::hasWarning() const {
+    // Open load detection is not reliable at standstill (TMC5160 datasheet)
+    if (stst)
+        return otpw;
     return otpw || olA || olB;
 }
 
@@ -356,8 +359,11 @@ std::string TMC5160::formatErrors(const DriverStatus& s) {
     if (s.s2gB)  add("Short-to-GND phase B");
     if (s.s2vsA) add("Short-to-supply phase A");
     if (s.s2vsB) add("Short-to-supply phase B");
-    if (s.olA)   add("Open load phase A");
-    if (s.olB)   add("Open load phase B");
+    // Open load detection is not reliable at standstill (TMC5160 datasheet)
+    if (!s.stst) {
+        if (s.olA)   add("Open load phase A");
+        if (s.olB)   add("Open load phase B");
+    }
 
     return first ? "OK" : ss.str();
 }

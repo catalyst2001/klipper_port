@@ -142,6 +142,7 @@
     <ClCompile Include="gcode.cpp" />
     <ClCompile Include="klipper_config.cpp" />
     <ClCompile Include="tmc5160.cpp" />
+    <ClCompile Include="input_shaper.cpp" />
     <ClCompile Include="miniz_impl.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -157,6 +158,7 @@
     <ClInclude Include="gcode.h" />
     <ClInclude Include="klipper_config.h" />
     <ClInclude Include="tmc5160.h" />
+    <ClInclude Include="input_shaper.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\.editorconfig" />

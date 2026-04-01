@@ -93,6 +93,7 @@
     <ClCompile Include="..\klipper_host\gcode.cpp" />
     <ClCompile Include="..\klipper_host\klipper_config.cpp" />
     <ClCompile Include="..\klipper_host\tmc5160.cpp" />
+    <ClCompile Include="..\klipper_host\input_shaper.cpp" />
     <ClCompile Include="..\klipper_host\miniz_impl.cpp" />
   </ItemGroup>
   <ItemGroup>

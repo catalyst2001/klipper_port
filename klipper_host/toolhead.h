@@ -2,6 +2,7 @@
 
 #include "trapq.h"
 #include "stepper.h"
+#include "input_shaper.h"
 
 #include <vector>
 #include <deque>
@@ -56,6 +57,10 @@ public:
     // Generate and send queue_step commands for all steppers from flushed TrapMoves
     bool generateSteps();
 
+    // Input shaper access
+    InputShaper& getInputShaper() { return m_inputShaper; }
+    const InputShaper& getInputShaper() const { return m_inputShaper; }
+
 private:
     KlipperMCU& m_mcu;
 
@@ -80,10 +85,21 @@ private:
     // Trapezoid move queue
     TrapQ m_trapq;
 
+    // Input shaper
+    InputShaper m_inputShaper;
+
     // Lookahead: reverse + forward pass, then flush
     void lookaheadFlush(bool forceFlush);
 
-    // Generate steps for a single axis from a TrapMove
+    // Generate steps for a single axis from a TrapMove (analytical, no shaper)
     // needsReset: if true, send reset_step_clock before queue_step
     void generateAxisSteps(int axis, const TrapMove& tm, bool needsReset);
+
+    // Generate steps for a single axis across all TrapMoves using input shaping
+    // Uses secant/bisection method (Klipper's itersolve approach)
+    void generateShapedAxisSteps(int axis, const std::vector<TrapMove>& moves);
+
+    // Helper: get axis position at any absolute print time across TrapMoves
+    static double getAxisPositionAtTime(int axis, const std::vector<TrapMove>& moves,
+                                        double printTime);
 };

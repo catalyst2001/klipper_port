@@ -421,20 +421,275 @@ void ToolHead::generateAxisSteps(int axis, const TrapMove& tm, bool needsReset) 
     stepper->setLastStepClock(lastStepClock);
 }
 
+// ========== Input Shaper: Shaped Step Generation ==========
+
+// Get axis position at any absolute print time across a TrapMove sequence.
+// Handles times before the first move or after the last move by clamping.
+double ToolHead::getAxisPositionAtTime(int axis, const std::vector<TrapMove>& moves,
+                                       double printTime) {
+    if (moves.empty()) return 0.0;
+
+    // Before first move: return start position of first move
+    if (printTime <= moves.front().print_time) {
+        switch (axis) {
+            case 0: return moves.front().start_pos.x;
+            case 1: return moves.front().start_pos.y;
+            case 2: return moves.front().start_pos.z;
+            default: return 0.0;
+        }
+    }
+
+    // Find the TrapMove containing this time (linear search from end for efficiency
+    // since shaped lookups are mostly near current time)
+    for (int i = static_cast<int>(moves.size()) - 1; i >= 0; i--) {
+        const auto& tm = moves[i];
+        if (printTime >= tm.print_time) {
+            double dt = printTime - tm.print_time;
+            if (dt > tm.move_t) dt = tm.move_t;  // clamp to move duration
+            double dist = tm.start_v * dt + tm.half_accel * dt * dt;
+            double axisR = (axis == 0) ? tm.axes_r.x : (axis == 1) ? tm.axes_r.y : tm.axes_r.z;
+            double startPos = (axis == 0) ? tm.start_pos.x : (axis == 1) ? tm.start_pos.y : tm.start_pos.z;
+            return startPos + axisR * dist;
+        }
+    }
+
+    // Fallback: return start position of first move
+    switch (axis) {
+        case 0: return moves.front().start_pos.x;
+        case 1: return moves.front().start_pos.y;
+        case 2: return moves.front().start_pos.z;
+        default: return 0.0;
+    }
+}
+
+// Generate steps for a shaped axis using secant/bisection method.
+// Port of Klipper's itersolve_gen_steps_range with input shaper convolution.
+void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& moves) {
+    MCU_stepper* stepper = m_steppers[axis];
+    if (!stepper) return;
+
+    const auto& pulses = m_inputShaper.getAxisPulses(axis);
+    if (pulses.empty()) return;
+
+    double stepDist = stepper->getStepDist();
+    if (stepDist <= 0) return;
+    double halfStep = 0.5 * stepDist;
+
+    double mcuFreq = m_mcu.getClockSync().getMcuFreq();
+
+    double moveStart = moves.front().print_time;
+    double moveEnd = moves.back().print_time + moves.back().move_t;
+
+    // Lambda: compute shaped position at a given absolute print_time
+    auto shapedPos = [&](double pt) -> double {
+        double sum = 0.0;
+        for (const auto& p : pulses) {
+            sum += p.a * getAxisPositionAtTime(axis, moves, pt + p.t);
+        }
+        return sum;
+    };
+
+    // Initial shaped position
+    double commandedPos = shapedPos(moveStart);
+    double endPos = shapedPos(moveEnd);
+
+    // If barely any movement, skip
+    if (std::abs(endPos - commandedPos) < halfStep * 0.5) return;
+
+    // Secant/bisection iterative solver (matching Klipper's itersolve)
+    static constexpr double SEEK_TIME_RESET = 0.000100;
+
+    bool sdir = (endPos > commandedPos);
+    double target = commandedPos + (sdir ? halfStep : -halfStep);
+
+    struct TimePos { double time, pos; };
+    TimePos oldGuess = {moveStart, commandedPos};
+    TimePos guess = oldGuess;
+
+    bool haveBracket = false, isDirChange = false, checkOscillate = false;
+    double lastTime = moveStart;
+    double lowTime = moveStart;
+    double highTime = moveStart + SEEK_TIME_RESET;
+    if (highTime > moveEnd) highTime = moveEnd;
+
+    // Collect step times as (clock, direction) pairs
+    struct StepEvent {
+        int64_t clock;
+        bool forward;
+    };
+    std::vector<StepEvent> stepEvents;
+
+    for (;;) {
+        double guessDist = guess.pos - target;
+        double ogDist = oldGuess.pos - target;
+
+        // Secant method to guess next time
+        double nextTime;
+        double denom = guessDist - ogDist;
+        if (std::abs(denom) > 1e-20) {
+            nextTime = (oldGuess.time * guessDist - guess.time * ogDist) / denom;
+        } else {
+            nextTime = highTime; // fallback
+        }
+
+        if (!(nextTime > lowTime && nextTime < highTime)) {
+            // Out of bounds - use fallback
+            if (haveBracket) {
+                // Bisection fallback
+                nextTime = (lowTime + highTime) * 0.5;
+                checkOscillate = false;
+            } else if (guess.time >= moveEnd) {
+                // No more steps in this time range
+                break;
+            } else {
+                // Exponential search forward
+                nextTime = highTime;
+                highTime = 2.0 * highTime - lastTime;
+                if (highTime > moveEnd) highTime = moveEnd;
+            }
+        }
+
+        // Evaluate position at nextTime
+        oldGuess = guess;
+        guess.time = nextTime;
+        guess.pos = shapedPos(nextTime);
+        guessDist = guess.pos - target;
+
+        if (std::abs(guessDist) > 1e-9) {
+            double relDist = sdir ? guessDist : -guessDist;
+
+            if (relDist > 0.0) {
+                // Found position past target — step is present
+                if (haveBracket && oldGuess.time <= lowTime) {
+                    if (checkOscillate)
+                        oldGuess = guess;
+                    checkOscillate = true;
+                }
+                highTime = guess.time;
+                haveBracket = true;
+            } else if (relDist < -(halfStep + halfStep + 1e-8)) {
+                // Direction change detected
+                sdir = !sdir;
+                target = sdir ? target + halfStep + halfStep
+                              : target - halfStep - halfStep;
+                lowTime = lastTime;
+                highTime = guess.time;
+                isDirChange = haveBracket = true;
+                checkOscillate = false;
+            } else {
+                lowTime = guess.time;
+            }
+
+            if (!haveBracket || highTime - lowTime > 1e-9) {
+                continue;
+            }
+        }
+
+        // Found a step!
+        int64_t stepClock = m_mcu.getClockSync().printTimeToClock(guess.time);
+        stepEvents.push_back({stepClock, sdir});
+
+        // Advance target to next step
+        target = sdir ? target + halfStep + halfStep
+                      : target - halfStep - halfStep;
+
+        // Reset bounds for next search
+        double seekDelta = 1.5 * (guess.time - lastTime);
+        if (seekDelta < 1e-9) seekDelta = 1e-9;
+        if (isDirChange && seekDelta > SEEK_TIME_RESET)
+            seekDelta = SEEK_TIME_RESET;
+        lastTime = lowTime = guess.time;
+        highTime = guess.time + seekDelta;
+        if (highTime > moveEnd) highTime = moveEnd;
+        isDirChange = haveBracket = checkOscillate = false;
+    }
+
+    if (stepEvents.empty()) return;
+
+    // Reset step clock at start
+    int64_t tmStartClock = m_mcu.getClockSync().printTimeToClock(moveStart);
+    stepper->resetStepClock(tmStartClock);
+
+    // Group consecutive same-direction steps and compress each batch
+    uint32_t maxError = static_cast<uint32_t>(stepDist * 0.25 * mcuFreq);
+    static constexpr uint32_t CLOCK_DIFF_MAX = 3U << 28;
+
+    size_t batchStart = 0;
+    while (batchStart < stepEvents.size()) {
+        bool batchDir = stepEvents[batchStart].forward;
+
+        // Find end of same-direction batch
+        size_t batchEnd = batchStart + 1;
+        while (batchEnd < stepEvents.size() && stepEvents[batchEnd].forward == batchDir) {
+            batchEnd++;
+        }
+
+        // Set direction for this batch
+        stepper->setNextStepDir(batchDir);
+
+        // Extract step clocks for this batch
+        int numSteps = static_cast<int>(batchEnd - batchStart);
+        std::vector<int64_t> batchClocks(numSteps);
+        for (int i = 0; i < numSteps; i++) {
+            batchClocks[i] = stepEvents[batchStart + i].clock;
+        }
+
+        // Compress and send
+        int64_t lastStepClock = stepper->getLastStepClock();
+        int pos = 0;
+        while (pos < numSteps) {
+            int64_t clockDiff = batchClocks[pos] - lastStepClock;
+            if (clockDiff <= 0) {
+                pos++;
+                continue;
+            }
+            if (static_cast<uint64_t>(clockDiff) >= CLOCK_DIFF_MAX) {
+                stepper->queueStep(static_cast<uint32_t>(clockDiff), 1, 0);
+                lastStepClock = batchClocks[pos];
+                pos++;
+                continue;
+            }
+
+            StepMove move = sc_compress_bisect_add(batchClocks.data(), pos, numSteps,
+                                                   lastStepClock, maxError);
+
+            stepper->queueStep(move.interval, move.count, move.add);
+
+            int64_t totalTicks = (int64_t)move.interval * move.count
+                + (int64_t)move.add * ((int64_t)move.count * (move.count - 1) / 2);
+            lastStepClock += totalTicks;
+            pos += move.count;
+        }
+
+        stepper->setLastStepClock(lastStepClock);
+        batchStart = batchEnd;
+    }
+}
+
 bool ToolHead::generateSteps() {
     auto trapMoves = m_trapq.getAndClear();
     if (trapMoves.empty()) return true;
 
-    // Track whether each axis stepper has been reset for this batch.
-    // Only the first TrapMove that moves a given axis should call
-    // resetStepClock; subsequent phases continue from where queue_step
-    // left off (MCU auto-advances its internal step clock).
-    bool axisReset[3] = {false, false, false};
+    // Check which axes use input shaping
+    bool shaped[3] = {false, false, false};
+    for (int axis = 0; axis < 3; ++axis) {
+        shaped[axis] = m_inputShaper.isAxisShaped(axis);
+    }
 
+    // For shaped axes: use iterative solver across all TrapMoves at once
+    for (int axis = 0; axis < 3; ++axis) {
+        if (shaped[axis] && m_steppers[axis]) {
+            generateShapedAxisSteps(axis, trapMoves);
+        }
+    }
+
+    // For unshaped axes: use the existing analytical per-TrapMove approach
+    bool axisReset[3] = {false, false, false};
     for (auto& tm : trapMoves) {
         for (int axis = 0; axis < 3; ++axis) {
+            if (shaped[axis]) continue;  // already handled above
+
             generateAxisSteps(axis, tm, !axisReset[axis]);
-            // Mark axis as reset if this TrapMove actually had motion on it
             double axisR = 0;
             switch (axis) {
                 case 0: axisR = tm.axes_r.x; break;
