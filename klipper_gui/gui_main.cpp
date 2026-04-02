@@ -198,6 +198,8 @@ private:
     std::atomic<bool> m_printStop{false};
     std::thread m_printThread;
     std::atomic<size_t> m_printCurrentLine{0};
+    size_t m_printLastHighlightLine = 0;  // for UI highlighting
+    std::atomic<size_t> m_printErrorCount{0};
 
     // Driver error ignore
     wxCheckBox* m_cbIgnoreTmcErrors = nullptr;
@@ -1169,18 +1171,40 @@ void KlipperFrame::OnUITimer(wxTimerEvent&) {
         }
     }
 
-    // Print progress update
+    // Print progress update + line highlighting
     if (m_printing) {
         size_t current = m_printCurrentLine;
         size_t total = m_printLines.size();
         if (total > 0) {
             int pct = static_cast<int>((current * 100) / total);
             m_printProgress->SetValue(pct);
-            m_printStatus->SetLabel(wxString::Format("Print: line %zu / %zu (%d%%)%s",
-                current, total, pct,
-                m_printPaused.load() ? " [PAUSED]" : ""));
+
+            size_t errorCount = m_printErrorCount;
+            wxString statusText = wxString::Format("Print: line %zu / %zu (%d%%)", current, total, pct);
+            if (errorCount > 0)
+                statusText += wxString::Format(" [%zu errors]", errorCount);
+            if (m_printPaused.load())
+                statusText += " [PAUSED]";
+            m_printStatus->SetLabel(statusText);
             m_printStatus->SetForegroundColour(
                 m_printPaused.load() ? wxColour(200, 100, 0) : wxColour(0, 128, 0));
+
+            // Highlight current line yellow, clear previous
+            if (m_printGcodeView && current != m_printLastHighlightLine && current > 0) {
+                // Clear previous highlight
+                if (m_printLastHighlightLine > 0) {
+                    long prevStart = m_printGcodeView->XYToPosition(0, static_cast<long>(m_printLastHighlightLine - 1));
+                    long prevEnd = m_printGcodeView->GetLineLength(static_cast<long>(m_printLastHighlightLine - 1)) + prevStart;
+                    m_printGcodeView->SetStyle(prevStart, prevEnd, wxTextAttr(*wxBLACK, *wxWHITE));
+                }
+                // Set new highlight
+                long lineIdx = static_cast<long>(current - 1);
+                long startPos = m_printGcodeView->XYToPosition(0, lineIdx);
+                long endPos = m_printGcodeView->GetLineLength(lineIdx) + startPos;
+                m_printGcodeView->SetStyle(startPos, endPos, wxTextAttr(*wxBLACK, wxColour(255, 255, 150)));
+                m_printGcodeView->ShowPosition(startPos);
+                m_printLastHighlightLine = current;
+            }
         }
     }
 }
@@ -2272,6 +2296,8 @@ void KlipperFrame::OnPrintStart(wxCommandEvent&) {
     m_printPaused = false;
     m_printStop = false;
     m_printCurrentLine = 0;
+    m_printLastHighlightLine = 0;
+    m_printErrorCount = 0;
 
     m_btnPrintStart->Enable(false);
     m_btnPrintPause->Enable(true);
@@ -2304,59 +2330,103 @@ void KlipperFrame::OnPrintStop(wxCommandEvent&) {
 }
 
 void KlipperFrame::PrintThread() {
-    size_t batchSize = 10;  // execute multiple lines per batch for efficiency
+    // Flow control: maximum scheduling window ahead of MCU time (in seconds)
+    constexpr double MAX_SCHEDULE_AHEAD = 0.5;
+    // How many lines to accumulate before flushing to MCU
+    constexpr size_t FLUSH_BATCH = 10;
+    size_t linesSinceFlush = 0;
+    m_printErrorCount = 0;
 
     for (size_t i = 0; i < m_printLines.size(); ++i) {
-        // Check stop
+        // --- Check stop/pause (no mutex needed, these are atomics) ---
         if (m_printStop) break;
-
-        // Handle pause
         while (m_printPaused && !m_printStop) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         if (m_printStop) break;
 
+        // --- Health check: connection and shutdown (quick lock) ---
+        {
+            std::lock_guard<std::mutex> lock(m_mcuMutex);
+            if (!m_mcu.isConnected()) {
+                LogFromThread("Print aborted: MCU disconnected!", *wxRED);
+                break;
+            }
+            if (m_mcu.isShutdown()) {
+                LogFromThread(wxString::Format("Print aborted: MCU shutdown - %s",
+                    m_mcu.getShutdownMsg()), *wxRED);
+                break;
+            }
+        }
+
         const auto& line = m_printLines[i];
         m_printCurrentLine = i + 1;
 
         // Skip empty lines and comments
-        if (line.empty() || line[0] == ';') continue;
-
-        // Skip lines that are only comments after stripping
+        if (line.empty() || line[0] == ';' || line[0] == '(') continue;
         auto commentPos = line.find(';');
         std::string cmd = (commentPos != std::string::npos) ? line.substr(0, commentPos) : line;
-        // Trim whitespace
         while (!cmd.empty() && (cmd.back() == ' ' || cmd.back() == '\t'))
             cmd.pop_back();
         if (cmd.empty()) continue;
 
+        // --- Execute G-code line (short lock) ---
+        bool execOk = false;
         {
             std::lock_guard<std::mutex> lock(m_mcuMutex);
 
-            // Advance print_time base
+            // Advance print_time base so moves schedule into the future
             double now = m_mcu.getClockSync().estimatedPrintTime() + 0.25;
             if (now > m_toolhead->getNextPrintTime())
                 m_toolhead->setNextPrintTime(now);
 
-            if (!m_gcode->executeLine(cmd)) {
+            execOk = m_gcode->executeLine(cmd);
+        }
+
+        if (!execOk) {
+            m_printErrorCount++;
+            // Only log first 10 errors to avoid flooding
+            if (m_printErrorCount <= 10) {
                 LogFromThread(wxString::Format("Print error at line %zu: %s",
                     i + 1, m_gcode->getLastMessage()), *wxRED);
-                // Continue on unknown commands, stop on real errors
-                if (m_gcode->getLastMessage().find("Unknown") == std::string::npos) {
-                    break;
-                }
-                continue;
+            } else if (m_printErrorCount == 11) {
+                LogFromThread("(suppressing further print errors...)", wxColour(180, 0, 0));
             }
+            continue;
+        }
 
-            // Flush and generate steps periodically
-            if ((i % batchSize) == 0 || i == m_printLines.size() - 1) {
+        linesSinceFlush++;
+
+        // --- Flush and generate steps periodically (separate lock) ---
+        if (linesSinceFlush >= FLUSH_BATCH || i == m_printLines.size() - 1) {
+            linesSinceFlush = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_mcuMutex);
                 m_toolhead->flush();
                 m_toolhead->generateSteps();
+            }
 
-                // Small delay to let MCU process steps
-                double moveTime = 0.05;
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(static_cast<int>(moveTime * 1000)));
+            // --- Flow control: wait if we're scheduling too far ahead ---
+            // This prevents move queue overflow on the MCU
+            for (int waitCount = 0; waitCount < 200; ++waitCount) {
+                if (m_printStop) break;
+
+                double scheduleTime;
+                double mcuTime;
+                {
+                    std::lock_guard<std::mutex> lock(m_mcuMutex);
+                    if (!m_mcu.isConnected() || m_mcu.isShutdown()) break;
+                    scheduleTime = m_toolhead->getNextPrintTime();
+                    mcuTime = m_mcu.getClockSync().estimatedPrintTime();
+                }
+
+                double ahead = scheduleTime - mcuTime;
+                if (ahead < MAX_SCHEDULE_AHEAD) break;
+
+                // Release mutex and wait - this is the KEY fix:
+                // we sleep WITHOUT holding the mutex, so UI timer,
+                // clock sync, TMC polling etc. can all work freely
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
             }
         }
     }
@@ -2364,23 +2434,26 @@ void KlipperFrame::PrintThread() {
     // Final flush
     {
         std::lock_guard<std::mutex> lock(m_mcuMutex);
-        m_toolhead->flush();
-        m_toolhead->generateSteps();
+        if (m_mcu.isConnected() && !m_mcu.isShutdown()) {
+            m_toolhead->flush();
+            m_toolhead->generateSteps();
+        }
     }
 
     bool stopped = m_printStop.load();
+    size_t errorCount = m_printErrorCount.load();
     m_printing = false;
     m_printStop = false;
 
     if (stopped) {
         LogFromThread("Print stopped by user", *wxRED);
     } else {
-        LogFromThread(wxString::Format("Print complete! %zu lines executed", m_printLines.size()),
-            wxColour(0, 128, 0));
+        wxString msg = wxString::Format("Print complete! %zu lines", m_printLines.size());
+        if (errorCount > 0)
+            msg += wxString::Format(" (%zu errors skipped)", errorCount);
+        LogFromThread(msg, wxColour(0, 128, 0));
     }
 
-    // Re-enable buttons from the main thread via log queue (will be processed in timer)
-    // Use CallAfter for thread-safe UI updates
     CallAfter([this, stopped]() {
         m_btnPrintStart->Enable(false);
         m_btnPrintPause->Enable(false);
