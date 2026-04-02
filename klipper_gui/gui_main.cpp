@@ -1536,6 +1536,10 @@ void KlipperFrame::PollThread() {
             std::lock_guard<std::mutex> lock(m_mcuMutex);
             auto responses = m_mcu.processIncoming(5);
             for (auto& resp : responses) {
+                // Skip high-frequency sensor responses (already shown in ADC/TC lists)
+                if (resp.name == "analog_in_state" || resp.name == "thermocouple_state")
+                    continue;
+
                 std::ostringstream ss;
                 ss << "<< [" << resp.msgId << "] " << resp.name;
                 for (auto& [k, v] : resp.intParams) {
@@ -2330,12 +2334,22 @@ void KlipperFrame::OnPrintStop(wxCommandEvent&) {
 }
 
 void KlipperFrame::PrintThread() {
-    // Flow control: maximum scheduling window ahead of MCU time (in seconds)
-    constexpr double MAX_SCHEDULE_AHEAD = 0.5;
-    // How many lines to accumulate before flushing to MCU
+    // Klipper-style flow control with hysteresis:
+    // Fill buffer up to BUFFER_TIME_HIGH, then wait until it drains to BUFFER_TIME_LOW.
+    // This gives the MCU a healthy scheduling window and prevents "stepper too far in past".
+    constexpr double BUFFER_TIME_START = 1.0;  // initial print_time ahead of MCU
+    constexpr double BUFFER_TIME_HIGH  = 2.0;  // pause scheduling when this far ahead
+    constexpr double BUFFER_TIME_LOW   = 1.0;  // resume scheduling when buffer drains to this
     constexpr size_t FLUSH_BATCH = 10;
     size_t linesSinceFlush = 0;
     m_printErrorCount = 0;
+
+    // Set initial print_time well ahead of MCU time ONCE
+    {
+        std::lock_guard<std::mutex> lock(m_mcuMutex);
+        double initialTime = m_mcu.getClockSync().estimatedPrintTime() + BUFFER_TIME_START;
+        m_toolhead->setNextPrintTime(initialTime);
+    }
 
     for (size_t i = 0; i < m_printLines.size(); ++i) {
         // --- Check stop/pause (no mutex needed, these are atomics) ---
@@ -2375,10 +2389,12 @@ void KlipperFrame::PrintThread() {
         {
             std::lock_guard<std::mutex> lock(m_mcuMutex);
 
-            // Advance print_time base so moves schedule into the future
-            double now = m_mcu.getClockSync().estimatedPrintTime() + 0.25;
-            if (now > m_toolhead->getNextPrintTime())
-                m_toolhead->setNextPrintTime(now);
+            // Safety net: only bump print_time if it has fallen behind MCU time
+            // (can happen after a long pause or many non-move commands).
+            // Normal flow: print_time advances naturally via move durations.
+            double minTime = m_mcu.getClockSync().estimatedPrintTime() + 0.25;
+            if (minTime > m_toolhead->getNextPrintTime())
+                m_toolhead->setNextPrintTime(minTime);
 
             execOk = m_gcode->executeLine(cmd);
         }
@@ -2406,27 +2422,28 @@ void KlipperFrame::PrintThread() {
                 m_toolhead->generateSteps();
             }
 
-            // --- Flow control: wait if we're scheduling too far ahead ---
-            // This prevents move queue overflow on the MCU
-            for (int waitCount = 0; waitCount < 200; ++waitCount) {
+            // --- Flow control with hysteresis ---
+            // Wait until buffer drains to BUFFER_TIME_LOW before sending more.
+            // This prevents both "move queue overflow" and "stepper too far in past".
+            for (;;) {
                 if (m_printStop) break;
 
-                double scheduleTime;
-                double mcuTime;
+                double ahead;
                 {
                     std::lock_guard<std::mutex> lock(m_mcuMutex);
                     if (!m_mcu.isConnected() || m_mcu.isShutdown()) break;
-                    scheduleTime = m_toolhead->getNextPrintTime();
-                    mcuTime = m_mcu.getClockSync().estimatedPrintTime();
+                    ahead = m_toolhead->getNextPrintTime()
+                          - m_mcu.getClockSync().estimatedPrintTime();
                 }
 
-                double ahead = scheduleTime - mcuTime;
-                if (ahead < MAX_SCHEDULE_AHEAD) break;
+                if (ahead < BUFFER_TIME_HIGH) break;
 
-                // Release mutex and wait - this is the KEY fix:
-                // we sleep WITHOUT holding the mutex, so UI timer,
-                // clock sync, TMC polling etc. can all work freely
-                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                // Buffer is full — wait for MCU to catch up.
+                // Sleep WITHOUT holding the mutex so UI/clock sync/polling work.
+                // Sleep until buffer should drain to BUFFER_TIME_LOW.
+                double waitSec = ahead - BUFFER_TIME_LOW;
+                int waitMs = std::max(10, std::min(500, static_cast<int>(waitSec * 1000)));
+                std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
             }
         }
     }
