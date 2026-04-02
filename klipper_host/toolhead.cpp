@@ -383,10 +383,10 @@ void ToolHead::generateAxisSteps(int axis, const TrapMove& tm, bool needsReset) 
 
     // === Compress step clocks into queue_step(interval, count, add) commands ===
     // Uses Klipper's compress_bisect_add algorithm for optimal batch sizes.
-    // max_error: 25% of step distance in clock ticks (matches Klipper)
+    // max_error: 25 microseconds (matches Klipper's MAX_STEPCOMPRESS_ERROR)
 
     int64_t lastStepClock = doReset ? tmStartClock : stepper->getLastStepClock();
-    uint32_t maxError = static_cast<uint32_t>(stepDist * 0.25 * mcuFreq);
+    uint32_t maxError = static_cast<uint32_t>(0.000025 * mcuFreq);
     static constexpr uint32_t CLOCK_DIFF_MAX = 3U << 28;
 
     int pos = 0;
@@ -611,7 +611,7 @@ void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& mo
     stepper->resetStepClock(tmStartClock);
 
     // Group consecutive same-direction steps and compress each batch
-    uint32_t maxError = static_cast<uint32_t>(stepDist * 0.25 * mcuFreq);
+    uint32_t maxError = static_cast<uint32_t>(0.000025 * mcuFreq);
     static constexpr uint32_t CLOCK_DIFF_MAX = 3U << 28;
 
     size_t batchStart = 0;
@@ -683,22 +683,132 @@ bool ToolHead::generateSteps() {
         }
     }
 
-    // For unshaped axes: use the existing analytical per-TrapMove approach
-    bool axisReset[3] = {false, false, false};
-    for (auto& tm : trapMoves) {
-        for (int axis = 0; axis < 3; ++axis) {
-            if (shaped[axis]) continue;  // already handled above
+    // For unshaped axes: collect ALL step times across all TrapMoves, then
+    // compress once. This is critical for serial throughput — compressing
+    // per-TrapMove produces 10-100x more queue_step commands than needed
+    // because consecutive arc segments have similar step spacing that the
+    // compressor can merge into single (interval, count, add) triples.
+    for (int axis = 0; axis < 3; ++axis) {
+        if (shaped[axis]) continue;
+        MCU_stepper* stepper = m_steppers[axis];
+        if (!stepper) continue;
 
-            generateAxisSteps(axis, tm, !axisReset[axis]);
+        double stepDist = stepper->getStepDist();
+        if (stepDist <= 0) continue;
+        double mcuFreq = m_mcu.getClockSync().getMcuFreq();
+
+        // Collect all step events (clock + direction) across all TrapMoves
+        struct StepEvent { int64_t clock; bool forward; };
+        std::vector<StepEvent> allSteps;
+
+        for (const auto& tm : trapMoves) {
             double axisR = 0;
             switch (axis) {
                 case 0: axisR = tm.axes_r.x; break;
                 case 1: axisR = tm.axes_r.y; break;
                 case 2: axisR = tm.axes_r.z; break;
             }
-            if (std::abs(axisR) > 0.000000001) {
-                axisReset[axis] = true;
+            if (std::abs(axisR) < 0.000000001) continue;
+
+            double v0 = std::abs(axisR) * tm.start_v;
+            double accel = std::abs(axisR) * 2.0 * tm.half_accel;
+            double totalDist = v0 * tm.move_t + 0.5 * accel * tm.move_t * tm.move_t;
+            if (totalDist < stepDist * 0.5) continue;
+
+            int numSteps = static_cast<int>(totalDist / stepDist + 0.5);
+            if (numSteps <= 0) continue;
+
+            bool forward = (axisR > 0);
+            int64_t tmStartClock = m_mcu.getClockSync().printTimeToClock(tm.print_time);
+
+            if (std::abs(accel) < 1e-6) {
+                double invV = 1.0 / std::max(v0, 1e-6);
+                for (int i = 0; i < numSteps; i++) {
+                    double t = (i + 1) * stepDist * invV;
+                    allSteps.push_back({
+                        tmStartClock + static_cast<int64_t>(t * mcuFreq + 0.5),
+                        forward
+                    });
+                }
+            } else {
+                double v0sq = v0 * v0;
+                double inv_a = 1.0 / accel;
+                for (int i = 0; i < numSteps; i++) {
+                    double pos = (i + 1) * stepDist;
+                    double disc = v0sq + 2.0 * accel * pos;
+                    if (disc < 0) break;
+                    double t = (-v0 + std::sqrt(disc)) * inv_a;
+                    allSteps.push_back({
+                        tmStartClock + static_cast<int64_t>(t * mcuFreq + 0.5),
+                        forward
+                    });
+                }
             }
+        }
+
+        if (allSteps.empty()) continue;
+
+        // Reset step clock at start of first step batch
+        int64_t firstClock = allSteps.front().clock;
+        if (!stepper->isClockInitialized()) {
+            stepper->resetStepClock(firstClock);
+        } else {
+            int64_t gap = firstClock - stepper->getLastStepClock();
+            if (gap <= 0 || gap > 4'000'000'000LL) {
+                stepper->resetStepClock(firstClock);
+            }
+        }
+
+        // Compress and send: group by direction, then compress each batch.
+        // This matches Klipper's steppersync approach of collecting steps
+        // then compressing across TrapMove boundaries.
+        uint32_t maxError = static_cast<uint32_t>(0.000025 * mcuFreq);
+        static constexpr uint32_t CLOCK_DIFF_MAX = 3U << 28;
+
+        size_t batchStart = 0;
+        while (batchStart < allSteps.size()) {
+            bool batchDir = allSteps[batchStart].forward;
+
+            size_t batchEnd = batchStart + 1;
+            while (batchEnd < allSteps.size() && allSteps[batchEnd].forward == batchDir) {
+                batchEnd++;
+            }
+
+            stepper->setNextStepDir(batchDir);
+
+            int numSteps = static_cast<int>(batchEnd - batchStart);
+            std::vector<int64_t> batchClocks(numSteps);
+            for (int i = 0; i < numSteps; i++) {
+                batchClocks[i] = allSteps[batchStart + i].clock;
+            }
+
+            int64_t lastStepClock = stepper->getLastStepClock();
+            int pos = 0;
+            while (pos < numSteps) {
+                int64_t clockDiff = batchClocks[pos] - lastStepClock;
+                if (clockDiff <= 0) {
+                    pos++;
+                    continue;
+                }
+                if (static_cast<uint64_t>(clockDiff) >= CLOCK_DIFF_MAX) {
+                    stepper->queueStep(static_cast<uint32_t>(clockDiff), 1, 0);
+                    lastStepClock = batchClocks[pos];
+                    pos++;
+                    continue;
+                }
+
+                StepMove move = sc_compress_bisect_add(batchClocks.data(), pos, numSteps,
+                                                       lastStepClock, maxError);
+                stepper->queueStep(move.interval, move.count, move.add);
+
+                int64_t totalTicks = (int64_t)move.interval * move.count
+                    + (int64_t)move.add * ((int64_t)move.count * (move.count - 1) / 2);
+                lastStepClock += totalTicks;
+                pos += move.count;
+            }
+
+            stepper->setLastStepClock(lastStepClock);
+            batchStart = batchEnd;
         }
     }
 

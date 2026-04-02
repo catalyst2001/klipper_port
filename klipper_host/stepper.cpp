@@ -45,11 +45,22 @@ bool MCU_stepper::buildConfig() {
         m_stepPulseTicks = m_mcu.getConstantInt("STEPPER_BOTH_EDGE", 0) ? 0 : 2;
     }
 
+    // Enable both-edge stepping if MCU supports it (STEPPER_STEP_BOTH_EDGE=1).
+    // This uses the optimized stepper_event_edge() path in the MCU firmware,
+    // which halves the number of timer events and avoids the
+    // "Stepper too far in past" safety check in stepper_event_full().
+    // Klipper Python does the same in MCU_stepper._build_config().
+    int invertStep = 0;
+    bool hasBothEdge = m_mcu.getConstantInt("STEPPER_STEP_BOTH_EDGE", 0) != 0;
+    if (hasBothEdge && m_stepPulseTicks == 0) {
+        invertStep = -1;  // SF_SINGLE_SCHED → enables optimized edge path
+    }
+
     std::ostringstream cfg;
     cfg << "config_stepper oid=" << m_oid
         << " step_pin=" << stepPinNum
         << " dir_pin=" << dirPinNum
-        << " invert_step=" << (m_invertDir ? -1 : 0)
+        << " invert_step=" << invertStep
         << " step_pulse_ticks=" << m_stepPulseTicks;
     m_mcu.addConfigCmd(cfg.str());
 
