@@ -119,6 +119,9 @@ public:
     // Three-phase homing: fast home -> retract -> slow home
     bool homeAxis(KlipperMCU& mcu);
 
+    void setHomingAccel(double accel) { m_homingAccel = accel; }
+    double getHomingAccel() const { return m_homingAccel; }
+
 private:
     MCU_stepper& m_stepper;
     MCU_endstop& m_endstop;
@@ -128,4 +131,10 @@ private:
     double m_homingRetractDist = 5.0;
     double m_secondHomingSpeed = 2.5;
     double m_posEndstop = 0.0;
+    double m_homingAccel = 500.0;  // mm/s^2, acceleration ramp for homing
+
+    // Helper: queue steps with acceleration ramp from rest to target speed,
+    // then cruise. Used for homing phases.
+    void queueHomingSteps(KlipperMCU& mcu, double speed, int64_t maxSteps,
+                          int64_t startClock);
 };

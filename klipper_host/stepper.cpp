@@ -247,9 +247,9 @@ void PrinterRail::setPositionEndstop(double pos) {
 
 bool PrinterRail::homeAxis(KlipperMCU& mcu) {
     // Homing uses a 3-phase approach:
-    // 1. Fast move toward endstop
-    // 2. Retract
-    // 3. Slow move toward endstop
+    // 1. Fast move toward endstop (with accel ramp)
+    // 2. Retract (with accel ramp)
+    // 3. Slow move toward endstop (with accel ramp)
 
     double stepDist = m_stepper.getStepDist();
     if (stepDist <= 0.0) return false;
@@ -266,16 +266,12 @@ bool PrinterRail::homeAxis(KlipperMCU& mcu) {
         m_stepper.setNextStepDir(dir);
         m_stepper.resetStepClock(homeClock);
 
-        // Generate steps for fast approach
-        double moveSpeed = m_homingSpeed;
-        int64_t intervalTicks = static_cast<int64_t>(
-            clockSync.getMcuFreq() * stepDist / moveSpeed);
-        if (intervalTicks < 1) intervalTicks = 1;
-
         // Max steps for the axis range
         int64_t maxSteps = static_cast<int64_t>(
             (m_posMax - m_posMin) / stepDist) + 100;
-        m_stepper.queueStep(intervalTicks, maxSteps, 0);
+
+        // Accelerating ramp + cruise
+        queueHomingSteps(mcu, m_homingSpeed, maxSteps, homeClock);
 
         // Home endstop
         std::vector<MCU_stepper*> steppers = {&m_stepper};
@@ -298,18 +294,18 @@ bool PrinterRail::homeAxis(KlipperMCU& mcu) {
         m_stepper.setNextStepDir(dir);
         m_stepper.resetStepClock(startClock);
 
-        double moveSpeed = m_homingSpeed;
-        int64_t intervalTicks = static_cast<int64_t>(
-            clockSync.getMcuFreq() * stepDist / moveSpeed);
         int64_t retractSteps = static_cast<int64_t>(
             m_homingRetractDist / stepDist);
 
-        m_stepper.queueStep(intervalTicks, retractSteps, 0);
+        // Accelerating ramp + cruise (for retract)
+        queueHomingSteps(mcu, m_homingSpeed, retractSteps, startClock);
 
         // Wait for retract to complete
-        double retractTime = (retractSteps * stepDist) / moveSpeed;
+        double retractTime = (retractSteps * stepDist) / m_homingSpeed;
+        // Add extra time for the acceleration ramp
+        double accelTime = m_homingSpeed / m_homingAccel;
         std::this_thread::sleep_for(
-            std::chrono::milliseconds(static_cast<int>((retractTime + 0.2) * 1000)));
+            std::chrono::milliseconds(static_cast<int>((retractTime + accelTime + 0.2) * 1000)));
     }
 
     // Phase 3: Slow home
@@ -321,13 +317,11 @@ bool PrinterRail::homeAxis(KlipperMCU& mcu) {
         m_stepper.setNextStepDir(dir);
         m_stepper.resetStepClock(homeClock);
 
-        double moveSpeed = m_secondHomingSpeed;
-        int64_t intervalTicks = static_cast<int64_t>(
-            clockSync.getMcuFreq() * stepDist / moveSpeed);
         int64_t maxSteps = static_cast<int64_t>(
             (m_homingRetractDist * 2.0) / stepDist) + 100;
 
-        m_stepper.queueStep(intervalTicks, maxSteps, 0);
+        // Accelerating ramp + cruise (slow speed)
+        queueHomingSteps(mcu, m_secondHomingSpeed, maxSteps, homeClock);
 
         std::vector<MCU_stepper*> steppers = {&m_stepper};
         bool triggered = m_endstop.home(homeClock, 0.000015, 4, 0.01, true,
@@ -343,4 +337,50 @@ bool PrinterRail::homeAxis(KlipperMCU& mcu) {
         static_cast<int64_t>(m_posEndstop / stepDist));
 
     return true;
+}
+
+// Queue steps with acceleration ramp from rest to target speed, then cruise.
+// Uses 2 queue_step commands: one for accel (with add), one for cruise.
+void PrinterRail::queueHomingSteps(KlipperMCU& mcu, double speed, int64_t maxSteps,
+                                    int64_t startClock) {
+    double stepDist = m_stepper.getStepDist();
+    double mcuFreq = mcu.getClockSync().getMcuFreq();
+    double accel = m_homingAccel;
+
+    // Acceleration distance: v^2 / (2*a)
+    double accelDist = speed * speed / (2.0 * accel);
+    int64_t accelSteps = static_cast<int64_t>(accelDist / stepDist);
+    if (accelSteps < 2) accelSteps = 2;
+    if (accelSteps > maxSteps - 1) accelSteps = maxSteps - 1;
+
+    // First step interval (starting from near-zero velocity):
+    // t1 = sqrt(2 * step_dist / accel), interval1 = t1 * mcu_freq
+    double t1 = std::sqrt(2.0 * stepDist / accel);
+    int64_t firstInterval = static_cast<int64_t>(t1 * mcuFreq);
+
+    // Last step interval (at full speed):
+    // interval_N = step_dist / speed * mcu_freq
+    int64_t cruiseInterval = static_cast<int64_t>(mcuFreq * stepDist / speed);
+    if (cruiseInterval < 1) cruiseInterval = 1;
+
+    // Linear approximation of acceleration using add parameter:
+    // interval_n = firstInterval + add * n
+    // At step accelSteps-1: interval should ≈ cruiseInterval
+    int64_t addVal = 0;
+    if (accelSteps > 1) {
+        addVal = (cruiseInterval - firstInterval) / (accelSteps - 1);
+    }
+
+    // Clamp add to int16_t range
+    if (addVal < -32768) addVal = -32768;
+    if (addVal > 32767) addVal = 32767;
+
+    // Phase 1: Acceleration ramp
+    m_stepper.queueStep(firstInterval, accelSteps, addVal);
+
+    // Phase 2: Cruise at constant speed
+    int64_t cruiseSteps = maxSteps - accelSteps;
+    if (cruiseSteps > 0) {
+        m_stepper.queueStep(cruiseInterval, cruiseSteps, 0);
+    }
 }

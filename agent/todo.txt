@@ -43,17 +43,25 @@ KLIPPER C++ PORT — TODO / TASK TRACKER
 АЛГОРИТМИЧЕСКИЕ ИСПРАВЛЕНИЯ (приоритет 2)
 ================================================================================
 
-[ ] A2-FIX: Print-time backpressure / pause logic
-    Файлы: toolhead.h, toolhead.cpp
-    Описание: Добавить BUFFER_TIME_HIGH/START, проверку print_time vs est_time,
-              блокировку gcode processing при переполнении буфера
-    Требует: clock_sync интеграция (estimated_print_time)
+[X] A2-FIX: Print-time backpressure / pause logic
+    Файлы: trapq.h, toolhead.h, toolhead.cpp
+    Дата: 2025-04-03
+    Итог: Добавлены BUFFER_TIME_HIGH=1.0, BUFFER_TIME_START=0.250.
+          syncPrintTime() — привязка print_time к MCU clock при старте из idle.
+          checkPause() — блокировка хоста если print_time > est_time + 1.0s
+          (sleep в цикле, с processIncoming для поддержки clock sync).
+          lookaheadFlush() теперь вызывает generateSteps() сразу.
+          m_needStartSync — state machine idle→active.
 
-[ ] A4-FIX: Homing с ускорением (trapezoid ramp)
-    Файлы: stepper.cpp (PrinterRail::homeAxis)
-    Описание: Заменить constant-velocity queueStep на trapezoid move через
-              toolhead/trapq. Или минимум — добавить acceleration ramp.
-    Также: overtravel correction (trig_pos tracking)
+[X] A4-FIX: Homing с ускорением (acceleration ramp)
+    Файлы: stepper.h, stepper.cpp (PrinterRail)
+    Дата: 2025-04-03
+    Итог: Добавлен queueHomingSteps() — 2-фазная генерация шагов:
+          1) Разгон от 0 до speed через queue_step с add параметром
+          2) Cruise на полной скорости.
+          Все 3 фазы homing (fast/retract/slow) используют ускорение.
+          Добавлен m_homingAccel=500 мм/с² (настраиваемый).
+          Overtravel correction — НЕ реализован (отдельная задача).
 
 ================================================================================
 SERIAL / PROTOCOL ИСПРАВЛЕНИЯ
@@ -110,3 +118,5 @@ SERIAL / PROTOCOL ИСПРАВЛЕНИЯ
 2025-04-03: Создан файл todo
 2025-04-03: A1-FIX выполнен — junction velocity с centripetal limits
 2025-04-03: A5-FIX выполнен — lazy flush + MCR + time-based trigger
+2025-04-03: A2-FIX выполнен — print-time backpressure + syncPrintTime + checkPause
+2025-04-03: A4-FIX выполнен — homing acceleration ramp (queueHomingSteps)

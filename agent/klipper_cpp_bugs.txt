@@ -402,6 +402,21 @@ E1. [serial_port / klipper_mcu] ЗАВИСАНИЕ ПРИ ПЕРЕЗАГРУЗК
   - Partial flush: только flush_count moves, остальное сохраняется
   - flush() вызывает lookaheadFlush(false) для полной остановки
 
+2025-04-03 | A2 | Print-time backpressure / pause logic
+  Файлы: trapq.h, toolhead.h, toolhead.cpp
+  - BUFFER_TIME_HIGH=1.0s, BUFFER_TIME_START=0.250s
+  - syncPrintTime(): привязка print_time к est_print_time при старте
+  - checkPause(): блокировка хоста если print_time > est_time + 1s
+  - lookaheadFlush() вызывает generateSteps() сразу после TrapQ append
+  - m_needStartSync: state machine idle→active
+
+2025-04-03 | A4 | Homing с acceleration ramp
+  Файлы: stepper.h, stepper.cpp
+  - queueHomingSteps(): 2-фазная генерация (accel ramp + cruise)
+  - Использует queue_step add параметр для линейной аппроксимации
+  - Все 3 фазы homing используют ускорение
+  - m_homingAccel=500 мм/с² (настраиваемый)
+
 ================================================================================
 END OF BUG REPORT
 ================================================================================

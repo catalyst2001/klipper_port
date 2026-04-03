@@ -111,6 +111,10 @@ public:
 // Lookahead constants (from Klipper's toolhead.py)
 constexpr double LOOKAHEAD_FLUSH_TIME = 0.150; // seconds
 
+// Buffer time constants for print-time backpressure (from Klipper's toolhead.py)
+constexpr double BUFFER_TIME_HIGH = 1.0;    // max seconds host can be ahead of MCU
+constexpr double BUFFER_TIME_START = 0.250;  // initial buffer when starting from idle
+
 // TrapQ: queue of TrapMoves for step generation.
 // Steppers consume TrapMoves to generate step times.
 class TrapQ {

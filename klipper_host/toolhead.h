@@ -76,7 +76,11 @@ private:
     Vec3 m_pos;
 
     // Print time tracking
-    double m_nextPrintTime = 0.1;
+    double m_nextPrintTime = 0.0;
+
+    // Backpressure state (Klipper's special_queuing_state equivalent)
+    bool m_needStartSync = true;   // true = idle, need to anchor print_time on first move
+    double m_needCheckPause = -1.0; // print_time threshold for next pause check
 
     // Lookahead queue + time-based flush tracking
     std::deque<Move> m_queue;
@@ -95,6 +99,12 @@ private:
     // lazy=true: only flush moves up to confirmed velocity peak (partial flush)
     // lazy=false: flush all moves (force complete stop at end)
     void lookaheadFlush(bool lazy);
+
+    // Backpressure: sleep if host is too far ahead of MCU
+    void checkPause();
+
+    // Sync print_time to MCU clock on first move after idle
+    void syncPrintTime();
 
     // Generate steps for a single axis from a TrapMove (analytical, no shaper)
     // needsReset: if true, send reset_step_clock before queue_step

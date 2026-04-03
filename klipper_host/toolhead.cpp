@@ -6,6 +6,8 @@
 #include <cmath>
 #include <iostream>
 #include <climits>
+#include <thread>
+#include <chrono>
 
 // ========== Step Compression (port of Klipper's stepcompress.c) ==========
 
@@ -208,6 +210,11 @@ void ToolHead::moveAbsolute(const Vec3& pos, double speed) {
     if (m_junctionFlush <= 0.0) {
         lookaheadFlush(true);
     }
+
+    // Backpressure: if we've queued enough, check if we need to wait for MCU
+    if (m_nextPrintTime > m_needCheckPause) {
+        checkPause();
+    }
 }
 
 void ToolHead::moveRelative(const Vec3& delta, double speed) {
@@ -219,6 +226,9 @@ void ToolHead::flush() {
     if (!m_queue.empty()) {
         lookaheadFlush(false);
     }
+    // Transition to idle — next move will re-sync print_time
+    m_needStartSync = true;
+    m_needCheckPause = -1.0;
 }
 
 void ToolHead::lookaheadFlush(bool lazy) {
@@ -286,6 +296,13 @@ void ToolHead::lookaheadFlush(bool lazy) {
         return;
     }
 
+    // If this is the first flush from idle, sync print_time to MCU clock
+    if (m_needStartSync) {
+        m_needStartSync = false;
+        m_needCheckPause = -1.0;
+        syncPrintTime();
+    }
+
     // --- FORWARD PASS ---
     // Propagate cruise_v2 forward for moves that couldn't accelerate
     double prev_cruise_v2 = 0.0;
@@ -317,8 +334,40 @@ void ToolHead::lookaheadFlush(bool lazy) {
         m_trapq.append(trapMoves);
     }
 
+    // Generate steps immediately (converts TrapMoves to queue_step commands)
+    generateSteps();
+
     // Remove processed moves from the queue, keep the rest
     m_queue.erase(m_queue.begin(), m_queue.begin() + flushCount);
+}
+
+// Sync print_time to MCU clock when transitioning from idle to printing.
+// Port of Klipper's ToolHead._calc_print_time()
+void ToolHead::syncPrintTime() {
+    double est = m_mcu.getClockSync().estimatedPrintTime();
+    double minPrintTime = est + BUFFER_TIME_START;
+    if (minPrintTime > m_nextPrintTime) {
+        m_nextPrintTime = minPrintTime;
+    }
+}
+
+// Backpressure: block if host is too far ahead of MCU.
+// Port of Klipper's ToolHead._check_pause()
+void ToolHead::checkPause() {
+    while (true) {
+        double est = m_mcu.getClockSync().estimatedPrintTime();
+        double pauseTime = m_nextPrintTime - est - BUFFER_TIME_HIGH;
+        if (pauseTime <= 0.0) break;
+
+        // Sleep for the calculated time, clamped to [5ms, 1s]
+        int sleepMs = static_cast<int>(std::max(5.0, std::min(1000.0, pauseTime * 1000.0)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+
+        // Process incoming MCU responses while waiting (keeps clock sync alive)
+        m_mcu.processIncoming(0);
+    }
+    // Update check threshold
+    m_needCheckPause = m_nextPrintTime;
 }
 
 void ToolHead::generateAxisSteps(int axis, const TrapMove& tm, bool needsReset) {
