@@ -1,0 +1,419 @@
+================================================================================
+KLIPPER C++ PORT vs ORIGINAL PYTHON KLIPPER — ARCHITECTURAL COMPARISON
+================================================================================
+Date: 2025-04-03
+Scope: klipper_host/ (C++ port) vs examples/klipper/klippy/ (Python original)
+
+================================================================================
+1. ОБЩАЯ АРХИТЕКТУРА
+================================================================================
+
+PYTHON KLIPPER:
+- Модульная событийная архитектура на основе reactor (greenlet-кооперативная многозадачность)
+- Плагинная система (extras/) с динамической загрузкой модулей
+- Фоновый RX-поток (serialqueue в C + background thread в Python)
+- Klipper Chelper (C-библиотека): stepcompress, itersolve, trapq, steppersync, serialqueue
+- Координация через reactor: таймеры, completions, мьютексы на greenlet-ах
+- Полная поддержка Multi-MCU
+
+C++ PORT:
+- Монолитная процедурная архитектура
+- Нет событийного цикла (reactor)
+- Нет фоновых потоков — всё синхронно в main()
+- Переписаны на C++: stepcompress (bisect_add), trapq, move planner
+- НЕ используется chelper C-библиотека — step-compression реализована заново
+- Нет steppersync/syncemitter — шаги отправляются напрямую через serial
+- Single-MCU only
+
+ВЛИЯНИЕ: Отсутствие reactor и фоновых потоков означает, что порт не может
+обрабатывать gcode параллельно с генерацией шагов. Нет time-critical scheduling.
+
+================================================================================
+2. TOOLHEAD / MOTION PLANNER — КРИТИЧЕСКИЕ ОТЛИЧИЯ
+================================================================================
+
+2.1. LOOKAHEAD ALGORITHM
+-------------------------
+PYTHON: LookAheadQueue с time-based flush trigger
+  - LOOKAHEAD_FLUSH_TIME = 0.250s (150ms in older versions)
+  - junction_flush отсчитывается от минимального времени каждого move
+  - Lazy flush: обрабатывает только moves до подтверждённого пика скорости
+  - Оставшиеся moves остаются в очереди для дальнейшей оптимизации
+
+C++ PORT: queue-depth flush trigger
+  - Flush при m_queue.size() >= 16 (hardcoded)
+  - НЕТ time-based flush
+  - НЕТ lazy flush — весь queue обрабатывается за раз
+  - Последний move всегда завершается со скоростью 0
+
+ВЛИЯНИЕ [СРЕДНЕЕ]: Отсутствие lazy flush приводит к суб-оптимальным
+присвоению скоростей. На коротких сегментах (дуги, кривые) хвостовые
+moves в batch-е будут иметь end_v=0 раньше, чем нужно. Результат —
+лишние разгоны/торможения, рывки, замедление на мелкой геометрии.
+
+2.2. MCR (MINIMUM CRUISE RATIO) — ОТСУТСТВУЕТ
+----------------------------------------------
+PYTHON: Implements min_cruise_ratio tracking
+  - max_mcr_start_v2, mcr_delta_v2, peak_cruise_v2
+  - mcr_pseudo_accel = max_accel * (1 - min_cruise_ratio)
+  - Предотвращает "saw-tooth" velocity profiles (разгон-торможение без круизного участка)
+
+C++ PORT: НЕТ MCR-логики
+  - Поле max_smoothed_v2 объявлено, но не используется
+
+ВЛИЯНИЕ [СРЕДНЕЕ]: Без MCR на серии коротких moves (arc segments, мелкие
+линейные сегменты) возникает паттерн "треугольных" скоростей без
+cruise-участка. Это увеличивает вибрации и снижает реальную скорость печати.
+
+2.3. JUNCTION VELOCITY CALCULATION — НЕПОЛНАЯ
+---------------------------------------------
+PYTHON: 4 ограничения на скорость в junction-е:
+  1. move_jd_v2 = R(jd, sinθ/2) * accel              — junction deviation
+  2. pmove_jd_v2 = R(jd, sinθ/2) * prev_accel         — то же для предыдущего move
+  3. move_centripetal_v2 = delta_v2 * 0.25 * tan(θ/2)  — центростремительное
+  4. pmove_centripetal_v2 = prev_delta_v2 * 0.25 * tan(θ/2)
+
+  max_start_v2 = min(все 4 + cruise ограничения)
+
+C++ PORT: только 1 ограничение:
+  1. jv2 = R(jd, sinθ/2) * accel
+
+  НЕТ: pmove_jd_v2, centripetal_v2, pmove_centripetal_v2
+
+ВЛИЯНИЕ [ВЫСОКОЕ]: Отсутствие центростремительного ограничения и
+вычисления для предыдущего move означает завышенные скорости на
+поворотах. Особенно опасно:
+  - Повороты под малыми углами (небольшое отклонение, jd_v2 высокое,
+    но centripetal_v2 низкое)
+  - Moves с разным accel (prev_move может иметь сниженный accel из-за
+    kinematics check_move)
+
+РЕЗУЛЬТАТ: Потеря шагов, повышенные вибрации, артефакты печати на углах.
+
+2.4. PRINT TIME MANAGEMENT — ОТСУТСТВУЕТ
+-----------------------------------------
+PYTHON: Сложная система управления временем:
+  - BUFFER_TIME_HIGH = 1.0s — целевой опережающий буфер
+  - BUFFER_TIME_START = 0.250s — минимальный буфер при старте
+  - _check_pause() блокирует gcode-поток когда buffer полон
+  - _calc_print_time() синхронизирует print_time с реальным временем
+  - Прайминг: NeedPrime → Priming → Main states
+
+C++ PORT: Нет управления временем
+  - m_nextPrintTime монотонно растёт без ограничений
+  - Нет паузы при преждевременном заполнении буфера
+  - Нет state machine (NeedPrime/Priming)
+  - Start print_time = 0.1s (hardcoded)
+
+ВЛИЯНИЕ [КРИТИЧЕСКОЕ]: Без backpressure/pause:
+  - При длинных gcode файлах toolhead генерирует шаги на часы вперёд
+  - MCU serial queue переполняется
+  - Невозможно корректно останавливать/приостанавливать печать
+  - Print-time может улететь далеко от реального MCU clock
+
+2.5. EXTRUDER — НЕ РЕАЛИЗОВАН
+------------------------------
+PYTHON: Полная поддержка:
+  - Extruder class с собственным stepper, pressure advance, kinematics
+  - E-axis в Move с отдельной обработкой (extrude-only moves)
+  - ExtruderStepper с smooth_time для PA
+
+C++ PORT: Ни одного упоминания E-axis
+  - GCodeParser игнорирует параметр E
+  - Move/TrapMove = 3 оси (XYZ)
+  - Нет pressure advance
+
+ВЛИЯНИЕ [БЛОКИРУЮЩЕЕ]: Невозможно печатать без экструдера.
+
+2.6. DRIP MOVE (HOMING) — НЕ РЕАЛИЗОВАН
+-----------------------------------------
+PYTHON: drip_move() — специальный режим:
+  - Move проходит через полный lookahead/trapq
+  - Steps генерируются порционно в реальном времени
+  - Между порциями проверяется endstop trigger
+  - Обеспечивает корректное ускорение/торможение при хоминге
+
+C++ PORT: Прямая генерация шагов
+  - PrinterRail::homeAxis() вручную вызывает queueStep() с constant velocity
+  - Нет ускорения/торможения — stepper мгновенно стартует на полной скорости
+  - Нет реальновременной проверки endstop между step-batch-ами
+  - Использует sleep_for() вместо reactor timing
+
+ВЛИЯНИЕ [ВЫСОКОЕ]: Мгновенный старт на полной скорости при хоминге:
+  - Может привести к пропуску шагов на высоких homing_speed
+  - Нет торможения после trigger — перебег выше
+  - sleep_for() неточен для real-time scheduling
+
+================================================================================
+3. GCODE PROCESSING — ОТЛИЧИЯ
+================================================================================
+
+3.1. ARCHITECTURE
+PYTHON: GCodeDispatch + GCodeCommand + GCodeIO
+  - Полноценная система регистрации обработчиков
+  - Mux commands (маршрутизация по ключевому параметру)
+  - Reactor fd callback для чтения gcode
+  - Flow control: backpressure при 20+ pending commands
+  - M112 priority scanning (вне очереди)
+  - Greenlet mutex для thread safety
+
+C++ PORT: GCodeParser — flat dispatch
+  - Map<string, handler> для кастомных команд
+  - Switch/if цепочка для стандартных команд
+  - Нет flow control — executeBlock() синхронно всё за раз
+  - Нет fd-based reading
+  - Нет mux commands
+
+3.2. HOMED STATE CHECK
+PYTHON: check_move() в kinematics проверяет homed axes
+C++ PORT: НЕТ проверки — moves принимаются без хоминга
+
+ВЛИЯНИЕ [СРЕДНЕЕ]: Ошибка оператора может вызвать crash в hardware.
+
+3.3. ARC INTERPOLATION (G2/G3)
+PYTHON: Реализуется через extra (gcode_arcs.py), использует move_with_transform
+C++ PORT: Встроена в GCodeParser, ~1mm сегменты, 8-360 штук
+  - Нет поддержки R-параметра (только I/J центр)
+  - Нет P-параметра (повторы)
+  - В остальном корректно
+
+======================== ========================================================
+4. SERIAL / PROTOCOL — ОТЛИЧИЯ
+================================================================================
+
+4.1. SERIAL I/O MODEL
+PYTHON: C-level serialqueue + background RX thread
+  - Non-blocking с event-driven dispatch
+  - Retransmission queue с sequence tracking
+  - RTO (retransmit timeout) estimation
+  - Command queue с minclock/reqclock scheduling
+  - serialqueue_send() с ACK/notify mechanism
+
+C++ PORT: Синхронный blocking I/O
+  - ReadFile/WriteFile через Win32 API
+  - Нет retransmission queue (!)
+  - Нет command scheduling (minclock/reqclock не используются)
+  - processIncoming() блокируется на read с timeout
+  - Sequence tracking есть, но только для identify handshake
+
+ВЛИЯНИЕ [КРИТИЧЕСКОЕ]: Без retransmission при потере пакета:
+  - MCU не получит команду, sequence разойдётся
+  - Нет recovery — система зависает
+  - Нет minclock scheduling = шаги могут отправляться в прошлое
+
+4.2. IDENTIFY HANDSHAKE
+PYTHON: Через serialqueue C-layer, с retries и timeout
+C++ PORT: Сканирует все 16 sequence номеров, exponential backoff retries
+  - Более robust для reconnection (пробует все seq)
+  - Может быть медленнее на первом подключении
+
+================================================================================
+5. CLOCK SYNCHRONIZATION — СРАВНЕНИЕ
+================================================================================
+
+PYTHON: ClockSync in clocksync.py
+C++ PORT: ClockSync in clock_sync.cpp/h
+
+ИДЕНТИЧНО:
+  ✓ RTT_AGE = 0.000010 / (60*60)
+  ✓ DECAY = 1/30
+  ✓ TRANSMIT_EXTRA = 0.001
+  ✓ Outlier rejection: 25x variance AND 0.0005*freq threshold
+  ✓ EMA linear regression formula
+  ✓ 8 warm-up samples
+  ✓ 64-bit clock extension
+
+ОТЛИЧИЕ:
+  - C++ использует sentTime для regression input; Python использует
+    sentTime (без min_half_rtt offset в regression). В итоге clockEst
+    формируется одинаково, но intermediate regression values слегка
+    отличаются. Практическое влияние минимально.
+
+  - C++ не передаёт clock estimate в serialqueue (нет C serialqueue)
+  - Нет set_clock_est() → serialqueue, потому что нет serialqueue
+  - Нет SecondarySync (только primary MCU)
+
+================================================================================
+6. MCU CONFIGURATION — СРАВНЕНИЕ
+================================================================================
+
+PYTHON: MCUConfigHelper с 3 списками команд
+C++ PORT: KlipperMCU с 3 списками команд
+
+ИДЕНТИЧНО:
+  ✓ OID allocation (sequential counter)
+  ✓ allocate_oids count=N prepend
+  ✓ CRC32 of config commands
+  ✓ finalize_config crc=X append
+  ✓ get_config reconciliation (fresh/restart/reset paths)
+  ✓ Stale clock patching в restart/init commands
+  ✓ Pin resolution через regex replacement
+
+ОТЛИЧИЯ:
+  - C++ не вызывает config callbacks — объекты добавляют команды напрямую
+    через addConfigCmd/addRestartCmd/addInitCmd
+  - C++ finalizeConfig() добавляет MCU reset при shutdown (Python тоже,
+    но другим путём через MCURestartHelper)
+
+================================================================================
+7. STEP GENERATION — КРИТИЧЕСКОЕ СРАВНЕНИЕ
+================================================================================
+
+PYTHON: itersolve (C chelper) → stepcompress (C) → steppersync (C) → serialqueue (C)
+  - itersolve: итеративный поиск step times через stepper_kinematics
+  - stepcompress: compress_bisect_add → queue_step commands
+  - steppersync: координированная отправка steps от всех steppers
+  - serialqueue: scheduled командный send с minclock/reqclock
+
+C++ PORT: Аналитические формулы → compress_bisect_add → queueStep → serial
+  - Unshaped: аналитическое решение квадратного уравнения для step times
+    (constant vel = linear, accel = quadratic formula)
+  - Shaped: secant/bisection solver (порт itersolve_gen_steps_range)
+  - compress_bisect_add: точный порт из stepcompress.c
+  - Нет steppersync — steps отправляются непосредственно
+
+ОТЛИЧИЯ:
+  7a. Unshaped step generation:
+      Python: itersolve (generic, поддерживает любые kinematics)
+      C++: прямая аналитическая формула (только cartesian)
+      → Не поддерживает CoreXY, Delta и другие kinematics
+      → НО для cartesian — корректно и потенциально быстрее
+
+  7b. Shaped step generation:
+      Python: input_shaper обёртывает stepper_kinematics в C
+      C++: convolution в generateShapedAxisSteps()
+      → Алгоритмически эквивалентно (secant/bisection)
+      → Но интегрировано иначе (в toolhead vs chelper)
+
+  7c. Cross-TrapMove compression:
+      C++ оптимизация: для unshaped осей собирает ВСЕ step clocks
+      из ВСЕХ TrapMoves в один массив и компрессирует разом
+      → Уменьшает количество queue_step команд в 10-100x для arc сегментов
+      → Python делает это через непрерывную работу stepcompress
+
+  7d. Отсутствие steppersync:
+      → Нет координации между осями
+      → Шаги X могут отправляться значительно раньше Y
+      → На MCU это может вызвать переполнение очереди одной оси
+
+================================================================================
+8. INPUT SHAPER — СРАВНЕНИЕ
+================================================================================
+
+ИДЕНТИЧНО:
+  ✓ Все типы шейперов: ZV, ZVD, MZV, EI, 2HUMP_EI, 3HUMP_EI
+  ✓ Формулы коэффициентов (K, t_d, df)
+  ✓ Polynomial expansion для EI shapers
+  ✓ initPulses нормализация, реверс, time-shift
+
+ОТЛИЧИЯ:
+  - Python: input shaper обёртывает stepper kinematics на C-уровне
+    (input_shaper_alloc → input_shaper_set_sk → itersolve использует обёртку)
+  - C++: convolution выполняется в toolhead::generateShapedAxisSteps()
+    (явный цикл по pulse weights)
+  - Функционально эквивалентно, но разная точка интеграции
+
+================================================================================
+9. HOMING — СРАВНЕНИЕ
+================================================================================
+
+PYTHON:
+  - HomingMove + Homing classes
+  - Uses drip_move (через полный planner с ускорением)
+  - TriggerDispatch + MCU_trsync для multi-MCU
+  - StepperPosition tracking (start_pos, halt_pos, trig_pos)
+  - Проверка overtravel (halt_pos - trig_pos)
+  - ENDSTOP_SAMPLE_TIME=15µs, ENDSTOP_SAMPLE_COUNT=4
+  - Динамический расчёт rest_time от max_steps
+
+C++ PORT:
+  - PrinterRail::homeAxis() — монолитная функция
+  - Прямое queueStep() без ускорения (constant velocity)
+  - trsync есть, но только single-MCU
+  - Нет StepperPosition, нет trig_pos
+  - Нет overtravel коррекции
+  - Hardcoded restTime=0.01s (vs dynamic calculation)
+
+ВЛИЯНИЕ [ВЫСОКОЕ]: Отсутствие ускорения при хоминге снижает надёжность
+на высоких скоростях. Отсутствие overtravel коррекции = неточная
+позиция после хоминга (ошибка ~десятки мкм на типичных скоростях).
+
+================================================================================
+10. MCU OBJECTS — СРАВНЕНИЕ
+================================================================================
+
+ИДЕНТИЧНО (функционально):
+  ✓ MCU_digital_out (safety timeout, start/shutdown value validation)
+  ✓ MCU_pwm (HW + SW PWM paths)
+  ✓ MCU_adc (staggered start, callback-based)
+  ✓ MCU_SPI (with/without CS, bus resolution)
+  ✓ MCU_I2C (write, read, bus configuration)
+  ✓ MCU_TMC_uart (CRC8-ATM, bitframe encode/decode, retries)
+  ✓ TMC5160 (current calc, CHOPCONF, PWMCONF, GCONF, daisy chain)
+  ✓ MCU_Thermocouple (MAX31855/31856/6675/31865, Callendar-Van Dusen)
+
+ОТЛИЧИЯ:
+  - MCU_pwm: Python имеет next_aligned_print_time() для фазовой корректности,
+    C++ — нет
+  - MCU_adc: Python поддерживает batch response format,
+    C++ — только single-value format
+  - TMC5160: Python имеет write verification (read-back + retry),
+    C++ — нет (fire and forget write)
+  - MCU_endstop: Python имеет TriggerDispatch для multi-MCU,
+    C++ — single MCU only
+
+================================================================================
+11. CONFIG SYSTEM — СРАВНЕНИЕ
+================================================================================
+
+PYTHON: ConfigParser с sections, options, условными includes
+  - Supports [include path], conditional pin mapping
+  - Extensive validation with error messages
+  - Runtime section lookup: get_printer().lookup_object()
+
+C++ PORT: KlipperConfig static parser
+  - INI-style: [section], key: value
+  - Нет conditional includes
+  - Нет runtime plugin system
+  - Hardcoded section type mapping (stepper_*, extruder, heater_bed, etc.)
+
+================================================================================
+12. ЧТО РЕАЛИЗОВАНО ХОРОШО (ОТНОСИТЕЛЬНО ОРИГИНАЛА)
+================================================================================
+
+  ✓ Protocol layer (VLQ, CRC16, message framing, identify)  — полный порт
+  ✓ Clock synchronization — nearly identical algorithm
+  ✓ Step compression (bisect_add) — faithful port
+  ✓ Input shaper math — все коэффициенты корректны
+  ✓ TMC5160 — register config, current calc, daisy chain
+  ✓ MCU config finalization — CRC reconciliation path
+  ✓ Thermocouple conversion — all 4 sensor types
+  ✓ Shaped step generation — secant/bisection solver
+
+================================================================================
+13. ПРИОРИТЕТНЫЙ СПИСОК ОТЛИЧИЙ ДЛЯ ИСПРАВЛЕНИЯ
+================================================================================
+
+  КРИТИЧЕСКИЕ (блокируют стабильную работу):
+  1. Print-time buffering / pause logic
+  2. Serial retransmission
+  3. Extruder support
+  4. Junction velocity — добавить centripetal + prev_move limits
+
+  ВЫСОКИЕ (влияют на качество / надёжность):
+  5. Lazy flush + time-based flush trigger
+  6. MCR (Minimum Cruise Ratio)
+  7. Drip move для homing (ускорение/торможение)
+  8. Homing overtravel correction
+  9. Steppersync coordination
+
+  СРЕДНИЕ (улучшение robustness):
+  10. Homed state validation
+  11. GCode flow control
+  12. Multi-MCU support (trdispatch)
+  13. TMC5160 write verification
+  14. PWM phase alignment
+
+================================================================================
+END OF COMPARISON
+================================================================================

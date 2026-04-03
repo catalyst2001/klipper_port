@@ -6,87 +6,99 @@
 // ========== Move ==========
 
 Move::Move(const Vec3& startPos, const Vec3& endPos,
-           double spd, double acc, double maxJV2)
+           double spd, double acc, double junctionDev, double mcrPseudoAccel)
     : start_pos(startPos), end_pos(endPos), speed(spd), accel(acc),
-      max_junction_v2(maxJV2)
+      junction_deviation(junctionDev)
 {
     axes_d = end_pos - start_pos;
     move_d = axes_d.length();
 
     max_cruise_v2 = speed * speed;
+    delta_v2 = 2.0 * move_d * accel;
+    mcr_delta_v2 = 2.0 * move_d * mcrPseudoAccel;
 
-    // Can't start/end faster than what accel allows over the distance
-    max_start_v2 = max_cruise_v2;
-    max_smoothed_v2 = max_cruise_v2;
+    max_start_v2 = 0.0;
+    max_mcr_start_v2 = 0.0;
 
     is_kinematic_move = (move_d > 0.000000001);
+    min_move_t = is_kinematic_move ? (move_d / speed) : 0.0;
 }
 
-void Move::calcJunctionV2(const Move* prevMove, double junctionDeviation) {
+// Port of Klipper's Move.calc_junction() from toolhead.py
+// Computes max_start_v2 using junction deviation + centripetal velocity model
+void Move::calcJunction(const Move* prevMove) {
     if (!prevMove || !prevMove->is_kinematic_move || !is_kinematic_move) {
-        max_junction_v2 = 0.0;
+        max_start_v2 = 0.0;
+        max_mcr_start_v2 = 0.0;
         return;
     }
 
-    // Junction velocity from junction deviation model (Klipper's approach):
-    // v² = junction_deviation * accel * (sin(theta/2) / (1 - sin(theta/2)))
-    // Using the dot product of unit vectors to get cos(theta)
+    // Initial constraint: can't exceed either move's cruise speed,
+    // previous move's next_junction limit, or what prev could accelerate to
+    double max_start = std::min({max_cruise_v2,
+                                 prevMove->max_cruise_v2,
+                                 prevMove->next_junction_v2,
+                                 prevMove->max_start_v2 + prevMove->delta_v2});
+
+    // Find max velocity using "approximated centripetal velocity"
+    // See Klipper's toolhead.py Move.calc_junction() for derivation
     Vec3 prevUnit = prevMove->axes_d * (1.0 / prevMove->move_d);
     Vec3 curUnit = axes_d * (1.0 / move_d);
 
-    double cosTheta = -(prevUnit.dot(curUnit));
-    // cos(theta) ranges from -1 (same dir) to 1 (reversal)
-    // cos(theta/2) = sqrt((1 + cos(theta))/2)
-    // sin(theta/2) = sqrt((1 - cos(theta))/2)
+    // junction_cos_theta = -(dot product of direction vectors)
+    double junction_cos_theta = -(curUnit.dot(prevUnit));
 
-    if (cosTheta >= 0.9999) {
-        // Nearly 180° reversal: junction velocity = 0
-        max_junction_v2 = 0.0;
-        return;
+    double sin_theta_d2 = std::sqrt(std::max(0.5 * (1.0 - junction_cos_theta), 0.0));
+    double cos_theta_d2 = std::sqrt(std::max(0.5 * (1.0 + junction_cos_theta), 0.0));
+    double one_minus_sin_theta_d2 = 1.0 - sin_theta_d2;
+
+    if (one_minus_sin_theta_d2 > 0.0 && cos_theta_d2 > 0.0) {
+        double R_jd = sin_theta_d2 / one_minus_sin_theta_d2;
+
+        // Junction deviation velocity for this move and previous move
+        double move_jd_v2 = R_jd * junction_deviation * accel;
+        double pmove_jd_v2 = R_jd * prevMove->junction_deviation * prevMove->accel;
+
+        // Centripetal velocity limit — approximated circle must contact
+        // moves no further than mid-move
+        double quarter_tan_theta_d2 = 0.25 * sin_theta_d2 / cos_theta_d2;
+        double move_centripetal_v2 = delta_v2 * quarter_tan_theta_d2;
+        double pmove_centripetal_v2 = prevMove->delta_v2 * quarter_tan_theta_d2;
+
+        // Apply all 4 limits
+        max_start = std::min({max_start,
+                              move_jd_v2, pmove_jd_v2,
+                              move_centripetal_v2, pmove_centripetal_v2});
     }
+    // else: colinear or ~180° — no geometric constraint, max_start
+    // stays at cruise/reachability limit from above
 
-    cosTheta = std::max(-1.0, std::min(1.0, cosTheta));
-    double sinThetaD2 = std::sqrt(0.5 * (1.0 - cosTheta));
-    double r = junctionDeviation * sinThetaD2 / (1.0 - sinThetaD2);
+    max_start_v2 = std::max(0.0, max_start);
 
-    // v² = R * accel
-    double jv2 = r * accel;
-
-    // Clamp to min of both moves' cruise speeds  
-    jv2 = std::min(jv2, max_cruise_v2);
-    jv2 = std::min(jv2, prevMove->max_cruise_v2);
-
-    max_junction_v2 = std::max(0.0, jv2);
+    // MCR tracking
+    max_mcr_start_v2 = std::min(max_start_v2,
+        prevMove->max_mcr_start_v2 + prevMove->mcr_delta_v2);
 }
 
 void Move::setJunction(double startV2, double cruiseV2, double endV2) {
+    // Port of Klipper's Move.set_junction() from toolhead.py
+    // Determine accel, cruise, and decel portions of the move distance
+    double half_inv_accel = 0.5 / accel;
+
+    accel_d = (cruiseV2 - startV2) * half_inv_accel;
+    decel_d = (cruiseV2 - endV2) * half_inv_accel;
+    cruise_d = move_d - accel_d - decel_d;
+
+    // Determine move velocities
     start_v = std::sqrt(startV2);
     cruise_v = std::sqrt(cruiseV2);
     end_v = std::sqrt(endV2);
 
-    // Acceleration phase: v² = v0² + 2*a*d → d = (v² - v0²) / (2*a)
-    double inv2a = 1.0 / (2.0 * accel);
-
-    accel_d = (cruiseV2 - startV2) * inv2a;
-    decel_d = (cruiseV2 - endV2) * inv2a;
-    cruise_d = move_d - accel_d - decel_d;
-
-    // Handle triangle profile (cruise_d < 0)
-    if (cruise_d < 0.0) {
-        // Reduce cruise velocity so accel_d + decel_d = move_d
-        // v_peak² = (v0² + v1² + 2*a*d) / 2
-        double peakV2 = (startV2 + endV2 + 2.0 * accel * move_d) * 0.5;
-        cruise_v = std::sqrt(std::max(0.0, peakV2));
-        accel_d = (peakV2 - startV2) * inv2a;
-        decel_d = (peakV2 - endV2) * inv2a;
-        cruise_d = 0.0;
-    }
-
-    // Compute timing
-    // accel: d = v0*t + 0.5*a*t² → t = (v - v0) / a
-    accel_t = (accel > 0 && accel_d > 0) ? (cruise_v - start_v) / accel : 0;
-    cruise_t = (cruise_v > 0) ? cruise_d / cruise_v : 0;
-    decel_t = (accel > 0 && decel_d > 0) ? (cruise_v - end_v) / accel : 0;
+    // Determine time spent in each portion of move (time is the
+    // distance divided by average velocity) — matches Klipper exactly
+    accel_t = (start_v + cruise_v > 0.0) ? accel_d / ((start_v + cruise_v) * 0.5) : 0.0;
+    cruise_t = (cruise_v > 0.0) ? cruise_d / cruise_v : 0.0;
+    decel_t = (end_v + cruise_v > 0.0) ? decel_d / ((end_v + cruise_v) * 0.5) : 0.0;
 }
 
 std::vector<TrapMove> Move::toTrapMoves() const {

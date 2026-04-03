@@ -1,0 +1,112 @@
+================================================================================
+KLIPPER C++ PORT — TODO / TASK TRACKER
+================================================================================
+Создан: 2025-04-03
+Формат: [STATUS] ID: Описание
+  STATUS: [ ] todo, [W] в работе, [X] выполнено, [T] ожидает тестирования
+
+================================================================================
+АЛГОРИТМИЧЕСКИЕ ИСПРАВЛЕНИЯ (приоритет 1)
+================================================================================
+
+[X] A1-FIX: Junction velocity — добавить centripetal limit + prev_move calc
+    Файлы: trapq.h, trapq.cpp (calcJunctionV2)
+    Порт: toolhead.py :: Move.calc_junction()
+    Описание: Добавить 4 ограничения: move_jd_v2, pmove_jd_v2, 
+              move_centripetal_v2, pmove_centripetal_v2
+    Также: добавить delta_v2 в Move, junction_deviation per-move
+    Дата: 2025-04-03
+    Итог: Добавлены delta_v2, junction_deviation в Move. calcJunction()
+          вычисляет все 4 лимита (jd + centripetal для обоих moves),
+          clamp по prev max_start_v2 + delta_v2 и prev next_junction_v2.
+          Формула junction_deviation: scv²*(√2-1)/accel (как в оригинале).
+          setSquareCornerVelocity() теперь вычисляет JD и mcrPseudoAccel.
+          moveAbsolute() передаёт JD и mcrPseudoAccel в Move конструктор.
+
+[X] A5-FIX: Lazy flush + time-based flush trigger
+    Файлы: toolhead.h, toolhead.cpp (lookaheadFlush, moveAbsolute)
+    Порт: toolhead.py :: LookAheadQueue.flush(lazy=True)
+    Описание: Заменить flush по queue depth на time-based trigger
+              (LOOKAHEAD_FLUSH_TIME = 0.150s). Реализовать lazy flush:
+              flush только до подтверждённого пика, остальное оставлять.
+    Также: добавить MCR tracking (min_cruise_ratio)
+    Дата: 2025-04-03
+    Итог: Добавлены LOOKAHEAD_FLUSH_TIME=0.150, m_junctionFlush (countdown),
+          MCR tracking (mcr_pseudo_accel, max_mcr_start_v2, mcr_delta_v2).
+          lookaheadFlush(lazy) — полный 2-pass алгоритм из оригинала:
+          reverse pass с MCR и flush_count determination, forward pass
+          с cruise_v2 propagation, partial flush с сохранением trailing moves.
+          moveAbsolute() использует time-based flush trigger.
+          flush() вызывает lookaheadFlush(false) для принудительной остановки.
+
+================================================================================
+АЛГОРИТМИЧЕСКИЕ ИСПРАВЛЕНИЯ (приоритет 2)
+================================================================================
+
+[ ] A2-FIX: Print-time backpressure / pause logic
+    Файлы: toolhead.h, toolhead.cpp
+    Описание: Добавить BUFFER_TIME_HIGH/START, проверку print_time vs est_time,
+              блокировку gcode processing при переполнении буфера
+    Требует: clock_sync интеграция (estimated_print_time)
+
+[ ] A4-FIX: Homing с ускорением (trapezoid ramp)
+    Файлы: stepper.cpp (PrinterRail::homeAxis)
+    Описание: Заменить constant-velocity queueStep на trapezoid move через
+              toolhead/trapq. Или минимум — добавить acceleration ramp.
+    Также: overtravel correction (trig_pos tracking)
+
+================================================================================
+SERIAL / PROTOCOL ИСПРАВЛЕНИЯ
+================================================================================
+
+[ ] A3-FIX: Serial retransmission queue
+    Файлы: klipper_mcu.cpp, serial_port.cpp (или новый serialqueue.cpp)
+    Описание: Реализовать retransmit queue с ACK tracking, sequence-based
+              retransmission, RTO estimation. Большая задача.
+
+[ ] E1-FIX: Reconnect при потере COM порта
+    Файлы: serial_port.cpp, klipper_mcu.cpp
+    Описание: Обнаружение отключения USB-serial (timeout, error codes),
+              автоматический disconnect + cleanup, prepare for reconnect.
+    Этап 1: Timeout detection + graceful disconnect
+    Этап 2: Auto-reconnect + re-identify + re-config
+
+================================================================================
+СРЕДНИЕ ЗАДАЧИ
+================================================================================
+
+[ ] B1-FIX: Проверка homed state перед moves
+    Файлы: gcode.cpp (cmdG0G1)
+    
+[ ] B3-FIX: Dynamic endstop sample rate calculation
+    Файлы: stepper.cpp (PrinterRail::homeAxis)
+
+[ ] C6-FIX: TMC5160 write verification (readback + retry)
+    Файлы: tmc5160.cpp
+
+[ ] C1-FIX: Steppersync / inter-axis coordination
+    Файлы: toolhead.cpp (generateSteps)
+
+================================================================================
+ФУНКЦИОНАЛЬНЫЕ ДОРАБОТКИ
+================================================================================
+
+[ ] D1: Extruder / E-axis support
+[ ] D4: CoreXY kinematics
+[ ] D6: Heater PID control
+[ ] D8: Thermal runaway protection
+
+================================================================================
+ИНФРАСТРУКТУРА
+================================================================================
+
+[ ] CLI: Создать CLI утилиту для диагностики (connect, identify, status)
+    Описание: Отдельный проект, даёт возможность отслеживать состояние
+              MCU, clock sync, stepper status через терминал.
+
+================================================================================
+ИСТОРИЯ ИЗМЕНЕНИЙ
+================================================================================
+2025-04-03: Создан файл todo
+2025-04-03: A1-FIX выполнен — junction velocity с centripetal limits
+2025-04-03: A5-FIX выполнен — lazy flush + MCR + time-based trigger

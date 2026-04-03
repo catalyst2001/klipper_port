@@ -176,8 +176,10 @@ void ToolHead::setJunctionDeviation(double jd) {
 void ToolHead::setSquareCornerVelocity(double scv) {
     m_squareCornerVelocity = scv;
     // Compute junction_deviation from square_corner_velocity:
-    // jd = scv^2 / (2 * accel)  (Klipper's formula)
-    m_junctionDeviation = (scv * scv) / (2.0 * m_maxAccel);
+    // jd = scv^2 * (sqrt(2) - 1) / max_accel  (Klipper's formula)
+    double scv2 = scv * scv;
+    m_junctionDeviation = scv2 * (std::sqrt(2.0) - 1.0) / m_maxAccel;
+    m_mcrPseudoAccel = m_maxAccel * (1.0 - m_minCruiseRatio);
 }
 
 void ToolHead::addStepper(int axis, MCU_stepper* stepper) {
@@ -190,24 +192,21 @@ void ToolHead::moveAbsolute(const Vec3& pos, double speed) {
     speed = std::min(speed, m_maxVel);
     if (speed <= 0) speed = m_maxVel;
 
-    Move move(m_pos, pos, speed, m_maxAccel);
+    Move move(m_pos, pos, speed, m_maxAccel, m_junctionDeviation, m_mcrPseudoAccel);
 
     if (!move.is_kinematic_move) return;
 
     // Calculate junction velocity with previous move
     Move* prev = m_queue.empty() ? nullptr : &m_queue.back();
-    move.calcJunctionV2(prev, m_junctionDeviation);
-
-    // Limit max start velocity
-    move.max_start_v2 = std::min(move.max_junction_v2,
-                                  move.max_cruise_v2);
+    move.calcJunction(prev);
 
     m_queue.push_back(std::move(move));
     m_pos = pos;
 
-    // Flush lookahead if queue is getting long
-    if (m_queue.size() >= 16) {
-        lookaheadFlush(false);
+    // Time-based flush trigger (like Klipper's junction_flush countdown)
+    m_junctionFlush -= m_queue.back().min_move_t;
+    if (m_junctionFlush <= 0.0) {
+        lookaheadFlush(true);
     }
 }
 
@@ -218,74 +217,108 @@ void ToolHead::moveRelative(const Vec3& delta, double speed) {
 
 void ToolHead::flush() {
     if (!m_queue.empty()) {
-        lookaheadFlush(true);
+        lookaheadFlush(false);
     }
 }
 
-void ToolHead::lookaheadFlush(bool forceFlush) {
+void ToolHead::lookaheadFlush(bool lazy) {
+    m_junctionFlush = LOOKAHEAD_FLUSH_TIME;
+
     if (m_queue.empty()) return;
 
-    size_t count = m_queue.size();
+    bool updateFlushCount = lazy;
+    size_t flushCount = m_queue.size();
 
-    // REVERSE PASS: propagate max_start_v2 backwards
-    // Last move must end at 0 (if force flush)
-    double end_v2 = forceFlush ? 0.0 : m_queue.back().max_cruise_v2;
+    // --- REVERSE PASS ---
+    // Traverse queue from last to first move and determine maximum
+    // junction speed assuming the robot comes to a complete stop
+    // after the last move. Port of Klipper's LookAheadQueue.flush().
 
-    for (int i = static_cast<int>(count) - 1; i >= 0; --i) {
+    struct JunctionInfo {
+        size_t idx;
+        double start_v2;
+        double cruise_v2;     // -1.0 means "None" (needs forward propagation)
+        double next_start_v2;
+    };
+    std::vector<JunctionInfo> jinfo(flushCount);
+
+    double next_start_v2 = 0.0;
+    double next_mcr_start_v2 = 0.0;
+    double peak_cruise_v2 = 0.0;
+    int pending_cv2_assign = 0;
+
+    for (int i = static_cast<int>(flushCount) - 1; i >= 0; --i) {
         Move& move = m_queue[i];
-        // The move's start velocity is limited by what end velocity the
-        // braking phase can reach: v_start² = v_end² + 2*a*d
-        // But it can't exceed junction limit
-        double reachable = end_v2 + 2.0 * move.accel * move.move_d;
-        move.max_start_v2 = std::min(move.max_start_v2,
-                                      std::min(reachable, move.max_cruise_v2));
-        end_v2 = move.max_start_v2;
-    }
 
-    // FORWARD PASS: propagate start_v2 forward, set junctions
-    double prev_end_v2 = 0.0;
+        double reachable_start_v2 = next_start_v2 + move.delta_v2;
+        double start_v2 = std::min(move.max_start_v2, reachable_start_v2);
+        double cruise_v2 = -1.0;  // None
+        pending_cv2_assign += 1;
 
-    for (size_t i = 0; i < count; ++i) {
-        Move& move = m_queue[i];
+        double reach_mcr_start_v2 = next_mcr_start_v2 + move.mcr_delta_v2;
+        double mcr_start_v2 = std::min(move.max_mcr_start_v2, reach_mcr_start_v2);
 
-        // Start velocity: limited by previous move's end velocity AND
-        // what acceleration can reach over the distance
-        double start_v2 = std::min(move.max_start_v2, prev_end_v2);
-
-        // Cruise velocity: limited by max cruise speed
-        double cruise_v2 = move.max_cruise_v2;
-
-        // End velocity: limited by what we can reach from start and
-        // also by the next move's max_start (or 0 if flush)
-        double end_v2_limit;
-        if (i + 1 < count) {
-            end_v2_limit = m_queue[i + 1].max_start_v2;
-        } else {
-            end_v2_limit = forceFlush ? 0.0 : cruise_v2;
+        if (mcr_start_v2 < reach_mcr_start_v2) {
+            // It's possible for this move to accelerate
+            if (mcr_start_v2 + move.mcr_delta_v2 > next_mcr_start_v2
+                || pending_cv2_assign > 1) {
+                // This move can both accel and decel, or this is a
+                // full accel move followed by a full decel move
+                if (updateFlushCount && peak_cruise_v2 > 0.0) {
+                    flushCount = static_cast<size_t>(i) + pending_cv2_assign;
+                    updateFlushCount = false;
+                }
+                peak_cruise_v2 = (mcr_start_v2 + reach_mcr_start_v2) * 0.5;
+            }
+            cruise_v2 = std::min({(start_v2 + reachable_start_v2) * 0.5,
+                                  move.max_cruise_v2,
+                                  peak_cruise_v2});
+            pending_cv2_assign = 0;
         }
 
-        // Can't exceed what acceleration allows: v² = v0² + 2*a*d
-        double max_end_from_start = start_v2 + 2.0 * move.accel * move.move_d;
-        double end_v2_val = std::min(end_v2_limit, max_end_from_start);
-        end_v2_val = std::min(end_v2_val, cruise_v2);
+        jinfo[i] = {static_cast<size_t>(i), start_v2, cruise_v2, next_start_v2};
+        next_start_v2 = start_v2;
+        next_mcr_start_v2 = mcr_start_v2;
+    }
 
-        // Set the trapezoid
-        move.setJunction(start_v2, cruise_v2, end_v2_val);
+    if (updateFlushCount || flushCount == 0) {
+        // Lazy flush found no confirmed velocity peak — nothing to flush yet
+        return;
+    }
+
+    // --- FORWARD PASS ---
+    // Propagate cruise_v2 forward for moves that couldn't accelerate
+    double prev_cruise_v2 = 0.0;
+
+    for (size_t i = 0; i < flushCount; ++i) {
+        auto& ji = jinfo[i];
+        Move& move = m_queue[ji.idx];
+
+        double cruise_v2 = ji.cruise_v2;
+        if (cruise_v2 < 0.0) {
+            // This move can't accelerate — propagate from previous
+            cruise_v2 = std::min(prev_cruise_v2, ji.start_v2);
+        }
+
+        move.setJunction(std::min(ji.start_v2, cruise_v2),
+                         cruise_v2,
+                         std::min(ji.next_start_v2, cruise_v2));
 
         // Assign print time
         move.print_time = m_nextPrintTime;
         m_nextPrintTime += move.accel_t + move.cruise_t + move.decel_t;
 
-        prev_end_v2 = end_v2_val;
+        prev_cruise_v2 = cruise_v2;
     }
 
-    // Generate TrapMoves and add to queue
-    for (auto& move : m_queue) {
-        auto trapMoves = move.toTrapMoves();
+    // Generate TrapMoves for flushed moves and add to queue
+    for (size_t i = 0; i < flushCount; ++i) {
+        auto trapMoves = m_queue[i].toTrapMoves();
         m_trapq.append(trapMoves);
     }
 
-    m_queue.clear();
+    // Remove processed moves from the queue, keep the rest
+    m_queue.erase(m_queue.begin(), m_queue.begin() + flushCount);
 }
 
 void ToolHead::generateAxisSteps(int axis, const TrapMove& tm, bool needsReset) {

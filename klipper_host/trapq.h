@@ -51,11 +51,13 @@ struct TrapMove {
 
 // Move: a planned motion from start_pos to end_pos.
 // After junction calculation + lookahead, it gets split into TrapMoves.
+// Port of Klipper's Move class from toolhead.py.
 class Move {
 public:
     Move() = default;
     Move(const Vec3& startPos, const Vec3& endPos,
-         double speed, double accel, double maxJunctionV2 = 0.0);
+         double speed, double accel, double junctionDev = 0.0,
+         double mcrPseudoAccel = 0.0);
 
     Vec3 start_pos;
     Vec3 end_pos;
@@ -63,10 +65,19 @@ public:
     double move_d = 0;         // total distance
     double speed = 0;          // cruise speed (mm/s)
     double accel = 0;          // acceleration (mm/s^2)
-    double max_junction_v2 = 0; // max junction velocity^2 (from junction deviation)
-    double max_start_v2 = 0;
-    double max_cruise_v2 = 0;
-    double max_smoothed_v2 = 0;
+    double junction_deviation = 0; // per-move junction deviation
+
+    // Velocity squared tracking (Klipper convention)
+    double max_start_v2 = 0;   // max allowed start velocity^2
+    double max_cruise_v2 = 0;  // speed^2
+    double delta_v2 = 0;       // 2 * move_d * accel (max v^2 change)
+    double next_junction_v2 = 999999999.9; // limit on next move's junction
+
+    // Minimum cruise ratio (MCR) tracking
+    double max_mcr_start_v2 = 0;
+    double mcr_delta_v2 = 0;   // 2 * move_d * mcr_pseudo_accel
+
+    double min_move_t = 0;     // move_d / velocity (minimum time at cruise)
 
     // Junction results (filled by lookahead flush)
     double start_v = 0;
@@ -86,8 +97,9 @@ public:
 
     bool is_kinematic_move = false;
 
-    // Calculate junction deviation-based max velocity
-    void calcJunctionV2(const Move* prevMove, double junctionDeviation);
+    // Calculate junction velocity using centripetal + junction deviation model
+    // Port of Klipper's Move.calc_junction()
+    void calcJunction(const Move* prevMove);
 
     // Set start/cruise/end velocities and compute trapezoid timing
     void setJunction(double startV2, double cruiseV2, double endV2);
@@ -95,6 +107,9 @@ public:
     // Split this move into TrapMoves (accel + cruise + decel)
     std::vector<TrapMove> toTrapMoves() const;
 };
+
+// Lookahead constants (from Klipper's toolhead.py)
+constexpr double LOOKAHEAD_FLUSH_TIME = 0.150; // seconds
 
 // TrapQ: queue of TrapMoves for step generation.
 // Steppers consume TrapMoves to generate step times.

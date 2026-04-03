@@ -69,6 +69,8 @@ private:
     double m_maxAccel = 1000.0;   // mm/s^2
     double m_junctionDeviation = 0.02;  // mm (from square_corner_velocity)
     double m_squareCornerVelocity = 5.0; // mm/s
+    double m_minCruiseRatio = 0.5;      // minimum cruise ratio [0, 1)
+    double m_mcrPseudoAccel = 0.0;      // max_accel * (1 - min_cruise_ratio)
 
     // Current position
     Vec3 m_pos;
@@ -76,8 +78,9 @@ private:
     // Print time tracking
     double m_nextPrintTime = 0.1;
 
-    // Lookahead queue
+    // Lookahead queue + time-based flush tracking
     std::deque<Move> m_queue;
+    double m_junctionFlush = LOOKAHEAD_FLUSH_TIME; // countdown (seconds)
 
     // Axis steppers [X, Y, Z]
     MCU_stepper* m_steppers[3] = {nullptr, nullptr, nullptr};
@@ -89,7 +92,9 @@ private:
     InputShaper m_inputShaper;
 
     // Lookahead: reverse + forward pass, then flush
-    void lookaheadFlush(bool forceFlush);
+    // lazy=true: only flush moves up to confirmed velocity peak (partial flush)
+    // lazy=false: flush all moves (force complete stop at end)
+    void lookaheadFlush(bool lazy);
 
     // Generate steps for a single axis from a TrapMove (analytical, no shaper)
     // needsReset: if true, send reset_step_clock before queue_step

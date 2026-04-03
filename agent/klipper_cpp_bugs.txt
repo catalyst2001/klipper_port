@@ -1,0 +1,407 @@
+================================================================================
+KLIPPER C++ PORT — BUGS, INSTABILITIES, LOGIC ERRORS
+================================================================================
+Date: 2025-04-03
+Scope: klipper_host/ (C++ port)
+Reference: examples/klipper/klippy/ (Python original)
+
+================================================================================
+КАТЕГОРИЯ A — КРИТИЧЕСКИЕ БАГИ (могут вызвать crash / потерю шагов / порчу)
+================================================================================
+
+A1. [toolhead.cpp] ОТСУТСТВИЕ CENTRIPETAL JUNCTION VELOCITY LIMIT
+    Файл: trapq.cpp :: Move::calcJunctionV2()
+    
+    ПРОБЛЕМА: calcJunctionV2() вычисляет junction velocity только через
+    junction deviation модель (jd * sinθ/2 / (1-sinθ/2) * accel). Отсутствует
+    centripetal velocity limit = delta_v2 * 0.25 * tan(θ/2), который в
+    оригинальном Klipper ограничивает скорость в junction-е для пологих
+    поворотов (малые углы).
+    
+    ПОСЛЕДСТВИЕ: На пологих поворотах (cosθ ≈ -1, малый угол) junction
+    deviation даёт высокий лимит, а centripetal — низкий. Без centripetal
+    limit скорость завышена → высокие перегрузки, потеря шагов, рывки.
+    
+    ТАКЖЕ: Нет вычисления для предыдущего move (prev_move_jd_v2,
+    prev_move_centripetal_v2). Если prev_move имеет сниженный accel (от
+    kinematics check_move), junction будет рассчитан по accel текущего move,
+    что тоже завышает скорость.
+    
+    ПРИОРИТЕТ: КРИТИЧЕСКИЙ
+    ФАЙЛ: klipper_host/trapq.cpp, строки с calcJunctionV2
+
+--------
+
+A2. [toolhead.cpp] НЕТ PRINT-TIME BACKPRESSURE
+    Файл: toolhead.cpp :: moveAbsolute(), flush()
+    
+    ПРОБЛЕМА: m_nextPrintTime растёт без ограничений. При обработке
+    большого gcode-файла toolhead генерирует тысячи moves и queue_step
+    команд, отправляя их "в будущее" на десятки минут вперёд.
+    
+    ПОСЛЕДСТВИЕ:
+    - Переполнение serial buffer / MCU command queue
+    - Невозможно корректно приостановить печать (шаги уже в MCU)
+    - При M112 (emergency stop) MCU уже заполнен командами на минуты вперёд
+    - Рассинхронизация print_time и реального MCU clock
+    
+    В оригинале: _check_pause() блокирует gcode thread когда
+    print_time - estimated_print_time > BUFFER_TIME_HIGH (1.0s)
+    
+    ПРИОРИТЕТ: КРИТИЧЕСКИЙ
+    ФАЙЛ: klipper_host/toolhead.cpp
+
+--------
+
+A3. [serial_port.cpp / klipper_mcu.cpp] НЕТ RETRANSMISSION
+    Файл: klipper_mcu.cpp :: sendCommand()
+    
+    ПРОБЛЕМА: Команды отправляются через serial и не отслеживаются.
+    Нет retransmission queue, нет ACK tracking, нет RTO estimation.
+    При потере пакета (шум, buffer overflow) команда теряется безвозвратно.
+    
+    ПОСЛЕДСТВИЕ:
+    - Потерянная queue_step = пропуск шагов
+    - Потерянная config команда = MCU shutdown
+    - Sequence number mismatch = потеря синхронизации
+    
+    В оригинале: C-level serialqueue ведёт retransmit queue, отслеживает
+    ACK по sequence number, retransmit по timeout и duplicate ACK.
+    
+    ПРИОРИТЕТ: КРИТИЧЕСКИЙ
+    ФАЙЛ: klipper_host/klipper_mcu.cpp, klipper_host/serial_port.cpp
+
+--------
+
+A4. [stepper.cpp] ХОМИНГ БЕЗ УСКОРЕНИЯ
+    Файл: stepper.cpp :: PrinterRail::homeAxis()
+    
+    ПРОБЛЕМА: Хоминг выполняется queueStep(intervalTicks, maxSteps, 0) —
+    constant velocity, мгновенный старт. Нет trapezoid profile.
+    
+    ПОСЛЕДСТВИЕ:
+    - При homing_speed > stepper's instant-acceleration capability →
+      пропуск шагов в первые мгновения
+    - Stepper motor может не успеть разогнаться → дроп-ауты
+    - Нет торможения после endstop trigger → увеличенный overtravel
+    - Неточная позиция endstop (нет trig_pos коррекции)
+    
+    В оригинале: drip_move() проходит через полный planner, обеспечивая
+    acceleration ramp при старте и deceleration при остановке.
+    
+    ПРИОРИТЕТ: ВЫСОКИЙ
+    ФАЙЛ: klipper_host/stepper.cpp, строки ~258-336
+
+--------
+
+A5. [toolhead.cpp] LOOKAHEAD FLUSH БЕЗ LAZY MODE
+    Файл: toolhead.cpp :: lookaheadFlush()
+    
+    ПРОБЛЕМА: lookaheadFlush() всегда обрабатывает ВСЮ очередь.
+    Последний move в batch-е всегда получает end_v=0 (complete stop).
+    
+    При flush по порогу 16 moves: каждые 16 moves принудительная остановка.
+    Для arc сегментов (~1mm) это остановка каждые 16mm. Для прямых
+    линий — каждые 16 G1 команд.
+    
+    ПОСЛЕДСТВИЕ:
+    - Периодические полные остановки каждые 16 moves
+    - Сильные артефакты на дугах и кривых
+    - Снижение средней скорости печати
+    
+    В оригинале: lazy flush обрабатывает только moves до подтверждённого
+    пика скорости, оставляя хвост очереди для дальнейшей оптимизации.
+    
+    ПРИОРИТЕТ: ВЫСОКИЙ
+    ФАЙЛ: klipper_host/toolhead.cpp :: lookaheadFlush(), moveAbsolute()
+
+================================================================================
+КАТЕГОРИЯ B — СРЕДНИЕ БАГИ (влияют на качество/надёжность)
+================================================================================
+
+B1. [gcode.cpp] НЕТ ПРОВЕРКИ HOMED STATE ПЕРЕД MOVES
+    Файл: gcode.cpp :: cmdG0G1()
+    
+    ПРОБЛЕМА: G0/G1 принимаются без проверки, были ли оси захомлены.
+    
+    ПОСЛЕДСТВИЕ: Оператор может случайно двинуть оси в неизвестном
+    положении → столкновение с границами / повреждение механики.
+    
+    ПРИОРИТЕТ: СРЕДНИЙ
+    ФАЙЛ: klipper_host/gcode.cpp
+
+--------
+
+B2. [toolhead.cpp] НЕТ MCR (MINIMUM CRUISE RATIO)
+    Файл: toolhead.cpp :: lookaheadFlush()
+
+    ПРОБЛЕМА: Раздел max_smoothed_v2 объявлен, но MCR логика не реализована.
+    Без MCR на серии коротких move возникает "зубчатый" velocity profile
+    (треугольники без cruise-участка).
+    
+    ПОСЛЕДСТВИЕ: Повышенные вибрации, шум, потенциальная потеря шагов
+    на высоких скоростях. Снижение реальной пропускной способности.
+    
+    ПРИОРИТЕТ: СРЕДНИЙ
+    ФАЙЛ: klipper_host/toolhead.cpp
+
+--------
+
+B3. [stepper.cpp] HARDCODED ENDSTOP SAMPLE PARAMETERS
+    Файл: stepper.cpp :: PrinterRail::homeAxis()
+    
+    ПРОБЛЕМА: restTime=0.01 hardcoded. В оригинале rest_time вычисляется
+    динамически: move_time / max_steps. При медленном хоминге и большом
+    travel rest_time может быть значительно больше.
+    
+    ПОСЛЕДСТВИЕ: При быстром хоминге (много шагов) — слишком редкие
+    проверки endstop → поздний trigger detection → больший overtravel.
+    При медленном хоминге — избыточно частые проверки → лишняя нагрузка.
+    
+    ПРИОРИТЕТ: СРЕДНИЙ
+    ФАЙЛ: klipper_host/stepper.cpp, строка ~298
+
+--------
+
+B4. [stepper.cpp] HOMING endstop POLLING С GOTO
+    Файл: stepper.cpp :: MCU_endstop::home()
+    
+    ПРОБЛЕМА: Polling loop с timeout 5s использует goto done. Более серьёзно:
+    trsync_state проверяется через processIncoming() в тесном цикле с
+    500ms таймаутом. Если MCU не ответил за время polling — timeout без
+    clean recovery.
+    
+    ПОСЛЕДСТВИЕ: При сбое связи во время хоминга — зависание на 5 секунд,
+    затем продолжение без корректного состояния endstop/trsync.
+    
+    ПРИОРИТЕТ: СРЕДНИЙ
+    ФАЙЛ: klipper_host/stepper.cpp :: MCU_endstop::home()
+
+--------
+
+B5. [klipper_mcu.cpp] SEQUENCE SCANNING НЕЭФФЕКТИВНО
+    Файл: klipper_mcu.cpp :: identify()
+    
+    ПРОБЛЕМА: При identify пробуются все 16 sequence номеров. Если MCU
+    не отвечает (выключен/сломан), каждый sequence ждёт timeout * retries.
+    С exponential backoff это может занять 16 * (10+20+40+80+160)ms = ~5s.
+    
+    ПОСЛЕДСТВИЕ: Медленный startup при проблемах с MCU. Не баг как таковой,
+    но заметная задержка vs Python's serialqueue подход.
+    
+    ПРИОРИТЕТ: НИЗКИЙ
+
+--------
+
+B6. [klipper_mcu.cpp] STALE CLOCK PATCHING — MAGIC NUMBERS
+    Файл: klipper_mcu.cpp :: finalizeConfig()
+    
+    ПРОБЛЕМА: При обновлении clock= значений в restart/init командах
+    используется смещение 250ms + 10ms*index. Если MCU clock гуляет или
+    finalization занимает долго — clock может оказаться в прошлом.
+    
+    В оригинале: clock вычисляется от текущего estimated time + padding.
+    Тот же подход, но без hardcoded offset.
+    
+    ПРИОРИТЕТ: НИЗКИЙ
+    ФАЙЛ: klipper_mcu.cpp :: finalizeConfig()
+
+================================================================================
+КАТЕГОРИЯ C — ПОТЕНЦИАЛЬНЫЕ НЕСТАБИЛЬНОСТИ
+================================================================================
+
+C1. [toolhead.cpp] generateSteps() — ORDER OF AXIS STEP SENDING
+    
+    ПРОБЛЕМА: Шаги генерируются и отправляются по осям последовательно
+    (сначала все X, потом все Y, потом Z). Нет steppersync для координации.
+    
+    ПОСЛЕДСТВИЕ: На MCU шаги оси X окажутся в queue на десятки ms раньше
+    шагов Y. Если MCU firmware имеет ограничение на глубину очереди —
+    X-queue может переполниться до того, как начнут приходить Y-шаги.
+    
+    ПРИОРИТЕТ: СРЕДНИЙ
+    ФАЙЛ: klipper_host/toolhead.cpp :: generateSteps()
+
+--------
+
+C2. [toolhead.cpp] generateShapedAxisSteps() — CONVERGENCE
+    
+    ПРОБЛЕМА: Secant/bisection solver для shaped steps имеет hardcoded
+    лимит итераций (50). Если input shaper вызывает сложный non-monotonic
+    profile (сильные осцилляции), solver может не сойтись.
+    
+    ПОСЛЕДСТВИЕ: Некоррктное step timing при extreme input shaper settings.
+    В оригинале chelper-версия: те же ограничения, 50 итераций, но
+    с дополнительной обработкой (itersolve_check_active).
+    
+    ПРИОРИТЕТ: НИЗКИЙ
+    ФАЙЛ: klipper_host/toolhead.cpp
+
+--------
+
+C3. [clock_sync.cpp] THREAD SAFETY
+    
+    ПРОБЛЕМА: getClockEstimate() защищён mutex, но handleClockResponse()
+    вызывается из main thread (синхронный processIncoming). При переходе
+    к асинхронной модели potential race condition.
+    
+    Текущая реализация безопасна (однопоточная), но при рефакторинге в
+    многопоточную модель — потребуется ревизия.
+    
+    ПРИОРИТЕТ: НИЗКИЙ (на будущее)
+
+--------
+
+C4. [gcode.cpp] ARC INTERPOLATION — RADIUS AVERAGING
+    Файл: gcode.cpp :: cmdG2G3()
+    
+    ПРОБЛЕМА: Радиус вычисляется как среднее расстояний от центра до
+    начальной и конечной точки: radius = (r1 + r2) / 2. При существенной
+    разнице r1 и r2 (ошибка в I/J) дуга будет неточной без предупреждения.
+    
+    В оригинале (gcode_arcs.py): проверяет |r1-r2| < threshold и выдаёт
+    ошибку при расхождении.
+    
+    ПРИОРИТЕТ: НИЗКИЙ
+    ФАЙЛ: klipper_host/gcode.cpp :: cmdG2G3()
+
+--------
+
+C5. [klipper_mcu.cpp] processIncoming() — BUFFER HANDLING
+    
+    ПРОБЛЕМА: m_recvBuf растёт неограниченно (reserve 4096, но append
+    без лимита). Если MCU шлёт мусор или данные приходят быстрее
+    обработки — буфер может расти бесконечно.
+    
+    ПОСЛЕДСТВИЕ: Memory leak при corrupt serial data.
+    
+    ПРИОРИТЕТ: НИЗКИЙ
+    ФАЙЛ: klipper_host/klipper_mcu.cpp :: processIncoming()
+
+--------
+
+C6. [tmc5160.cpp] NO WRITE VERIFICATION
+    
+    ПРОБЛЕМА: writeRegister() отправляет SPI данные без read-back
+    верификации. В оригинале: запись → чтение → сравнение → retry до 5 раз.
+    
+    ПОСЛЕДСТВИЕ: Corrupt SPI transaction не обнаруживается. TMC5160 может
+    работать с неверными настройками (ток, microstep count, stealthchop).
+    
+    ПРИОРИТЕТ: СРЕДНИЙ
+    ФАЙЛ: klipper_host/tmc5160.cpp :: writeRegister()
+
+--------
+
+C7. [serial_port.cpp] TIMEOUT RESETTING ON EVERY READ
+    
+    ПРОБЛЕМА: read() вызывает SetCommTimeouts() на каждом вызове.
+    Это syscall, и при высокой частоте polling (processIncoming в тесном
+    цикле) — лишние kernel transitions.
+    
+    ПОСЛЕДСТВИЕ: Небольшое снижение производительности. Не баг, но
+    неоптимальность.
+    
+    ПРИОРИТЕТ: НИЗКИЙ
+    ФАЙЛ: klipper_host/serial_port.cpp :: read()
+
+--------
+
+C8. [klipper_config.cpp] COMMENT PARSING EDGE CASE
+    
+    ПРОБЛЕМА: parseFile() считает # комментарием только после пробела:
+    "key: value # comment" → ok, но "key: value#nospace" → value включает #.
+    Klipper Python ConfigParser стандартно не обрабатывает inline comments.
+    
+    ПОСЛЕДСТВИЕ: При пинах вида "PC0#" или значениях с # — некорректный
+    парсинг. Маловероятно на практике, но edge case.
+    
+    ПРИОРИТЕТ: НИЗКИЙ
+
+================================================================================
+КАТЕГОРИЯ D — ОТСУТСТВУЮЩАЯ ФУНКЦИОНАЛЬНОСТЬ
+================================================================================
+
+D1. Extruder / E-axis — нет экструдера, pressure advance, extrude-only moves
+D2. Reactor / event loop — нет асинхронной обработки событий
+D3. Multi-MCU support — нет trdispatch, нет SecondarySync
+D4. Kinematics (CoreXY, Delta, etc.) — только cartesian
+D5. Bed mesh / bed leveling — нет
+D6. Heater PID control — нет (MCU_adc/MCU_pwm есть, но нет PID loop)
+D7. Fan control logic — нет (PWM pin есть, но нет Fan class)
+D8. Temperature monitoring / thermal runaway — нет
+D9. SD card / файловый доступ для gcode — нет
+D10. M112 emergency stop recovery — нет graceful recovery
+D11. Firmware restart/reconnect — частично (finalizeConfig делает reset,
+     но нет полного reconnect flow)
+D12. Statistics / diagnostics — нет MCUStatsHelper
+D13. Motion report — нет position tracking / reporting
+D14. Filament sensors — нет
+D15. Probe / Z offset — нет
+
+================================================================================
+КАТЕГОРИЯ E — БАГИ ОБНАРУЖЕННЫЕ ПОЛЬЗОВАТЕЛЕМ
+================================================================================
+
+E1. [serial_port / klipper_mcu] ЗАВИСАНИЕ ПРИ ПЕРЕЗАГРУЗКЕ ПЛАТЫ
+    Файл: klipper_mcu.cpp, serial_port.cpp
+    
+    ПРОБЛЕМА: После перезагрузки MCU (плата Duet 3 6HC, USB serial)
+    ПО зависает в ожидании ответа, который никогда не придёт.
+    Причина: USB-serial виртуальный COM порт переинициализируется при
+    перезагрузке платы (USB reset), но хост-ПО продолжает ждать на
+    старом HANDLE.
+    
+    ПОСЛЕДСТВИЕ: Полное зависание ПО. Требуется ручное завершение процесса.
+    Нет автоматического обнаружения потери связи.
+    
+    НЕОБХОДИМО:
+    - Обнаружение потери COM порта (timeout detection, serial error handling)
+    - Автоматический disconnect с освобождением всех ресурсов сессии
+    - Базовый reconnect flow (повторное открытие порта, re-identify, re-config)
+    - Освобождение: serial handle, OID state, config commands, clock sync state
+    
+    ПРИОРИТЕТ: КРИТИЧЕСКИЙ (пользовательский опыт)
+    ФАЙЛ: klipper_host/serial_port.cpp, klipper_host/klipper_mcu.cpp
+    СТАТУС: [ ] НЕ ИСПРАВЛЕНО
+
+================================================================================
+РЕЗЮМЕ
+================================================================================
+
+Критических багов: 6 (A1-A5, E1)
+Средних багов: 6 (B1-B6)
+Потенциальных нестабильностей: 8 (C1-C8)
+Отсутствующей функциональности: 15 (D1-D15)
+
+Самые опасные проблемы для немедленного исправления:
+1. A1 — Junction velocity calculation (потеря шагов на углах)
+2. A2 — Print-time backpressure (переполнение MCU queue)
+3. A3 — Serial retransmission (потеря команд)
+4. A5 — Lookahead без lazy flush (принудительные остановки)
+5. A4 — Homing без ускорения (пропуск шагов)
+6. E1 — Зависание при перезагрузке платы
+
+================================================================================
+ИСТОРИЯ ИСПРАВЛЕНИЙ
+================================================================================
+(формат: дата | ID бага | описание фикса | файлы)
+
+2025-04-03 | A1 | Junction velocity: полная реимплементация centripetal model
+  Файлы: trapq.h, trapq.cpp, toolhead.cpp
+  - Move конструктор принимает junctionDev + mcrPseudoAccel
+  - calcJunction(): 4 лимита (move_jd_v2, pmove_jd_v2, centripetal x2)
+  - setSquareCornerVelocity(): формула scv²*(√2-1)/accel + mcrPseudoAccel
+
+2025-04-03 | A5 | Lazy flush + MCR: полная реимплементация lookahead
+  Файлы: trapq.h, toolhead.h, toolhead.cpp
+  - LOOKAHEAD_FLUSH_TIME = 0.150s, time-based flush trigger
+  - lookaheadFlush(lazy): 2-pass алгоритм с MCR tracking
+  - Reverse pass: start_v2 + mcr_start_v2 + peak_cruise_v2 + flush_count
+  - Forward pass: cruise_v2 propagation (None → inherit from prev)
+  - Partial flush: только flush_count moves, остальное сохраняется
+  - flush() вызывает lookaheadFlush(false) для полной остановки
+
+================================================================================
+END OF BUG REPORT
+================================================================================
