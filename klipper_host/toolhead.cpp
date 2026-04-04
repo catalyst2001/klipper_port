@@ -765,6 +765,32 @@ bool ToolHead::generateSteps() {
     auto trapMoves = m_trapq.getAndClear();
     if (trapMoves.empty()) return true;
 
+    // The MCU timer uses 32-bit unsigned clocks with signed overflow
+    // detection (timer_is_before). At 300MHz, 2^31 ticks = ~7.16 seconds.
+    // If we schedule steps beyond this, the timer wraps and fires immediately,
+    // causing "Stepper too far in past" shutdown.
+    // Limit step generation to moves within MAX_CLOCK_AHEAD of current time.
+    // Deferred moves stay in the trapq for the next generateSteps() call.
+    constexpr double MAX_CLOCK_AHEAD = 5.0; // seconds (safe margin under 7.16s)
+    double est = m_mcu.getClockSync().estimatedPrintTime();
+    double maxPrintTime = est + MAX_CLOCK_AHEAD;
+
+    // Split: generate steps for moves within safe window, defer the rest
+    std::vector<TrapMove> nowMoves;
+    std::vector<TrapMove> laterMoves;
+    for (auto& tm : trapMoves) {
+        if (tm.print_time <= maxPrintTime) {
+            nowMoves.push_back(std::move(tm));
+        } else {
+            laterMoves.push_back(std::move(tm));
+        }
+    }
+    if (!laterMoves.empty()) {
+        m_trapq.append(laterMoves); // put back for next call
+    }
+    if (nowMoves.empty()) return true;
+    trapMoves = std::move(nowMoves);
+
     // Check which axes use input shaping
     bool shaped[3] = {false, false, false};
     for (int axis = 0; axis < 3; ++axis) {

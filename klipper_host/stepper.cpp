@@ -40,20 +40,29 @@ bool MCU_stepper::buildConfig() {
     int dirPinNum = m_mcu.resolvePin(m_dirPin);
     if (stepPinNum < 0 || dirPinNum < 0) return false;
 
-    // step_pulse_ticks: use MCU constant if not set
+    // step_pulse_ticks: compute from MCU clock frequency, matching Python Klipper.
+    // Default pulse duration is 2µs. If both-edge stepping is available AND the
+    // pulse duration is short enough, enable it for the optimized MCU path.
+    double mcuFreq = static_cast<double>(m_mcu.getConstantInt("CLOCK_FREQ", 300000000));
+    constexpr double DEFAULT_PULSE_DURATION = 0.000002; // 2µs
+    constexpr double MIN_BOTH_EDGE_DURATION = 0.000000500; // 500ns
+
     if (m_stepPulseTicks <= 0) {
-        m_stepPulseTicks = m_mcu.getConstantInt("STEPPER_BOTH_EDGE", 0) ? 0 : 2;
+        m_stepPulseTicks = (std::max)(1, static_cast<int>(mcuFreq * DEFAULT_PULSE_DURATION + 0.5));
     }
 
-    // Enable both-edge stepping if MCU supports it (STEPPER_STEP_BOTH_EDGE=1).
-    // This uses the optimized stepper_event_edge() path in the MCU firmware,
-    // which halves the number of timer events and avoids the
-    // "Stepper too far in past" safety check in stepper_event_full().
-    // Klipper Python does the same in MCU_stepper._build_config().
+    // Check both-edge support. MCU firmware reports either STEPPER_STEP_BOTH_EDGE
+    // (new) or STEPPER_BOTH_EDGE (old). Python checks both.
+    int ssbe = m_mcu.getConstantInt("STEPPER_STEP_BOTH_EDGE", 0);
+    int sbe = m_mcu.getConstantInt("STEPPER_BOTH_EDGE", 0);
+
     int invertStep = 0;
-    bool hasBothEdge = m_mcu.getConstantInt("STEPPER_STEP_BOTH_EDGE", 0) != 0;
-    if (hasBothEdge && m_stepPulseTicks == 0) {
-        invertStep = -1;  // SF_SINGLE_SCHED → enables optimized edge path
+    bool wantBothEdge = (ssbe || sbe) && (DEFAULT_PULSE_DURATION <= MIN_BOTH_EDGE_DURATION);
+    if (wantBothEdge) {
+        invertStep = -1; // SF_SINGLE_SCHED → enables edge-optimized path
+        if (sbe) {
+            m_stepPulseTicks = 0; // old MCUs: zero pulse ticks for both-edge
+        }
     }
 
     std::ostringstream cfg;

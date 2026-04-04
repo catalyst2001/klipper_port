@@ -2473,6 +2473,8 @@ void KlipperFrame::PrintThread() {
             // --- Flow control with hysteresis ---
             // Wait until buffer drains to BUFFER_TIME_LOW before sending more.
             // This prevents both "move queue overflow" and "stepper too far in past".
+            // Also drains any deferred TrapMoves (steps scheduled too far ahead
+            // are held in the trapq until they're within safe MCU timer range).
             for (;;) {
                 if (m_printStop) break;
 
@@ -2482,6 +2484,9 @@ void KlipperFrame::PrintThread() {
                     if (!m_mcu.isConnected() || m_mcu.isShutdown()) break;
                     ahead = m_toolhead->getNextPrintTime()
                           - m_mcu.getClockSync().estimatedPrintTime();
+
+                    // Drain deferred steps that are now within safe timer range
+                    m_toolhead->generateSteps();
                 }
 
                 if (ahead < BUFFER_TIME_HIGH) break;
@@ -2496,12 +2501,21 @@ void KlipperFrame::PrintThread() {
         }
     }
 
-    // Final flush
+    // Final flush: drain all remaining deferred steps
     {
-        std::lock_guard<std::mutex> lock(m_mcuMutex);
+        std::unique_lock<std::mutex> lock(m_mcuMutex);
         if (m_mcu.isConnected() && !m_mcu.isShutdown()) {
             m_toolhead->flush();
-            m_toolhead->generateSteps();
+            // Drain deferred TrapMoves that may still be in the trapq
+            while (!m_toolhead->getTrapQ().empty()) {
+                m_toolhead->generateSteps();
+                if (m_toolhead->getTrapQ().empty()) break;
+                // Still have deferred moves — wait briefly for MCU time to advance
+                lock.unlock();
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                lock.lock();
+                if (!m_mcu.isConnected() || m_mcu.isShutdown()) break;
+            }
         }
         m_toolhead->resetSyncState(); // back to idle
     }
