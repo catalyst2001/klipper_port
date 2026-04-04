@@ -298,12 +298,19 @@ void ToolHead::lookaheadFlush(bool lazy) {
         return;
     }
 
-    // If this is the first flush from idle, sync print_time to MCU clock
+    // If this is the first flush from idle, clear the sync flag
     if (m_needStartSync) {
         m_needStartSync = false;
         m_needCheckPause = -1.0;
-        syncPrintTime();
     }
+
+    // Ensure print_time hasn't drifted behind real MCU time.
+    // Without serial clock-gating (unlike Python Klipper), step commands
+    // are sent synchronously — processing + serial time consume the buffer.
+    // With arc-heavy files, cumulative drift can push print_time into the past.
+    // syncPrintTime() bumps print_time to est + BUFFER_TIME_START if needed;
+    // it's a no-op when print_time is already sufficiently ahead.
+    syncPrintTime();
 
     // --- FORWARD PASS ---
     // Propagate cruise_v2 forward for moves that couldn't accelerate
