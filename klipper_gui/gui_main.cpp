@@ -1347,9 +1347,21 @@ void KlipperFrame::OnIdentify(wxCommandEvent&) {
         StartPolling();
         StartClockSync();
 
-        // Register shutdown callback
+        // Register shutdown callback — auto-disconnect on MCU shutdown/restart
         m_mcu.setShutdownCallback([this](const std::string& reason) {
             LogFromThread(wxString::Format("!!! MCU SHUTDOWN: %s !!!", reason), *wxRED);
+            // Stop any active print
+            if (m_printing) {
+                m_printStop = true;
+            }
+            // Schedule auto-disconnect on UI thread
+            CallAfter([this]() {
+                if (m_connected) {
+                    LogFromThread("Auto-disconnecting due to MCU shutdown...", *wxRED);
+                    wxCommandEvent evt;
+                    OnConnect(evt); // triggers disconnect branch
+                }
+            });
         });
     }
     else {
@@ -1531,10 +1543,32 @@ void KlipperFrame::StopPolling() {
 }
 
 void KlipperFrame::PollThread() {
+    int consecutiveErrors = 0;
     while (m_pollRunning && m_connected) {
         {
             std::lock_guard<std::mutex> lock(m_mcuMutex);
+
+            // Check serial device health (detects USB disconnect)
+            if (!m_mcu.isConnected()) {
+                LogFromThread("PollThread: MCU disconnected (port closed)", *wxRED);
+                break;
+            }
+
             auto responses = m_mcu.processIncoming(5);
+
+            // processIncoming returns empty on read error or timeout.
+            // Track consecutive empty reads to detect device loss.
+            if (responses.empty()) {
+                // Check if the serial port is still alive
+                if (!m_mcu.isConnected()) {
+                    LogFromThread("PollThread: serial device lost", *wxRED);
+                    break;
+                }
+                // Normal timeout — not an error
+            } else {
+                consecutiveErrors = 0;
+            }
+
             for (auto& resp : responses) {
                 // Skip high-frequency sensor responses (already shown in ADC/TC lists)
                 if (resp.name == "analog_in_state" || resp.name == "thermocouple_state")
@@ -1552,6 +1586,19 @@ void KlipperFrame::PollThread() {
             }
         } // mutex released here
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // If we broke out due to device loss, trigger auto-disconnect on UI thread
+    if (m_connected && !m_pollRunning) {
+        // Normal stop — do nothing
+    } else if (m_connected) {
+        LogFromThread("Auto-disconnecting due to device loss...", *wxRED);
+        CallAfter([this]() {
+            if (m_connected) {
+                wxCommandEvent evt;
+                OnConnect(evt); // triggers disconnect branch
+            }
+        });
     }
 }
 
@@ -2347,6 +2394,7 @@ void KlipperFrame::PrintThread() {
     // Set initial print_time well ahead of MCU time ONCE
     {
         std::lock_guard<std::mutex> lock(m_mcuMutex);
+        m_toolhead->resetSyncState(); // start from idle — first lookaheadFlush will call syncPrintTime
         double initialTime = m_mcu.getClockSync().estimatedPrintTime() + BUFFER_TIME_START;
         m_toolhead->setNextPrintTime(initialTime);
     }
@@ -2455,6 +2503,7 @@ void KlipperFrame::PrintThread() {
             m_toolhead->flush();
             m_toolhead->generateSteps();
         }
+        m_toolhead->resetSyncState(); // back to idle
     }
 
     bool stopped = m_printStop.load();

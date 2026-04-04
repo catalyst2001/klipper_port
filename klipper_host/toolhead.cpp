@@ -211,10 +211,10 @@ void ToolHead::moveAbsolute(const Vec3& pos, double speed) {
         lookaheadFlush(true);
     }
 
-    // Backpressure: if we've queued enough, check if we need to wait for MCU
-    if (m_nextPrintTime > m_needCheckPause) {
-        checkPause();
-    }
+    // Note: backpressure (waiting when host is ahead of MCU) is handled
+    // externally by PrintThread's flow control loop, not here.
+    // Doing it here would sleep while holding m_mcuMutex, blocking
+    // PollThread and ClockSyncThread.
 }
 
 void ToolHead::moveRelative(const Vec3& delta, double speed) {
@@ -226,9 +226,11 @@ void ToolHead::flush() {
     if (!m_queue.empty()) {
         lookaheadFlush(false);
     }
-    // Transition to idle — next move will re-sync print_time
-    m_needStartSync = true;
-    m_needCheckPause = -1.0;
+    // Note: we do NOT reset m_needStartSync here. PrintThread calls flush()
+    // every FLUSH_BATCH lines — that's not a true idle transition. Resetting
+    // sync every batch would cause repeated re-anchoring of print_time,
+    // creating discontinuities. Only resetSyncState() should be called
+    // at actual print start/end from outside.
 }
 
 void ToolHead::lookaheadFlush(bool lazy) {
@@ -334,7 +336,11 @@ void ToolHead::lookaheadFlush(bool lazy) {
         m_trapq.append(trapMoves);
     }
 
-    // Generate steps immediately (converts TrapMoves to queue_step commands)
+    // Generate steps immediately so MCU receives commands incrementally
+    // during arc processing (each G2/G3 produces hundreds of moves).
+    // Without this, steps would only be sent at FLUSH_BATCH boundaries,
+    // and the earliest steps would be in the MCU's past by then.
+    // getAndClear() ensures no double-generation if called again externally.
     generateSteps();
 
     // Remove processed moves from the queue, keep the rest

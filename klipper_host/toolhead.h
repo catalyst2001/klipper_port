@@ -57,6 +57,9 @@ public:
     // Generate and send queue_step commands for all steppers from flushed TrapMoves
     bool generateSteps();
 
+    // Reset sync state — call at actual print start/end, not at every flush
+    void resetSyncState() { m_needStartSync = true; m_needCheckPause = -1.0; }
+
     // Input shaper access
     InputShaper& getInputShaper() { return m_inputShaper; }
     const InputShaper& getInputShaper() const { return m_inputShaper; }

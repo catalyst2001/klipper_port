@@ -24,7 +24,12 @@ public:
 
     std::string getPortName() const { return m_portName; }
 
+    // Check if the serial device is still present (USB not disconnected)
+    bool checkHealth() const;
+
 private:
     HANDLE m_handle = INVALID_HANDLE_VALUE;
+    HANDLE m_readEvent = nullptr;   // event for overlapped read
+    HANDLE m_writeEvent = nullptr;  // event for overlapped write
     std::string m_portName;
 };
