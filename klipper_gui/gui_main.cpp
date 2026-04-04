@@ -2461,20 +2461,23 @@ void KlipperFrame::PrintThread() {
 
         linesSinceFlush++;
 
-        // --- Flush and generate steps periodically (separate lock) ---
+        // --- Flush and generate steps periodically ---
         if (linesSinceFlush >= FLUSH_BATCH || i == m_printLines.size() - 1) {
             linesSinceFlush = 0;
             {
                 std::lock_guard<std::mutex> lock(m_mcuMutex);
                 m_toolhead->flush();
-                m_toolhead->generateSteps();
             }
+
+            // generateSteps() now self-paces via internal clock-gating:
+            // it waits (sleeping without mutex) until each step's target clock
+            // is within safe MCU 32-bit timer range before sending. This mirrors
+            // Python Klipper's serialqueue MIN_REQTIME_DELTA gating.
+            // Called WITHOUT mcuMutex so clock sync thread can update during waits.
+            m_toolhead->generateSteps();
 
             // --- Flow control with hysteresis ---
             // Wait until buffer drains to BUFFER_TIME_LOW before sending more.
-            // This prevents both "move queue overflow" and "stepper too far in past".
-            // Also drains any deferred TrapMoves (steps scheduled too far ahead
-            // are held in the trapq until they're within safe MCU timer range).
             for (;;) {
                 if (m_printStop) break;
 
@@ -2484,16 +2487,11 @@ void KlipperFrame::PrintThread() {
                     if (!m_mcu.isConnected() || m_mcu.isShutdown()) break;
                     ahead = m_toolhead->getNextPrintTime()
                           - m_mcu.getClockSync().estimatedPrintTime();
-
-                    // Drain deferred steps that are now within safe timer range
-                    m_toolhead->generateSteps();
                 }
 
                 if (ahead < BUFFER_TIME_HIGH) break;
 
                 // Buffer is full — wait for MCU to catch up.
-                // Sleep WITHOUT holding the mutex so UI/clock sync/polling work.
-                // Sleep until buffer should drain to BUFFER_TIME_LOW.
                 double waitSec = ahead - BUFFER_TIME_LOW;
                 int waitMs = std::max(10, std::min(500, static_cast<int>(waitSec * 1000)));
                 std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
@@ -2501,22 +2499,17 @@ void KlipperFrame::PrintThread() {
         }
     }
 
-    // Final flush: drain all remaining deferred steps
+    // Final flush
     {
-        std::unique_lock<std::mutex> lock(m_mcuMutex);
+        std::lock_guard<std::mutex> lock(m_mcuMutex);
         if (m_mcu.isConnected() && !m_mcu.isShutdown()) {
             m_toolhead->flush();
-            // Drain deferred TrapMoves that may still be in the trapq
-            while (!m_toolhead->getTrapQ().empty()) {
-                m_toolhead->generateSteps();
-                if (m_toolhead->getTrapQ().empty()) break;
-                // Still have deferred moves — wait briefly for MCU time to advance
-                lock.unlock();
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                lock.lock();
-                if (!m_mcu.isConnected() || m_mcu.isShutdown()) break;
-            }
         }
+    }
+    // generateSteps handles its own pacing (clock-gating waits internally)
+    m_toolhead->generateSteps();
+    {
+        std::lock_guard<std::mutex> lock(m_mcuMutex);
         m_toolhead->resetSyncState(); // back to idle
     }
 

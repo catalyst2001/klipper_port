@@ -453,23 +453,11 @@ void ToolHead::generateAxisSteps(int axis, const TrapMove& tm, bool needsReset) 
     }
 
     // === Decide: reset_step_clock or chain from previous move ===
-    // Klipper architecture: reset_step_clock is called once at print start.
-    // Between moves, queue_step commands chain seamlessly — the MCU's internal
-    // step clock auto-advances after each step batch completes.
+    // reset_step_clock only on first use — MCU shuts down if called
+    // while stepper has active queued steps (s->count > 0).
     bool doReset = false;
-    if (needsReset) {
-        if (!stepper->isClockInitialized()) {
-            // First use ever: must reset
-            doReset = true;
-        } else {
-            // Check if we can chain from lastStepClock
-            int64_t gap = stepClocks[0] - stepper->getLastStepClock();
-            if (gap <= 0 || gap > 4'000'000'000LL) {
-                // Gap negative (scheduling error) or > ~13s: need reset
-                doReset = true;
-            }
-            // else: chain from lastStepClock (no reset needed)
-        }
+    if (needsReset && !stepper->isClockInitialized()) {
+        doReset = true;
     }
 
     if (doReset) {
@@ -701,9 +689,11 @@ void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& mo
 
     if (stepEvents.empty()) return;
 
-    // Reset step clock at start
+    // Reset step clock only on first use
     int64_t tmStartClock = m_mcu.getClockSync().printTimeToClock(moveStart);
-    stepper->resetStepClock(tmStartClock);
+    if (!stepper->isClockInitialized()) {
+        stepper->resetStepClock(tmStartClock);
+    }
 
     // Group consecutive same-direction steps and compress each batch
     uint32_t maxError = static_cast<uint32_t>(0.000025 * mcuFreq);
@@ -733,6 +723,9 @@ void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& mo
         int64_t lastStepClock = stepper->getLastStepClock();
         int pos = 0;
         while (pos < numSteps) {
+            // Clock-gate: wait until step is within safe MCU timer range
+            if (!waitForClockGate(batchClocks[pos], mcuFreq)) return;
+
             int64_t clockDiff = batchClocks[pos] - lastStepClock;
             if (clockDiff <= 0) {
                 pos++;
@@ -764,32 +757,6 @@ void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& mo
 bool ToolHead::generateSteps() {
     auto trapMoves = m_trapq.getAndClear();
     if (trapMoves.empty()) return true;
-
-    // The MCU timer uses 32-bit unsigned clocks with signed overflow
-    // detection (timer_is_before). At 300MHz, 2^31 ticks = ~7.16 seconds.
-    // If we schedule steps beyond this, the timer wraps and fires immediately,
-    // causing "Stepper too far in past" shutdown.
-    // Limit step generation to moves within MAX_CLOCK_AHEAD of current time.
-    // Deferred moves stay in the trapq for the next generateSteps() call.
-    constexpr double MAX_CLOCK_AHEAD = 5.0; // seconds (safe margin under 7.16s)
-    double est = m_mcu.getClockSync().estimatedPrintTime();
-    double maxPrintTime = est + MAX_CLOCK_AHEAD;
-
-    // Split: generate steps for moves within safe window, defer the rest
-    std::vector<TrapMove> nowMoves;
-    std::vector<TrapMove> laterMoves;
-    for (auto& tm : trapMoves) {
-        if (tm.print_time <= maxPrintTime) {
-            nowMoves.push_back(std::move(tm));
-        } else {
-            laterMoves.push_back(std::move(tm));
-        }
-    }
-    if (!laterMoves.empty()) {
-        m_trapq.append(laterMoves); // put back for next call
-    }
-    if (nowMoves.empty()) return true;
-    trapMoves = std::move(nowMoves);
 
     // Check which axes use input shaping
     bool shaped[3] = {false, false, false};
@@ -869,15 +836,11 @@ bool ToolHead::generateSteps() {
 
         if (allSteps.empty()) continue;
 
-        // Reset step clock at start of first step batch
-        int64_t firstClock = allSteps.front().clock;
+        // Reset step clock only on first use — never during active printing.
+        // MCU shuts down with "Can't reset time when stepper active" if
+        // reset_step_clock is sent while steps are queued (s->count > 0).
         if (!stepper->isClockInitialized()) {
-            stepper->resetStepClock(firstClock);
-        } else {
-            int64_t gap = firstClock - stepper->getLastStepClock();
-            if (gap <= 0 || gap > 4'000'000'000LL) {
-                stepper->resetStepClock(firstClock);
-            }
+            stepper->resetStepClock(allSteps.front().clock);
         }
 
         // Compress and send: group by direction, then compress each batch.
@@ -906,6 +869,11 @@ bool ToolHead::generateSteps() {
             int64_t lastStepClock = stepper->getLastStepClock();
             int pos = 0;
             while (pos < numSteps) {
+                // Clock-gate: wait until this step is within safe MCU 32-bit timer range.
+                // At 300MHz, 2^31 ticks = 7.16s. We gate at 4.5s for safety margin.
+                // This mirrors Python Klipper's serialqueue MIN_REQTIME_DELTA gating.
+                if (!waitForClockGate(batchClocks[pos], mcuFreq)) return false;
+
                 int64_t clockDiff = batchClocks[pos] - lastStepClock;
                 if (clockDiff <= 0) {
                     pos++;
@@ -934,4 +902,22 @@ bool ToolHead::generateSteps() {
     }
 
     return true;
+}
+
+// Clock-gate: wait until targetClock is within safe MCU 32-bit timer range.
+// The MCU uses timer_is_before() with signed 32-bit overflow detection.
+// At 300MHz, 2^31 ticks = 7.16s. We gate at 4.5s for safety margin.
+// This mirrors Python Klipper's serialqueue MIN_REQTIME_DELTA gating —
+// commands are held until shortly before their execution time.
+bool ToolHead::waitForClockGate(int64_t targetClock, double mcuFreq) {
+    constexpr double MAX_CLOCK_AHEAD_SEC = 4.5;
+    int64_t maxAheadTicks = static_cast<int64_t>(MAX_CLOCK_AHEAD_SEC * mcuFreq);
+
+    while (m_mcu.isConnected() && !m_mcu.isShutdown()) {
+        double est = m_mcu.getClockSync().estimatedPrintTime();
+        int64_t curMcuClock = m_mcu.getClockSync().printTimeToClock(est);
+        if (targetClock - curMcuClock <= maxAheadTicks) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return false; // MCU disconnected or shutdown
 }

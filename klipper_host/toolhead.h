@@ -117,6 +117,10 @@ private:
     // Uses secant/bisection method (Klipper's itersolve approach)
     void generateShapedAxisSteps(int axis, const std::vector<TrapMove>& moves);
 
+    // Clock-gate: wait until targetClock is within safe MCU timer range.
+    // Returns false if MCU disconnected/shutdown (caller should abort).
+    bool waitForClockGate(int64_t targetClock, double mcuFreq);
+
     // Helper: get axis position at any absolute print time across TrapMoves
     static double getAxisPositionAtTime(int axis, const std::vector<TrapMove>& moves,
                                         double printTime);
