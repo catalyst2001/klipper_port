@@ -2384,8 +2384,8 @@ void KlipperFrame::PrintThread() {
     // Klipper-style flow control with hysteresis:
     // Fill buffer up to BUFFER_TIME_HIGH, then wait until it drains to BUFFER_TIME_LOW.
     // This gives the MCU a healthy scheduling window and prevents "stepper too far in past".
-    constexpr double BUFFER_TIME_START = 1.0;  // initial print_time ahead of MCU
-    constexpr double BUFFER_TIME_HIGH  = 2.0;  // pause scheduling when this far ahead
+    constexpr double BUFFER_TIME_START = 4.0;  // initial print_time ahead of MCU
+    constexpr double BUFFER_TIME_HIGH  = 4.0;  // pause scheduling when this far ahead
     constexpr double BUFFER_TIME_LOW   = 1.0;  // resume scheduling when buffer drains to this
     constexpr size_t FLUSH_BATCH = 10;
     size_t linesSinceFlush = 0;
