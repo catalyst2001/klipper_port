@@ -393,11 +393,20 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath) {
         {
             std::lock_guard<std::mutex> lock(g_mcuMutex);
             if (!ctx.mcu.isConnected()) {
-                LogError("MCU disconnected at line " + std::to_string(i + 1));
+                LogError("MCU disconnected at line " + std::to_string(i + 1)
+                         + " content=" + std::to_string(contentLines));
                 break;
             }
             if (ctx.mcu.isShutdown()) {
-                LogError("MCU shutdown at line " + std::to_string(i + 1));
+                std::string shutMsg = ctx.mcu.getShutdownMsg();
+                double ahead = ctx.toolhead->getNextPrintTime()
+                             - ctx.mcu.getClockSync().estimatedPrintTime();
+                std::ostringstream ss;
+                ss << "MCU SHUTDOWN at line " << (i + 1) << "/" << lines.size()
+                   << " content=" << contentLines
+                   << " ahead=" << std::fixed << std::setprecision(3) << ahead << "s"
+                   << " reason=\"" << shutMsg << "\"";
+                LogError(ss.str());
                 break;
             }
         }
@@ -432,19 +441,24 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath) {
         contentLines++;
         linesSinceFlush++;
 
-        // Log position after first few content lines
-        if (contentLines <= 5 || contentLines == 10) {
+        // Periodic line logging: first 5, then every 100 content lines
+        if (contentLines <= 5 || contentLines % 100 == 0) {
             std::lock_guard<std::mutex> lock(g_mcuMutex);
             auto p = ctx.toolhead->getPosition();
             auto elapsed = std::chrono::steady_clock::now() - startTime;
             double sec = std::chrono::duration<double>(elapsed).count();
+            double ahead = ctx.toolhead->getNextPrintTime()
+                         - ctx.mcu.getClockSync().estimatedPrintTime();
             std::ostringstream ss;
-            ss << "After line " << (i + 1) << " (content=" << contentLines
-               << "): pos=(" << std::fixed << std::setprecision(3)
+            ss << "L" << (i + 1) << "/" << lines.size()
+               << " #" << contentLines
+               << " pos=(" << std::fixed << std::setprecision(2)
                << p.x << "," << p.y << "," << p.z << ")"
-               << " printTime=" << std::setprecision(3) << ctx.toolhead->getNextPrintTime()
-               << " elapsed=" << std::setprecision(3) << sec << "s"
+               << " ahead=" << std::setprecision(3) << ahead << "s"
+               << " t=" << std::setprecision(1) << sec << "s"
                << " [" << cmd << "]";
+            if (ctx.mcu.isShutdown())
+                ss << " !! MCU SHUTDOWN !!";
             Log(ss.str());
         }
 
