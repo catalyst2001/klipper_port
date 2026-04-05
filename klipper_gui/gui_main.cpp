@@ -2399,6 +2399,22 @@ void KlipperFrame::PrintThread() {
         m_toolhead->setNextPrintTime(initialTime);
     }
 
+    // Step generation thread: decouples gcode processing from serial I/O.
+    // The main print thread builds moves (trapq); this thread sends them to MCU.
+    // generateSteps self-paces via clock-gating (waits until MCU clock is
+    // close enough before sending each step batch).
+    std::atomic<bool> stepGenDone{false};
+    std::thread stepGenThread([this, &stepGenDone]() {
+        while (m_mcu.isConnected() && !m_mcu.isShutdown()) {
+            bool ok = m_toolhead->generateSteps();
+            if (!ok) break;
+            if (stepGenDone.load(std::memory_order_acquire)) {
+                m_toolhead->generateSteps(); // Final drain
+                break;
+            }
+        }
+    });
+
     for (size_t i = 0; i < m_printLines.size(); ++i) {
         // --- Check stop/pause (no mutex needed, these are atomics) ---
         if (m_printStop) break;
@@ -2461,7 +2477,7 @@ void KlipperFrame::PrintThread() {
 
         linesSinceFlush++;
 
-        // --- Flush and generate steps periodically ---
+        // --- Flush periodically to push moves into TrapQ for the step gen thread ---
         if (linesSinceFlush >= FLUSH_BATCH || i == m_printLines.size() - 1) {
             linesSinceFlush = 0;
             {
@@ -2469,15 +2485,10 @@ void KlipperFrame::PrintThread() {
                 m_toolhead->flush();
             }
 
-            // generateSteps() now self-paces via internal clock-gating:
-            // it waits (sleeping without mutex) until each step's target clock
-            // is within safe MCU 32-bit timer range before sending. This mirrors
-            // Python Klipper's serialqueue MIN_REQTIME_DELTA gating.
-            // Called WITHOUT mcuMutex so clock sync thread can update during waits.
-            m_toolhead->generateSteps();
-
             // --- Flow control with hysteresis ---
-            // Wait until buffer drains to BUFFER_TIME_LOW before sending more.
+            // Wait until buffer drains below BUFFER_TIME_HIGH before sending more.
+            // The step gen thread drains the trapq in parallel, so the MCU clock
+            // advances while we wait here.
             for (;;) {
                 if (m_printStop) break;
 
@@ -2499,15 +2510,15 @@ void KlipperFrame::PrintThread() {
         }
     }
 
-    // Final flush
+    // Final flush + stop step generation thread
     {
         std::lock_guard<std::mutex> lock(m_mcuMutex);
         if (m_mcu.isConnected() && !m_mcu.isShutdown()) {
             m_toolhead->flush();
         }
     }
-    // generateSteps handles its own pacing (clock-gating waits internally)
-    m_toolhead->generateSteps();
+    stepGenDone.store(true, std::memory_order_release);
+    stepGenThread.join();
     {
         std::lock_guard<std::mutex> lock(m_mcuMutex);
         m_toolhead->resetSyncState(); // back to idle

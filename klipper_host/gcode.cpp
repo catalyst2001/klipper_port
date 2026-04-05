@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cmath>
 #include <regex>
+#include <thread>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -294,9 +295,13 @@ bool GCodeParser::cmdG28(const std::map<char, double>& params) {
     bool homeY = params.count('Y') > 0 || params.empty();
     bool homeZ = params.count('Z') > 0 || params.empty();
 
-    // Flush pending moves first
+    // Flush pending moves and pause step gen thread during homing
+    // (homing sends stepper commands directly, which conflicts with
+    // concurrent step generation)
     m_toolhead.flush();
-    m_toolhead.generateSteps();
+    m_toolhead.pauseStepGen();  // waits for in-flight generateSteps() to finish
+    // Wait for MCU to finish executing any steps already sent
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     int axes[] = {0, 1, 2};
     bool homeFlags[] = {homeX, homeY, homeZ};
@@ -308,10 +313,21 @@ bool GCodeParser::cmdG28(const std::map<char, double>& params) {
         std::cout << "[GCode] Homing " << axisNames[i] << " axis..." << std::endl;
         if (m_rails[i]->homeAxis(m_mcu)) {
             m_homed[i] = true;
+            // Send trsync_trigger to cleanly stop the trsync instance
+            // (matches Python Klipper's trsync.stop() behavior)
+            int trsyncOid = m_rails[i]->getEndstop().getTrsyncOid();
+            std::map<std::string, int64_t> trParams = {
+                {"oid", trsyncOid},
+                {"reason", 2}  // REASON_HOST_REQUEST
+            };
+            m_mcu.sendCommand("trsync_trigger", trParams);
+            // Drain any remaining trsync_state reports
+            m_mcu.processIncoming(50);
             std::cout << "[GCode] " << axisNames[i] << " homed OK" << std::endl;
         } else {
             m_lastMsg = std::string("Failed to home ") + axisNames[i] + " axis";
             std::cout << "[GCode] " << m_lastMsg << std::endl;
+            m_toolhead.resumeStepGen();
             return false;
         }
     }
@@ -322,6 +338,14 @@ bool GCodeParser::cmdG28(const std::map<char, double>& params) {
     if (homeY && m_rails[1]) pos.y = m_rails[1]->getPositionEndstop();
     if (homeZ && m_rails[2]) pos.z = m_rails[2]->getPositionEndstop();
     m_toolhead.setPosition(pos);
+
+    // Reset step clock state and resume step gen thread.
+    // Re-base print time with a sufficient buffer — homing consumed real time
+    // but no print moves, so the old printTime is now too close to the MCU clock.
+    m_toolhead.resetSyncState();
+    double newPrintTime = m_mcu.getClockSync().estimatedPrintTime() + 4.0;
+    m_toolhead.setNextPrintTime(newPrintTime);
+    m_toolhead.resumeStepGen();
 
     m_lastMsg = "ok";
     return true;

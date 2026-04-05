@@ -9,6 +9,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <atomic>
 
 class KlipperMCU;
 
@@ -58,8 +59,18 @@ public:
     // Generate and send queue_step commands for all steppers from flushed TrapMoves
     bool generateSteps();
 
+    // Pause/resume step generation (for homing coordination)
+    void pauseStepGen();
+    void resumeStepGen();
+
     // Reset sync state — call at actual print start/end, not at every flush
-    void resetSyncState() { m_needStartSync = true; m_needCheckPause = -1.0; m_stepClockSnapValid = false; }
+    void resetSyncState() {
+        m_needStartSync = true;
+        m_needCheckPause = -1.0;
+        m_stepClockSnapValid = false;
+        for (int i = 0; i < 3; i++)
+            if (m_steppers[i]) m_steppers[i]->resetClockInitialized();
+    }
 
     // Input shaper access
     InputShaper& getInputShaper() { return m_inputShaper; }
@@ -104,6 +115,10 @@ private:
     // to avoid inter-call drift from changing frequency estimates.
     ClockSync::ClockSnapshot m_stepClockSnap{};
     bool m_stepClockSnapValid = false;
+
+    // Step gen pause flag (for homing)
+    std::atomic<bool> m_stepGenPaused{false};
+    std::atomic<bool> m_stepGenRunning{false};
 
     // Lookahead: reverse + forward pass, then flush
     // lazy=true: only flush moves up to confirmed velocity peak (partial flush)

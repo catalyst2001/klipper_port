@@ -195,6 +195,7 @@ bool KlipperMCU::identify() {
 }
 
 std::vector<KlipperMCU::ParsedResponse> KlipperMCU::processIncoming(uint32_t timeoutMs) {
+    std::lock_guard<std::mutex> recvLock(m_recvMutex);
     std::vector<ParsedResponse> results;
 
     uint8_t tmpBuf[256];

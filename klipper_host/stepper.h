@@ -50,6 +50,7 @@ public:
     int64_t getLastStepClock() const { return m_lastStepClock; }
     void setLastStepClock(int64_t clock) { m_lastStepClock = clock; m_clockInitialized = true; }
     bool isClockInitialized() const { return m_clockInitialized; }
+    void resetClockInitialized() { m_clockInitialized = false; }
 
 private:
     KlipperMCU& m_mcu;

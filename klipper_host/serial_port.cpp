@@ -133,9 +133,16 @@ int SerialPort::read(uint8_t* buffer, size_t maxLength, uint32_t timeoutMs) {
     // The driver handles normal read completion; overlapped I/O is only
     // a safety net so we can CancelIoEx if USB device disappears.
     COMMTIMEOUTS ct = {};
-    ct.ReadIntervalTimeout = 10;
-    ct.ReadTotalTimeoutMultiplier = 0;
-    ct.ReadTotalTimeoutConstant = timeoutMs;
+    if (timeoutMs == 0) {
+        // Truly non-blocking: return immediately with whatever is buffered
+        ct.ReadIntervalTimeout = MAXDWORD;
+        ct.ReadTotalTimeoutMultiplier = 0;
+        ct.ReadTotalTimeoutConstant = 0;
+    } else {
+        ct.ReadIntervalTimeout = 10;
+        ct.ReadTotalTimeoutMultiplier = 0;
+        ct.ReadTotalTimeoutConstant = timeoutMs;
+    }
     SetCommTimeouts(m_handle, &ct);
 
     OVERLAPPED ov = {};
@@ -149,7 +156,7 @@ int SerialPort::read(uint8_t* buffer, size_t maxLength, uint32_t timeoutMs) {
         }
         // Normally COMMTIMEOUTS completes the operation within timeoutMs.
         // Safety margin catches USB-CDC disconnect where driver ignores timeouts.
-        DWORD safetyMs = timeoutMs + 500;
+        DWORD safetyMs = (timeoutMs == 0) ? 10 : timeoutMs + 500;
         DWORD waitResult = WaitForSingleObject(m_readEvent, safetyMs);
         if (waitResult == WAIT_OBJECT_0) {
             if (!GetOverlappedResult(m_handle, &ov, &bytesRead, FALSE)) {

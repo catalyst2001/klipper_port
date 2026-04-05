@@ -172,8 +172,8 @@ bool MCU_endstop::buildConfig() {
 
     // config_trsync for synchronized homing
     std::ostringstream trCfg;
-    trCfg << "trsync_start oid=" << m_trsyncOid
-          << " report_clock=0 report_ticks=0 expire_reason=0";
+    trCfg << "config_trsync oid=" << m_trsyncOid;
+    m_mcu.addConfigCmd(trCfg.str());
 
     return true;
 }
@@ -185,31 +185,41 @@ bool MCU_endstop::home(int64_t homeClock, double sampleTime, int sampleCount,
     int64_t sampleTicks = m_mcu.secondsToClock(sampleTime);
     int64_t restTicks = m_mcu.secondsToClock(restTime);
 
-    // Set up trsync: configure synchronized trigger
-    // trsync_start
+    // 1. trsync_start: begin synchronized trigger monitoring
+    double expireTimeout = 5.0;
     {
-        int64_t reportClock = homeClock;
-        int64_t reportTicks = m_mcu.secondsToClock(0.1);
+        int64_t expireTicks = m_mcu.secondsToClock(expireTimeout);
+        int64_t reportTicks = m_mcu.secondsToClock(expireTimeout * 0.3);
+        int64_t reportClock = homeClock + reportTicks;
         std::map<std::string, int64_t> params = {
             {"oid", m_trsyncOid},
             {"report_clock", static_cast<int64_t>(static_cast<uint32_t>(reportClock))},
             {"report_ticks", reportTicks},
-            {"expire_reason", 0}
+            {"expire_reason", 4}  // REASON_COMMS_TIMEOUT
         };
         if (!m_mcu.sendCommand("trsync_start", params)) return false;
     }
 
-    // Set steppers to use trsync
+    // 2. stepper_stop_on_trigger: register each stepper to stop on trsync trigger
     for (auto* stepper : steppers) {
         std::map<std::string, int64_t> params = {
+            {"oid", stepper->getOid()},
+            {"trsync_oid", m_trsyncOid}
+        };
+        if (!m_mcu.sendCommand("stepper_stop_on_trigger", params)) return false;
+    }
+
+    // 3. trsync_set_timeout: set expiration deadline
+    {
+        int64_t expireClock = homeClock + m_mcu.secondsToClock(expireTimeout);
+        std::map<std::string, int64_t> params = {
             {"oid", m_trsyncOid},
-            {"stepper_oid", stepper->getOid()},
-            {"set", 1}
+            {"clock", static_cast<int64_t>(static_cast<uint32_t>(expireClock))}
         };
         if (!m_mcu.sendCommand("trsync_set_timeout", params)) return false;
     }
 
-    // endstop_home
+    // 4. endstop_home: start endstop monitoring
     {
         std::map<std::string, int64_t> params = {
             {"oid", m_oid},
@@ -219,7 +229,7 @@ bool MCU_endstop::home(int64_t homeClock, double sampleTime, int sampleCount,
             {"rest_ticks", restTicks},
             {"pin_value", pinValue ? 1 : 0},
             {"trsync_oid", m_trsyncOid},
-            {"trigger_reason", 1}
+            {"trigger_reason", 1}  // REASON_ENDSTOP_HIT
         };
         if (!m_mcu.sendCommand("endstop_home", params)) return false;
     }
@@ -231,6 +241,10 @@ bool MCU_endstop::home(int64_t homeClock, double sampleTime, int sampleCount,
         auto responses = m_mcu.processIncoming(100);
         for (auto& resp : responses) {
             if (resp.name == "trsync_state") {
+                // Filter by OID — ignore stale reports from other trsync instances
+                auto oidIt = resp.intParams.find("oid");
+                if (oidIt == resp.intParams.end() || oidIt->second != m_trsyncOid)
+                    continue;
                 auto canIt = resp.intParams.find("can_trigger");
                 auto trIt = resp.intParams.find("trigger_reason");
                 if (canIt != resp.intParams.end() && canIt->second == 0) {

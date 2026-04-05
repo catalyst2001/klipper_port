@@ -248,6 +248,10 @@ private:
     // This mutex prevents interleaved WriteFile calls and m_sendSeq races.
     std::mutex m_sendMutex;
 
+    // Serial read / receive buffer mutex — serializes processIncoming()
+    // across threads (pollThread, stepGenThread, clockSyncThread, etc.).
+    std::mutex m_recvMutex;
+
     // Batch accumulator for command payloads
     std::vector<uint8_t> m_batchBuf;
 

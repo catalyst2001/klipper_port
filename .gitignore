@@ -15,3 +15,7 @@
 *.idb
 *.ipch
 *.pch
+
+# Test output files
+test_*.txt
+cdb_*.txt
