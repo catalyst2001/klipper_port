@@ -1,0 +1,11 @@
+[StepGen] Phase1 done: cmds=116 steps[0]=50 steps[1]=46 steps[2]=12
+[StepGen] 12941ms
+[StepGen] Phase1 done: cmds=349 steps[0]=170 steps[1]=175 steps[2]=0
+[StepGen] 4054ms
+[StepGen] Phase1 done: cmds=263 steps[0]=133 steps[1]=125 steps[2]=0
+[StepGen] 1646ms
+[StepGen] Phase1 done: cmds=337 steps[0]=167 steps[1]=164 steps[2]=0
+[StepGen] 867ms
+[StepGen] Phase1 done: cmds=326 steps[0]=161 steps[1]=161 steps[2]=0
+[KlipperMCU] !!! SHUTDOWN: Move queue overflow !!!
+[03:36:25.815] ERROR: Session ended due to MCU shutdown!

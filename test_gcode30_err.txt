@@ -1,0 +1,16 @@
+[StepGen] Phase1 done: cmds=116 steps[0]=50 steps[1]=46 steps[2]=12
+[StepGen] Phase2 start: genRange=[15066.443..15078.841] curPT=15064.493 ahead=[1.950..14.348]
+[StepGen] Phase2 done: totalSteps=108 timeThrottles=6 flowThrottles=1
+[StepGen] 13900ms
+[StepGen] Phase1 done: cmds=349 steps[0]=170 steps[1]=175 steps[2]=0
+[StepGen] Phase2 start: genRange=[15070.624..15082.475] curPT=15078.376 ahead=[-7.753..4.099]
+[StepGen] Phase2 done: totalSteps=345 timeThrottles=3 flowThrottles=4
+[StepGen] 3640ms
+[StepGen] Phase1 done: cmds=263 steps[0]=133 steps[1]=125 steps[2]=0
+[StepGen] Phase2 start: genRange=[15082.476..15084.069] curPT=15082.021 ahead=[0.455..2.047]
+[StepGen] Phase2 done: totalSteps=258 timeThrottles=1 flowThrottles=3
+[StepGen] 1586ms
+[StepGen] Phase1 done: cmds=661 steps[0]=328 steps[1]=325 steps[2]=0
+[StepGen] Phase2 start: genRange=[15084.071..15086.623] curPT=15083.608 ahead=[0.463..3.015]
+[KlipperMCU] !!! SHUTDOWN: Move queue overflow !!!
+[03:48:11.135] ERROR: Session ended due to MCU shutdown!

@@ -27,12 +27,15 @@ public:
 
     // Runtime: send queue_step command
     bool queueStep(int64_t interval, int64_t count, int64_t add);
+    bool queueStepBatched(int64_t interval, int64_t count, int64_t add);
 
     // Runtime: set next step direction (true = forward)
     bool setNextStepDir(bool forward);
+    bool setNextStepDirBatched(bool forward);
 
     // Runtime: reset step clock
     bool resetStepClock(int64_t clock);
+    bool resetStepClockBatched(int64_t clock);
 
     // Getters
     int getOid() const { return m_oid; }

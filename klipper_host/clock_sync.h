@@ -28,6 +28,7 @@ public:
 
     // Convert host monotonic time to MCU clock value
     int64_t getClock(double eventTime) const;
+    int64_t getClock() const;
 
     // Convert MCU clock to host time
     double estimateClockSystime(int64_t reqClock) const;
@@ -43,8 +44,21 @@ public:
     // Extend 32-bit MCU clock to 64-bit (signed extension, for response timestamps)
     int64_t clock32ToClock64(uint32_t clock32) const;
 
-    // Get MCU frequency
+    // Get MCU frequency (nominal, from CLOCK_FREQ)
     double getMcuFreq() const { return m_mcuFreq; }
+
+    // Snapshot for step-clock computation.  Captures the current clock estimate
+    // so that all step clocks within one generateSteps batch are consistent.
+    struct ClockSnapshot {
+        int64_t baseClock;     // estimated MCU clock right now
+        double  basePrintTime; // estimatedPrintTime right now (nominal domain)
+        double  estFreq;       // Kalman-estimated MCU frequency (actual Hz)
+        // Convert a print_time (nominal domain) to an MCU clock in the real domain
+        int64_t printTimeToRealClock(double printTime) const {
+            return baseClock + static_cast<int64_t>((printTime - basePrintTime) * estFreq);
+        }
+    };
+    ClockSnapshot getClockSnapshot() const;
 
     // Is clock sync healthy? (fewer than 5 unanswered queries)
     bool isActive() const { return m_queriesPending.load() < 5; }

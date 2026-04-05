@@ -24,6 +24,8 @@ KlipperMCU::~KlipperMCU() {
 
 bool KlipperMCU::connect(const std::string& port, uint32_t baudRate) {
     disconnect();
+    m_portName = port;
+    m_baudRate = baudRate;
     if (!m_serial.open(port, baudRate)) {
         m_lastError = "Failed to open serial port: " + port;
         return false;
@@ -71,6 +73,7 @@ bool KlipperMCU::isConnected() const {
 }
 
 bool KlipperMCU::sendRawFrame(const std::vector<uint8_t>& payload) {
+    std::lock_guard<std::mutex> lock(m_sendMutex);
     auto frame = build_message_frame(m_sendSeq, payload);
     m_sendSeq = (m_sendSeq + 1) & MESSAGE_SEQ_MASK;
 
@@ -614,7 +617,13 @@ void KlipperMCU::resetConfig() {
 }
 
 int64_t KlipperMCU::secondsToClock(double seconds) const {
-    return static_cast<int64_t>(seconds * m_clockSync.getEstimatedFreq());
+    // Use nominal CLOCK_FREQ for deterministic tick values (matches Python Klipper).
+    // The clock sync estimated frequency varies between runs and would cause
+    // CRC mismatches when the MCU already has a stored config.
+    auto it = m_config.find("CLOCK_FREQ");
+    double freq = (it != m_config.end()) ? static_cast<double>(it->second)
+                                         : m_clockSync.getEstimatedFreq();
+    return static_cast<int64_t>(seconds * freq);
 }
 
 int KlipperMCU::getConstantInt(const std::string& name, int defaultVal) const {
@@ -636,6 +645,33 @@ void KlipperMCU::requestMoveQueueSlot() {
     m_moveQueueSlots++;
 }
 
+// ---- Command Batching ----
+
+std::vector<uint8_t> KlipperMCU::encodeCommandPayload(const std::string& cmdName,
+    const std::map<std::string, int64_t>& intParams,
+    const std::map<std::string, std::vector<uint8_t>>& bufParams) {
+    auto it = m_commands.find(cmdName);
+    if (it == m_commands.end()) return {};
+    return encodeCommand(it->second, intParams, bufParams);
+}
+
+bool KlipperMCU::queuePayload(const std::vector<uint8_t>& payload) {
+    // If adding this payload would exceed max, flush the current batch first
+    if (!m_batchBuf.empty() &&
+        m_batchBuf.size() + payload.size() > MESSAGE_PAYLOAD_MAX) {
+        if (!flushBatch()) return false;
+    }
+    m_batchBuf.insert(m_batchBuf.end(), payload.begin(), payload.end());
+    return true;
+}
+
+bool KlipperMCU::flushBatch() {
+    if (m_batchBuf.empty()) return true;
+    std::vector<uint8_t> buf;
+    buf.swap(m_batchBuf);
+    return sendRawFrame(buf);
+}
+
 bool KlipperMCU::finalizeConfig() {
     if (m_configFinalized) {
         m_lastError = "Config already finalized";
@@ -653,12 +689,41 @@ bool KlipperMCU::finalizeConfig() {
     bool isConfig = configParams["is_config"] != 0;
     uint32_t mcuCrc = static_cast<uint32_t>(configParams["crc"]);
 
-    // Step 1.5: If MCU is in shutdown or has stale state, firmware restart to recover
-    bool needsRestart = false;
+    // Step 1.5: If MCU is in shutdown, clear it (avoid full reset on USB CDC devices).
+    //           If stale state with moves, reset.
     if (configParams["is_shutdown"] != 0) {
-        std::cout << "[KlipperMCU] MCU is in shutdown state, resetting..." << std::endl;
-        needsRestart = true;
-    } else if (!isConfig && configParams.count("move_count") && configParams["move_count"] > 0) {
+        std::cout << "[KlipperMCU] MCU is in shutdown state, clearing..." << std::endl;
+        // Send clear_shutdown and re-query config
+        if (!sendCommand("clear_shutdown")) {
+            m_lastError = "Failed to send clear_shutdown";
+            return false;
+        }
+        m_isShutdown = false;
+        {
+            std::lock_guard<std::mutex> lock(m_shutdownMutex);
+            m_shutdownMsg.clear();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // Re-query config state after clearing shutdown
+        configParams.clear();
+        if (!sendWithResponse("get_config", "config", configParams, bufP)) {
+            m_lastError = "Failed to re-query config after clear_shutdown";
+            return false;
+        }
+        isConfig = configParams["is_config"] != 0;
+        mcuCrc = static_cast<uint32_t>(configParams["crc"]);
+
+        if (configParams["is_shutdown"] != 0) {
+            m_lastError = "MCU still in shutdown after clear_shutdown";
+            return false;
+        }
+        std::cout << "[KlipperMCU] Shutdown cleared, is_config=" << isConfig
+                  << " crc=" << mcuCrc << std::endl;
+    }
+
+    bool needsRestart = false;
+    if (!isConfig && configParams.count("move_count") && configParams["move_count"] > 0) {
         std::cout << "[KlipperMCU] Stale MCU state detected (move_count="
                   << configParams["move_count"] << "), resetting..." << std::endl;
         needsRestart = true;
@@ -673,10 +738,19 @@ bool KlipperMCU::finalizeConfig() {
             m_shutdownMsg.clear();
         }
 
-        // Wait for MCU to reboot
-        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+        // Close serial port (USB CDC drops on MCU reset)
+        m_serial.close();
 
-        // Reopen serial port (DTR toggle + purge, like initial connect)
+        // Wait for MCU to reboot and USB to re-enumerate
+        std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+
+        // Reopen serial port
+        if (!m_serial.open(m_portName, m_baudRate)) {
+            m_lastError = "Failed to reopen serial port after MCU reset: " + m_portName;
+            return false;
+        }
+
+        // DTR toggle + purge
         m_serial.setDTR(false);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         m_serial.setDTR(true);
@@ -818,7 +892,16 @@ bool KlipperMCU::finalizeConfig() {
                 std::lock_guard<std::mutex> lock(m_shutdownMutex);
                 m_shutdownMsg.clear();
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+
+            // Close serial port (USB CDC drops on MCU reset)
+            m_serial.close();
+            std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+
+            // Reopen serial port
+            if (!m_serial.open(m_portName, m_baudRate)) {
+                m_lastError = "Failed to reopen serial port after CRC mismatch restart: " + m_portName;
+                return false;
+            }
 
             m_serial.setDTR(false);
             std::this_thread::sleep_for(std::chrono::milliseconds(100));

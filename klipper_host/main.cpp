@@ -1,355 +1,736 @@
-﻿#include <iostream>
+﻿// ============================================================================
+// Klipper Host C++ Test Tool
+// Console-based test harness for MCU communication, motion testing, and
+// gcode file execution with full timestamped logging.
+//
+// Usage:
+//   klipper_host.exe gcode <file>           - run gcode file
+//   klipper_host.exe move "<gcode>"         - execute single gcode block
+//   klipper_host.exe monitor [seconds]      - monitor MCU stats (default 30s)
+//   klipper_host.exe info                   - connect, identify, show config
+// ============================================================================
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
 #include <string>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
 #include <iomanip>
+#include <algorithm>
+#include <csignal>
+#include <map>
+
 #include "klipper_mcu.h"
+#include "klipper_config.h"
 #include "mcu_objects.h"
 #include "bus_objects.h"
 #include "stepper.h"
 #include "toolhead.h"
 #include "gcode.h"
+#include "tmc5160.h"
+#include "input_shaper.h"
 
-int main() {
-    std::cout << "=== Klipper Host C++ Test ===" << std::endl;
-    std::cout << "Connecting to Duet 3 6HC on COM3..." << std::endl;
+// ---- Global state ----
+static std::mutex g_mcuMutex;
+static std::atomic<bool> g_running{true};
+static std::atomic<bool> g_shutdown{false};
+static std::atomic<int> g_clockSyncFailures{0};
+static std::mutex g_logMutex;
 
+// ---- Timestamped logging ----
+static std::string timestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+    struct tm lt;
+    localtime_s(&lt, &t);
+    std::ostringstream ss;
+    ss << std::setfill('0')
+       << std::setw(2) << lt.tm_hour << ":"
+       << std::setw(2) << lt.tm_min << ":"
+       << std::setw(2) << lt.tm_sec << "."
+       << std::setw(3) << ms.count();
+    return ss.str();
+}
+
+static void Log(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    std::cout << "[" << timestamp() << "] " << msg << std::endl;
+}
+
+static void LogError(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    std::cerr << "[" << timestamp() << "] ERROR: " << msg << std::endl;
+}
+
+// ---- Signal handler for Ctrl-C ----
+static void signalHandler(int) {
+    g_running = false;
+}
+
+// ---- Background: ProcessIncoming + response logging ----
+static void pollThread(KlipperMCU& mcu) {
+    while (g_running) {
+        {
+            std::lock_guard<std::mutex> lock(g_mcuMutex);
+            if (!mcu.isConnected()) {
+                Log("POLL: MCU disconnected (port closed)");
+                g_running = false;
+                break;
+            }
+            auto responses = mcu.processIncoming(5);
+            for (auto& resp : responses) {
+                if (resp.name == "analog_in_state" || resp.name == "thermocouple_state")
+                    continue;
+                std::ostringstream ss;
+                ss << "<< [" << resp.msgId << "] " << resp.name;
+                for (auto& [k, v] : resp.intParams)
+                    ss << " " << k << "=" << v;
+                for (auto& [k, v] : resp.bufParams)
+                    ss << " " << k << "=[" << v.size() << " bytes]";
+                Log(ss.str());
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+// ---- Background: Clock sync polling ----
+static void clockSyncThread(KlipperMCU& mcu) {
+    while (g_running) {
+        {
+            std::lock_guard<std::mutex> lock(g_mcuMutex);
+            if (!mcu.isConnected()) break;
+            if (!mcu.clockSyncPoll()) {
+                int fails = ++g_clockSyncFailures;
+                Log("CLOCKSYNC: poll failed (consecutive=" + std::to_string(fails) + ")");
+                if (fails >= 3) {
+                    Log("CLOCKSYNC: 3 consecutive failures - MCU likely rebooted!");
+                    g_running = false;
+                    break;
+                }
+            } else {
+                g_clockSyncFailures = 0;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(984));
+    }
+}
+
+// ---- Initialization sequence (matches GUI flow) ----
+struct TestContext {
     KlipperMCU mcu;
+    std::unique_ptr<ConfigResult> config;
+    std::unique_ptr<ToolHead> toolhead;
+    std::unique_ptr<GCodeParser> gcode;
+    std::vector<std::unique_ptr<MCU_SPI>> spiObjects;
+    std::vector<std::unique_ptr<TMC5160>> tmcDrivers;
+    std::thread pollTh;
+    std::thread clockSyncTh;
 
-    // Connect
-    if (!mcu.connect("COM3", 250000)) {
-        std::cerr << "ERROR: " << mcu.getLastError() << std::endl;
+    bool init(const std::string& port, const std::string& configPath) {
+        // 1. Connect
+        Log("Connecting to " + port + "...");
+        if (!mcu.connect(port, 250000)) {
+            LogError("Connect failed: " + mcu.getLastError());
+            return false;
+        }
+        Log("Connected!");
+
+        // 2. Identify
+        Log("Running identify handshake...");
+        if (!mcu.identify()) {
+            LogError("Identify failed: " + mcu.getLastError());
+            return false;
+        }
+        Log("Identified! Version: " + mcu.getVersion());
+        Log("Build: " + mcu.getBuildVersions());
+        Log("Commands: " + std::to_string(mcu.getCommands().size()) +
+            ", Responses: " + std::to_string(mcu.getResponses().size()));
+        for (auto& [key, val] : mcu.getConfig()) {
+            Log("  Config: " + key + " = " + std::to_string(val));
+        }
+
+        // 3. Init clock sync
+        Log("Initializing clock synchronization...");
+        if (!mcu.initClockSync()) {
+            LogError("Clock sync init failed: " + mcu.getLastError());
+            return false;
+        }
+        {
+            auto& cs = mcu.getClockSync();
+            auto dbg = cs.getDebugInfo();
+            std::ostringstream ss;
+            ss << "Clock sync initialized: freq=" << std::fixed << std::setprecision(0)
+               << dbg.freq << " Hz, RTT=" << std::setprecision(3)
+               << dbg.minHalfRtt * 2000.0 << " ms";
+            Log(ss.str());
+        }
+
+        // 3.5. Clear shutdown if MCU is in shutdown from a previous session
+        if (mcu.isShutdown()) {
+            Log("MCU is in shutdown state: " + mcu.getShutdownMsg());
+            Log("Clearing shutdown...");
+            if (mcu.clearShutdown()) {
+                Log("Shutdown cleared successfully");
+            } else {
+                Log("clearShutdown failed (will retry during finalize): " + mcu.getLastError());
+            }
+        }
+
+        // 4. Load config (no MCU communication — just queues config commands)
+        Log("Loading config: " + configPath);
+        config = std::make_unique<ConfigResult>(KlipperConfig::load(mcu, configPath));
+        if (!config->ok()) {
+            LogError("Config load failed: " + config->lastError);
+            return false;
+        }
+        for (auto& w : config->warnings)
+            Log("  Warning: " + w);
+        for (auto& si : config->steppers) {
+            std::ostringstream ss;
+            ss << "  [" << si.name << "] stepper OID=" << si.stepper->getOid()
+               << " dist=" << std::setprecision(5) << si.stepper->getStepDist() << "mm";
+            Log(ss.str());
+        }
+        for (auto& ai : config->adcInputs)
+            Log("  [" + ai.name + "] ADC pin=" + ai.pin);
+        for (auto& di : config->digitalOuts)
+            Log("  [" + di.name + "] digital out pin=" + di.pin);
+        for (auto& tc : config->tmcConfigs) {
+            std::ostringstream ss;
+            ss << "  [" << tc.name << "] TMC5160 run=" << tc.runCurrent
+               << "A hold=" << tc.holdCurrent << "A ms=" << tc.microsteps;
+            Log(ss.str());
+        }
+        {
+            std::ostringstream ss;
+            ss << "  Printer: " << config->kinematics
+               << " vel=" << config->maxVelocity
+               << " accel=" << config->maxAccel
+               << " scv=" << config->squareCornerVelocity;
+            Log(ss.str());
+        }
+
+        // 4b. Create TMC5160 SPI objects (must be before finalize to register OIDs)
+        std::map<std::string, MCU_SPI*> tmcBusMap;
+        if (!config->tmcConfigs.empty()) {
+            Log("Creating TMC5160 SPI bus objects...");
+            for (auto& tc : config->tmcConfigs) {
+                if (tmcBusMap.find(tc.spiBus) == tmcBusMap.end()) {
+                    auto spi = std::make_unique<MCU_SPI>(mcu);
+                    spi->setupPin(tc.csPin, false);
+                    spi->setupBus(tc.spiBus, 3, 4000000);
+                    spi->buildConfig();
+                    tmcBusMap[tc.spiBus] = spi.get();
+                    spiObjects.push_back(std::move(spi));
+                }
+            }
+        }
+
+        // 5. Finalize MCU config (no background threads yet — exclusive serial access)
+        Log("Finalizing MCU configuration...");
+        if (!mcu.finalizeConfig()) {
+            LogError("Finalize failed: " + mcu.getLastError());
+            return false;
+        }
+        Log("Config finalized! OIDs=" + std::to_string(mcu.getOidCount()));
+
+        // 6. Re-init clock sync after finalize
+        mcu.initClockSync();
+        {
+            auto& cs = mcu.getClockSync();
+            auto dbg = cs.getDebugInfo();
+            std::ostringstream ss;
+            ss << "Clock sync re-initialized: freq=" << std::fixed << std::setprecision(0)
+               << dbg.freq << " Hz, RTT=" << std::setprecision(3)
+               << dbg.minHalfRtt * 2000.0 << " ms";
+            Log(ss.str());
+        }
+
+        // 7. Start background threads (AFTER finalize — finalize may reset MCU)
+        mcu.setShutdownCallback([](const std::string& reason) {
+            Log("!!! MCU SHUTDOWN: " + reason + " !!!");
+            g_shutdown = true;
+            g_running = false;
+        });
+        pollTh = std::thread(pollThread, std::ref(mcu));
+        clockSyncTh = std::thread(clockSyncThread, std::ref(mcu));
+
+        // 8. Create ToolHead
+        {
+            std::lock_guard<std::mutex> lock(g_mcuMutex);
+            toolhead = std::make_unique<ToolHead>(mcu);
+            double basePrintTime = mcu.getClockSync().estimatedPrintTime() + 0.25;
+            toolhead->setNextPrintTime(basePrintTime);
+            toolhead->setMaxVelocity(config->maxVelocity);
+            toolhead->setMaxAccel(config->maxAccel);
+            toolhead->setSquareCornerVelocity(config->squareCornerVelocity);
+            for (size_t i = 0; i < config->steppers.size() && i < 3; ++i)
+                toolhead->addStepper(static_cast<int>(i), config->steppers[i].stepper.get());
+        }
+        Log("Toolhead initialized");
+
+        // 9. Create G-code parser
+        gcode = std::make_unique<GCodeParser>(*toolhead, mcu);
+        for (size_t i = 0; i < config->steppers.size() && i < 3; ++i) {
+            if (config->steppers[i].rail)
+                gcode->addRail(static_cast<int>(i), config->steppers[i].rail.get());
+        }
+        Log("G-code parser initialized");
+
+        // 10. Initialize TMC5160 driver registers (SPI objects created in step 4b)
+        if (!config->tmcConfigs.empty()) {
+            Log("Initializing TMC5160 drivers...");
+            for (auto& tc : config->tmcConfigs) {
+                auto driver = std::make_unique<TMC5160>(tc.name);
+                driver->setSpi(tmcBusMap[tc.spiBus], tc.chainPosition, tc.chainLength);
+                driver->setCurrent(tc.runCurrent, tc.holdCurrent, tc.senseResistor);
+                driver->setMicrosteps(tc.microsteps, tc.interpolate);
+                driver->setStealthChop(tc.stealthChop);
+                {
+                    std::lock_guard<std::mutex> lock(g_mcuMutex);
+                    if (driver->initRegisters()) {
+                        auto status = driver->readStatus();
+                        Log("  [" + tc.name + "] Init OK - " + TMC5160::formatStatus(status));
+                    } else {
+                        LogError("  [" + tc.name + "] Init FAILED");
+                    }
+                }
+                tmcDrivers.push_back(std::move(driver));
+            }
+        }
+
+        Log("=== Initialization complete ===");
+        return true;
+    }
+
+    void shutdown() {
+        g_running = false;
+        if (pollTh.joinable()) pollTh.join();
+        if (clockSyncTh.joinable()) clockSyncTh.join();
+        mcu.disconnect();
+        Log("Disconnected.");
+    }
+};
+
+// ---- Mode: run gcode file ----
+static int runGcodeFile(TestContext& ctx, const std::string& filePath) {
+    std::ifstream file(filePath);
+    if (!file.is_open()) {
+        LogError("Cannot open file: " + filePath);
         return 1;
     }
-    std::cout << "Connected!" << std::endl;
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(file, line))
+        lines.push_back(line);
+    Log("Loaded gcode: " + filePath + " (" + std::to_string(lines.size()) + " lines)");
 
-    // Identify
-    std::cout << "\n--- Running identify handshake ---" << std::endl;
-    if (!mcu.identify()) {
-        std::cerr << "ERROR: " << mcu.getLastError() << std::endl;
-        return 1;
+    constexpr double BUFFER_TIME_START = 4.0;
+    constexpr double BUFFER_TIME_HIGH  = 4.0;
+    constexpr double BUFFER_TIME_LOW   = 1.0;
+    constexpr size_t FLUSH_BATCH = 10;
+    size_t linesSinceFlush = 0;
+    size_t errorCount = 0;
+
+    // Init print state
+    {
+        std::lock_guard<std::mutex> lock(g_mcuMutex);
+        ctx.toolhead->resetSyncState();
+        double initialTime = ctx.mcu.getClockSync().estimatedPrintTime() + BUFFER_TIME_START;
+        ctx.toolhead->setNextPrintTime(initialTime);
+        auto& cs = ctx.mcu.getClockSync();
+        std::ostringstream ss;
+        ss << "Print init: estPrintTime=" << std::fixed << std::setprecision(3)
+           << cs.estimatedPrintTime() << " initialTime=" << initialTime
+           << " clock=" << cs.getDebugInfo().lastClock
+           << " estFreq=" << std::setprecision(0) << cs.getEstimatedFreq()
+           << " nomFreq=" << cs.getMcuFreq();
+        Log(ss.str());
     }
+    Log("Starting print...");
 
-    // Print results
-    std::cout << "\n=== MCU Info ===" << std::endl;
-    std::cout << "Version: " << mcu.getVersion() << std::endl;
-    std::cout << "Build: " << mcu.getBuildVersions() << std::endl;
+    auto startTime = std::chrono::steady_clock::now();
+    size_t contentLines = 0;
+    size_t flushCount = 0;
 
-    std::cout << "\n=== Available Commands ===" << std::endl;
-    for (auto& [name, fmt] : mcu.getCommands()) {
-        std::cout << "  [" << fmt.msgId << "] " << fmt.formatStr << std::endl;
-    }
-
-    std::cout << "\n=== Available Responses ===" << std::endl;
-    for (auto& [name, fmt] : mcu.getResponses()) {
-        std::cout << "  [" << fmt.msgId << "] " << fmt.formatStr << std::endl;
-    }
-
-    std::cout << "\n=== Config ===" << std::endl;
-    for (auto& [key, val] : mcu.getConfig()) {
-        std::cout << "  " << key << " = " << val << std::endl;
-    }
-
-    std::cout << "\n=== Enumerations ===" << std::endl;
-    for (auto& [enumName, values] : mcu.getEnumerations()) {
-        std::cout << "  " << enumName << ": ";
-        for (auto& [vname, ev] : values) {
-            if (ev.isRange())
-                std::cout << vname << "=[" << ev.value << ".." << (ev.value + ev.count - 1) << "] ";
-            else
-                std::cout << vname << "=" << ev.value << " ";
+    // Step generation thread: decouples gcode processing from serial I/O.
+    // The main thread builds moves (trapq); this thread sends them to MCU.
+    // generateSteps self-paces via clock-gating (waits until MCU clock is
+    // close enough before sending each step batch).
+    std::atomic<bool> stepGenDone{false};
+    std::thread stepGenThread([&]() {
+        while (ctx.mcu.isConnected() && !ctx.mcu.isShutdown()) {
+            auto t0 = std::chrono::steady_clock::now();
+            bool ok = ctx.toolhead->generateSteps();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (ms > 500) {
+                std::cerr << "[StepGen] " << ms << "ms" << std::endl;
+            }
+            if (!ok) break; // MCU error
+            if (stepGenDone.load(std::memory_order_acquire)) {
+                // Final drain: process any remaining TrapMoves
+                ctx.toolhead->generateSteps();
+                break;
+            }
+            // Brief sleep when trapq was empty to avoid busy-waiting
+            if (ms < 2)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        std::cout << std::endl;
-    }
-
-    // Test: get_clock
-    std::cout << "\n--- Testing get_clock ---" << std::endl;
-    std::map<std::string, int64_t> clockIntParams;
-    std::map<std::string, std::vector<uint8_t>> clockBufParams;
-    if (mcu.sendWithResponse("get_clock", "clock", clockIntParams, clockBufParams)) {
-        // Clock is uint32, display as unsigned
-        uint32_t clock = static_cast<uint32_t>(clockIntParams["clock"]);
-        std::cout << "MCU Clock: " << clock << std::endl;
-    }
-    else {
-        std::cerr << "get_clock failed: " << mcu.getLastError() << std::endl;
-    }
-
-    // Test: get_uptime
-    std::cout << "\n--- Testing get_uptime ---" << std::endl;
-    std::map<std::string, int64_t> uptimeInt;
-    std::map<std::string, std::vector<uint8_t>> uptimeBuf;
-    if (mcu.sendWithResponse("get_uptime", "uptime", uptimeInt, uptimeBuf)) {
-        uint32_t high = static_cast<uint32_t>(uptimeInt["high"]);
-        uint32_t clk = static_cast<uint32_t>(uptimeInt["clock"]);
-        uint64_t totalClocks = (static_cast<uint64_t>(high) << 32) | clk;
-        double uptimeSeconds = static_cast<double>(totalClocks) / 300000000.0; // 300MHz
-        std::cout << "Uptime: " << uptimeSeconds << " seconds ("
-                  << (uptimeSeconds / 3600.0) << " hours)" << std::endl;
-    }
-    else {
-        std::cerr << "get_uptime failed: " << mcu.getLastError() << std::endl;
-    }
-
-    // Test: Clock Synchronization
-    std::cout << "\n--- Testing Clock Sync ---" << std::endl;
-    if (mcu.initClockSync()) {
-        auto& cs = mcu.getClockSync();
-        auto dbg = cs.getDebugInfo();
-        std::cout << "Clock Sync OK:" << std::endl;
-        std::cout << "  MCU freq: " << std::fixed << std::setprecision(0) << cs.getMcuFreq() << " Hz" << std::endl;
-        std::cout << "  Estimated freq: " << std::setprecision(1) << dbg.freq << " Hz" << std::endl;
-        std::cout << "  Min half RTT: " << std::setprecision(6) << dbg.minHalfRtt * 1000.0 << " ms" << std::endl;
-        std::cout << "  Last clock: " << dbg.lastClock << std::endl;
-
-        // Test clock sync poll
-        if (mcu.clockSyncPoll()) {
-            dbg = cs.getDebugInfo();
-            std::cout << "  After poll - freq: " << std::setprecision(1) << dbg.freq << " Hz" << std::endl;
-        }
-    }
-    else {
-        std::cerr << "Clock sync failed: " << mcu.getLastError() << std::endl;
-    }
-
-    // Test: Pin Resolution
-    std::cout << "\n--- Testing Pin Resolution ---" << std::endl;
-    std::vector<std::string> testPins = {"PA0", "PA15", "PB0", "PC5", "PD0", "PD5", "PE0", "ADC_TEMPERATURE"};
-    for (auto& pin : testPins) {
-        int num = mcu.resolvePin(pin);
-        std::cout << "  " << pin << " = " << num << std::endl;
-    }
-
-    // Test: Enum Resolution
-    std::cout << "\n--- Testing Enum Resolution ---" << std::endl;
-    std::cout << "  spi_bus spi0 = " << mcu.resolveEnum("spi_bus", "spi0") << std::endl;
-    std::cout << "  i2c_bus twihs0 = " << mcu.resolveEnum("i2c_bus", "twihs0") << std::endl;
-
-    // Test: Shutdown detection (register callback)
-    mcu.setShutdownCallback([](const std::string& reason) {
-        std::cerr << "*** SHUTDOWN CALLBACK: " << reason << " ***" << std::endl;
     });
 
-    // Test: MCU constants
-    std::cout << "\n--- MCU Constants ---" << std::endl;
-    std::cout << "  ADC_MAX = " << mcu.getConstantInt("ADC_MAX") << std::endl;
-    std::cout << "  PWM_MAX = " << mcu.getConstantInt("PWM_MAX") << std::endl;
-    std::cout << "  CLOCK_FREQ = " << mcu.getConstantInt("CLOCK_FREQ") << std::endl;
-    std::cout << "  MCU = " << mcu.getConfigStrings().count("MCU") << std::endl;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (!g_running) break;
 
-    // Test: MCU_digital_out (build config but don't finalize - just verify API)
-    std::cout << "\n--- Testing MCU_digital_out API ---" << std::endl;
-    {
-        MCU_digital_out dout(mcu);
-        dout.setupPin("PD0", false);
-        dout.setupMaxDuration(0.0);
-        dout.setupStartValue(false, false);
-        if (dout.buildConfig()) {
-            std::cout << "  Digital out OID=" << dout.getOid()
-                      << " pin=" << dout.getPinName() << " OK" << std::endl;
-        } else {
-            std::cout << "  Digital out build failed" << std::endl;
+        // Health check
+        {
+            std::lock_guard<std::mutex> lock(g_mcuMutex);
+            if (!ctx.mcu.isConnected()) {
+                LogError("MCU disconnected at line " + std::to_string(i + 1));
+                break;
+            }
+            if (ctx.mcu.isShutdown()) {
+                LogError("MCU shutdown at line " + std::to_string(i + 1));
+                break;
+            }
+        }
+
+        const std::string& cmd = lines[i];
+        // Skip empty/comment lines
+        {
+            std::string trimmed = cmd;
+            while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
+                trimmed.erase(trimmed.begin());
+            if (trimmed.empty() || trimmed[0] == ';' || trimmed[0] == '%' || trimmed[0] == '(')
+                continue;
+        }
+
+        // Execute
+        bool execOk;
+        {
+            std::lock_guard<std::mutex> lock(g_mcuMutex);
+            double minTime = ctx.mcu.getClockSync().estimatedPrintTime() + 0.25;
+            if (minTime > ctx.toolhead->getNextPrintTime())
+                ctx.toolhead->setNextPrintTime(minTime);
+            execOk = ctx.gcode->executeLine(cmd);
+        }
+        if (!execOk) {
+            std::string msg = ctx.gcode->getLastMessage();
+            if (!msg.empty() && msg.find("Unknown") == std::string::npos) {
+                LogError("Line " + std::to_string(i + 1) + ": " + msg + " [" + cmd + "]");
+                errorCount++;
+            }
+        }
+
+        contentLines++;
+        linesSinceFlush++;
+
+        // Log position after first few content lines
+        if (contentLines <= 5 || contentLines == 10) {
+            std::lock_guard<std::mutex> lock(g_mcuMutex);
+            auto p = ctx.toolhead->getPosition();
+            auto elapsed = std::chrono::steady_clock::now() - startTime;
+            double sec = std::chrono::duration<double>(elapsed).count();
+            std::ostringstream ss;
+            ss << "After line " << (i + 1) << " (content=" << contentLines
+               << "): pos=(" << std::fixed << std::setprecision(3)
+               << p.x << "," << p.y << "," << p.z << ")"
+               << " printTime=" << std::setprecision(3) << ctx.toolhead->getNextPrintTime()
+               << " elapsed=" << std::setprecision(3) << sec << "s"
+               << " [" << cmd << "]";
+            Log(ss.str());
+        }
+
+        // Flush periodically to push moves into TrapQ for the step gen thread
+        if (linesSinceFlush >= FLUSH_BATCH || i == lines.size() - 1) {
+            linesSinceFlush = 0;
+            flushCount++;
+
+            {
+                std::lock_guard<std::mutex> lock(g_mcuMutex);
+                ctx.toolhead->flush();
+            }
+
+            // Log some flushes for diagnostics
+            auto elapsed = std::chrono::steady_clock::now() - startTime;
+            double sec = std::chrono::duration<double>(elapsed).count();
+            double ahead;
+            double printTime;
+            {
+                std::lock_guard<std::mutex> lock(g_mcuMutex);
+                printTime = ctx.toolhead->getNextPrintTime();
+                ahead = printTime - ctx.mcu.getClockSync().estimatedPrintTime();
+            }
+            if (flushCount <= 5 || flushCount % 10 == 0 || i == lines.size() - 1) {
+                std::ostringstream ss;
+                ss << "Flush #" << flushCount << " at line " << (i + 1)
+                   << "/" << lines.size()
+                   << " elapsed=" << std::fixed << std::setprecision(1) << sec << "s"
+                   << " ahead=" << std::setprecision(3) << ahead << "s"
+                   << " printTime=" << std::setprecision(3) << printTime;
+                Log(ss.str());
+            }
+
+            // Backpressure: wait if host is too far ahead of MCU.
+            // The step gen thread drains the trapq in parallel, so the
+            // MCU clock advances while we wait here.
+            for (;;) {
+                if (!g_running) break;
+                {
+                    std::lock_guard<std::mutex> lock(g_mcuMutex);
+                    if (!ctx.mcu.isConnected() || ctx.mcu.isShutdown()) break;
+                    ahead = ctx.toolhead->getNextPrintTime()
+                          - ctx.mcu.getClockSync().estimatedPrintTime();
+                }
+                if (ahead < BUFFER_TIME_HIGH) break;
+                double waitSec = ahead - BUFFER_TIME_LOW;
+                int waitMs = (std::max)(10, (std::min)(500, static_cast<int>(waitSec * 1000)));
+                std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+            }
         }
     }
 
-    // Test: MCU_pwm (hardware PWM)
-    std::cout << "\n--- Testing MCU_pwm API ---" << std::endl;
+    // Final flush + stop step generation thread
+    Log("Flushing remaining moves...");
     {
-        MCU_pwm pwm(mcu);
-        pwm.setupPin("PD0", false);
-        pwm.setupCycleTime(0.001, true);  // 1kHz hardware PWM
-        pwm.setupMaxDuration(0.0);
-        pwm.setupStartValue(0.0, 0.0);
-        if (pwm.buildConfig()) {
-            std::cout << "  PWM OID=" << pwm.getOid()
-                      << " pin=" << pwm.getPinName()
-                      << " pwm_max=" << pwm.getPwmMax() << " OK" << std::endl;
-        } else {
-            std::cout << "  PWM build failed" << std::endl;
+        std::lock_guard<std::mutex> lock(g_mcuMutex);
+        if (ctx.mcu.isConnected() && !ctx.mcu.isShutdown())
+            ctx.toolhead->flush();
+    }
+    stepGenDone.store(true, std::memory_order_release);
+    stepGenThread.join();
+    {
+        std::lock_guard<std::mutex> lock(g_mcuMutex);
+        ctx.toolhead->resetSyncState();
+    }
+
+    auto elapsed = std::chrono::steady_clock::now() - startTime;
+    double totalSec = std::chrono::duration<double>(elapsed).count();
+    {
+        auto p = ctx.toolhead->getPosition();
+        std::ostringstream ps;
+        ps << "Final position: (" << std::fixed << std::setprecision(3)
+           << p.x << "," << p.y << "," << p.z << ")"
+           << " contentLines=" << contentLines << " flushes=" << flushCount;
+        Log(ps.str());
+    }
+    std::ostringstream ss;
+    ss << "Print finished: " << lines.size() << " lines, "
+       << std::fixed << std::setprecision(1) << totalSec << "s, "
+       << errorCount << " errors";
+    Log(ss.str());
+
+    // Wait for MCU to finish executing remaining queued steps
+    Log("Waiting for MCU to finish executing steps...");
+    for (int w = 0; w < 300 && g_running; ++w) {
+        double ahead;
+        {
+            std::lock_guard<std::mutex> lock(g_mcuMutex);
+            if (!ctx.mcu.isConnected() || ctx.mcu.isShutdown()) break;
+            ahead = ctx.toolhead->getNextPrintTime()
+                  - ctx.mcu.getClockSync().estimatedPrintTime();
         }
-    }
-
-    // Test: MCU_adc
-    std::cout << "\n--- Testing MCU_adc API ---" << std::endl;
-    {
-        MCU_adc adc(mcu);
-        adc.setupPin("ADC_TEMPERATURE");
-        adc.setupAdcSample(0.5, 0.001, 8, 0.0, 1.0, 0);
-        adc.setupAdcCallback([](double readTime, double value) {
-            std::cout << "  ADC callback: time=" << readTime
-                      << " value=" << value << std::endl;
-        });
-        if (adc.buildConfig()) {
-            std::cout << "  ADC OID=" << adc.getOid()
-                      << " pin=" << adc.getPinName() << " OK" << std::endl;
-        } else {
-            std::cout << "  ADC build failed" << std::endl;
+        if (ahead <= 0.2) break;
+        if (w % 20 == 0) {
+            std::ostringstream ss;
+            ss << "  Waiting: ahead=" << std::fixed << std::setprecision(2) << ahead << "s";
+            Log(ss.str());
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    Log("Done.");
+
+    return (errorCount > 0 || g_shutdown) ? 1 : 0;
+}
+
+// ---- Mode: execute gcode block ----
+static int runGcodeBlock(TestContext& ctx, const std::string& gcodeBlock) {
+    Log("Executing: " + gcodeBlock);
+
+    {
+        std::lock_guard<std::mutex> lock(g_mcuMutex);
+        ctx.toolhead->resetSyncState();
+        double now = ctx.mcu.getClockSync().estimatedPrintTime() + 0.25;
+        ctx.toolhead->setNextPrintTime(now);
     }
 
-    // Test: MCU_SPI (build config API test)
-    std::cout << "\n--- Testing MCU_SPI API ---" << std::endl;
+    int count;
     {
-        MCU_SPI spi(mcu);
-        spi.setupPin("PA5", false);
-        spi.setupBus("spi0", 0, 4000000);
-        if (spi.buildConfig()) {
-            std::cout << "  SPI OID=" << spi.getOid() << " OK" << std::endl;
-        } else {
-            std::cout << "  SPI build failed" << std::endl;
+        std::lock_guard<std::mutex> lock(g_mcuMutex);
+        count = ctx.gcode->executeBlock(gcodeBlock);
+    }
+    if (count <= 0) {
+        LogError("Execute failed: " + ctx.gcode->getLastMessage());
+        return 1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_mcuMutex);
+        ctx.toolhead->flush();
+    }
+    ctx.toolhead->generateSteps();
+
+    Log("Waiting for motion to complete...");
+    for (int w = 0; w < 100 && g_running; ++w) {
+        double ahead;
+        {
+            std::lock_guard<std::mutex> lock(g_mcuMutex);
+            if (!ctx.mcu.isConnected() || ctx.mcu.isShutdown()) break;
+            ahead = ctx.toolhead->getNextPrintTime()
+                  - ctx.mcu.getClockSync().estimatedPrintTime();
         }
+        if (ahead <= 0.2) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    // Test: MCU_I2C (build config API test)
-    std::cout << "\n--- Testing MCU_I2C API ---" << std::endl;
     {
-        MCU_I2C i2c(mcu);
-        i2c.setupBus("twihs0", 100000, 0x48);
-        if (i2c.buildConfig()) {
-            std::cout << "  I2C OID=" << i2c.getOid() << " OK" << std::endl;
-        } else {
-            std::cout << "  I2C build failed" << std::endl;
-        }
+        std::lock_guard<std::mutex> lock(g_mcuMutex);
+        ctx.toolhead->resetSyncState();
     }
 
-    // Test: TMC UART CRC and bit-framing
-    std::cout << "\n--- Testing TMC UART CRC ---" << std::endl;
-    {
-        uint8_t testData[] = {0xF5, 0x00, 0x06};
-        uint8_t crc = MCU_TMC_uart::calcCrc8(testData, 3);
-        std::cout << "  CRC8 of [F5,00,06] = 0x" << std::hex << (int)crc << std::dec << std::endl;
-    }
-
-    // Test: Thermocouple temperature conversion
-    std::cout << "\n--- Testing Thermocouple Conversions ---" << std::endl;
-    {
-        // MAX31855: 25.0C = 0x00190000 (100 << 18)
-        double t1 = MCU_Thermocouple::convertTemperature(
-            MCU_Thermocouple::SensorType::MAX31855, 100 << 18);
-        std::cout << "  MAX31855 raw 0x01900000 = " << t1 << " C" << std::endl;
-
-        // MAX6675: 25.0C = (100 << 3)
-        double t2 = MCU_Thermocouple::convertTemperature(
-            MCU_Thermocouple::SensorType::MAX6675, 100 << 3);
-        std::cout << "  MAX6675 raw 0x0320 = " << t2 << " C" << std::endl;
-    }
-
-    // ---- Phase 4: Stepper, Toolhead, G-code ----
-
-    // Test: MCU_stepper (build config API)
-    std::cout << "\n--- Testing MCU_stepper API ---" << std::endl;
-    MCU_stepper stepperX(mcu);
-    stepperX.setupPin("PD6", "PD11");
-    stepperX.setupStepDist(40.0, 200, 16); // 40mm belt, 200 steps, 16 microsteps
-    stepperX.setupInvertDir(false);
-    stepperX.buildConfig();
-    std::cout << "  Stepper X: OID=" << stepperX.getOid()
-              << " step_dist=" << stepperX.getStepDist() << " mm" << std::endl;
-
-    MCU_stepper stepperY(mcu);
-    stepperY.setupPin("PD7", "PD12");
-    stepperY.setupStepDist(40.0, 200, 16);
-    stepperY.setupInvertDir(false);
-    stepperY.buildConfig();
-    std::cout << "  Stepper Y: OID=" << stepperY.getOid()
-              << " step_dist=" << stepperY.getStepDist() << " mm" << std::endl;
-
-    MCU_stepper stepperZ(mcu);
-    stepperZ.setupPin("PD8", "PD13");
-    stepperZ.setupStepDist(8.0, 200, 16); // 8mm lead screw
-    stepperZ.setupInvertDir(false);
-    stepperZ.buildConfig();
-    std::cout << "  Stepper Z: OID=" << stepperZ.getOid()
-              << " step_dist=" << stepperZ.getStepDist() << " mm" << std::endl;
-
-    // Test: MCU_endstop
-    std::cout << "\n--- Testing MCU_endstop API ---" << std::endl;
-    MCU_endstop endstopX(mcu);
-    endstopX.setupPin("PC16", true);
-    endstopX.buildConfig();
-    std::cout << "  Endstop X: OID=" << endstopX.getOid()
-              << " trsync=" << endstopX.getTrsyncOid() << std::endl;
-
-    // Test: PrinterRail
-    std::cout << "\n--- Testing PrinterRail ---" << std::endl;
-    PrinterRail railX(stepperX, endstopX);
-    railX.setPositionLimits(0, 300);
-    railX.setHomingSpeed(25.0);
-    railX.setPositionEndstop(0);
-    std::cout << "  Rail X: range [" << railX.getPosMin() << ", " << railX.getPosMax()
-              << "] homing_speed=" << railX.getHomingSpeed() << std::endl;
-
-    // Test: Toolhead + Trapezoid Planner
-    std::cout << "\n--- Testing Toolhead ---" << std::endl;
-    ToolHead toolhead(mcu);
-    toolhead.setMaxVelocity(100);
-    toolhead.setMaxAccel(1000);
-    toolhead.setSquareCornerVelocity(5.0);
-    toolhead.addStepper(0, &stepperX);
-    toolhead.addStepper(1, &stepperY);
-    toolhead.addStepper(2, &stepperZ);
-    std::cout << "  maxVel=" << toolhead.getMaxVelocity()
-              << " maxAccel=" << toolhead.getMaxAccel()
-              << " junctionDev=" << toolhead.getJunctionDeviation() << std::endl;
-
-    // Test: Move/TrapMove generation (offline, no MCU send)
-    std::cout << "\n--- Testing Move + TrapMove ---" << std::endl;
-    {
-        Move move(Vec3(0, 0, 0), Vec3(10, 0, 0), 50.0, 1000.0);
-        move.setJunction(0, 50.0 * 50.0, 0);
-        auto trapMoves = move.toTrapMoves();
-        std::cout << "  Move 10mm @ 50mm/s: " << trapMoves.size() << " trap moves" << std::endl;
-        for (size_t i = 0; i < trapMoves.size(); ++i) {
-            auto& tm = trapMoves[i];
-            std::cout << "    [" << i << "] t=" << tm.print_time
-                      << " dt=" << tm.move_t
-                      << " v0=" << tm.start_v
-                      << " a/2=" << tm.half_accel << std::endl;
-        }
-    }
-
-    // Test: G-code parser (offline)
-    std::cout << "\n--- Testing GCodeParser ---" << std::endl;
-    GCodeParser gcode(toolhead, mcu);
-    gcode.addRail(0, &railX);
-
-    gcode.executeLine("G90");
-    std::cout << "  G90: absolute=" << gcode.isAbsoluteMode() << std::endl;
-    gcode.executeLine("G91");
-    std::cout << "  G91: absolute=" << gcode.isAbsoluteMode() << std::endl;
-    gcode.executeLine("G90");
-
-    gcode.executeLine("G92 X0 Y0 Z0");
-    std::cout << "  G92 X0 Y0 Z0: basePos=("
-              << gcode.getBasePosition().x << ","
-              << gcode.getBasePosition().y << ","
-              << gcode.getBasePosition().z << ")" << std::endl;
-
-    // Parse test without sending to MCU (toolhead queues but doesn't send)
-    gcode.executeLine("G1 X10 Y5 F3000");
-    gcode.executeLine("G1 X20 Y10");
-    std::cout << "  After G1 moves: queue=" << toolhead.getQueueSize()
-              << " pos=(" << toolhead.getPosition().x
-              << "," << toolhead.getPosition().y
-              << "," << toolhead.getPosition().z << ")" << std::endl;
-
-    gcode.executeLine("M114");
-    std::cout << "  M114: " << gcode.getLastMessage() << std::endl;
-
-    // Test: Config finalization (sends all config to MCU)
-    std::cout << "\n--- Testing Config Finalization ---" << std::endl;
-    if (mcu.finalizeConfig()) {
-        std::cout << "  Config finalized OK! OIDs=" << mcu.getOidCount() << std::endl;
-
-        // Poll for a few seconds to receive ADC data
-        std::cout << "\n--- Polling for ADC data (3 seconds) ---" << std::endl;
-        auto start = std::chrono::steady_clock::now();
-        while (std::chrono::steady_clock::now() - start < std::chrono::seconds(3)) {
-            mcu.processIncoming(100);
-        }
-    } else {
-        std::cout << "  Config finalize failed: " << mcu.getLastError() << std::endl;
-    }
-
-    std::cout << "\n=== Done ===" << std::endl;
-    mcu.disconnect();
+    Vec3 pos = ctx.toolhead->getPosition();
+    std::ostringstream posStr;
+    posStr << "Position: X=" << std::fixed << std::setprecision(3) << pos.x
+           << " Y=" << pos.y << " Z=" << pos.z;
+    Log(posStr.str());
+    Log("Done.");
     return 0;
 }
+
+// ---- Mode: monitor MCU stats ----
+static int runMonitor(TestContext& ctx, int seconds) {
+    Log("Monitoring MCU for " + std::to_string(seconds) + " seconds...");
+    auto start = std::chrono::steady_clock::now();
+    while (g_running) {
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        if (std::chrono::duration<double>(elapsed).count() >= seconds) break;
+        {
+            std::lock_guard<std::mutex> lock(g_mcuMutex);
+            if (!ctx.mcu.isConnected()) {
+                LogError("MCU disconnected!");
+                return 1;
+            }
+            if (ctx.mcu.isShutdown()) {
+                LogError("MCU shutdown!");
+                return 1;
+            }
+            auto& cs = ctx.mcu.getClockSync();
+            auto dbg = cs.getDebugInfo();
+            std::ostringstream ss;
+            ss << "ClockSync: freq=" << std::fixed << std::setprecision(0) << dbg.freq
+               << " rtt=" << std::setprecision(3) << dbg.minHalfRtt * 2000.0 << "ms"
+               << " clock=" << dbg.lastClock
+               << " est_print_time=" << std::setprecision(3) << cs.estimatedPrintTime();
+            Log(ss.str());
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
+    Log("Monitor done.");
+    return 0;
+}
+
+// ---- Mode: info only ----
+static int runInfo(TestContext& ctx) {
+    Log("MCU info displayed above. Monitoring for 5 seconds...");
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Log("Done.");
+    return 0;
+}
+
+// ---- Usage ----
+static void printUsage(const char* exe) {
+    std::cerr << "Usage:\n"
+              << "  " << exe << " gcode <file.gcode>    - run gcode file\n"
+              << "  " << exe << " move \"<gcode>\"        - execute gcode block\n"
+              << "  " << exe << " monitor [seconds]      - monitor MCU stats\n"
+              << "  " << exe << " info                   - show MCU info\n\n"
+              << "Options:\n"
+              << "  --port <COMx>     - serial port (default COM3)\n"
+              << "  --config <file>   - config file (default configs/generic-duet3-6hc.cfg)\n";
+}
+
+// ---- Main ----
+int main(int argc, char* argv[]) {
+    signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
+
+    // Parse args
+    std::string mode;
+    std::string modeArg;
+    std::string port = "COM3";
+    std::string configPath = "configs/generic-duet3-6hc.cfg";
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--port" && i + 1 < argc) {
+            port = argv[++i];
+        } else if (arg == "--config" && i + 1 < argc) {
+            configPath = argv[++i];
+        } else if (mode.empty()) {
+            mode = arg;
+        } else if (modeArg.empty()) {
+            modeArg = arg;
+        }
+    }
+
+    if (mode.empty()) {
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    Log("=== Klipper Host C++ Test Tool ===");
+    Log("Mode: " + mode + (modeArg.empty() ? "" : " " + modeArg));
+
+    // Initialize
+    TestContext ctx;
+    if (!ctx.init(port, configPath)) {
+        LogError("Initialization failed!");
+        ctx.shutdown();
+        return 1;
+    }
+
+    // Run selected mode
+    int result = 0;
+    if (mode == "gcode") {
+        if (modeArg.empty()) {
+            LogError("gcode mode requires a file path");
+            result = 1;
+        } else {
+            result = runGcodeFile(ctx, modeArg);
+        }
+    } else if (mode == "move") {
+        if (modeArg.empty()) {
+            LogError("move mode requires a gcode string");
+            result = 1;
+        } else {
+            result = runGcodeBlock(ctx, modeArg);
+        }
+    } else if (mode == "monitor") {
+        int seconds = modeArg.empty() ? 30 : std::stoi(modeArg);
+        result = runMonitor(ctx, seconds);
+    } else if (mode == "info") {
+        result = runInfo(ctx);
+    } else {
+        LogError("Unknown mode: " + mode);
+        printUsage(argv[0]);
+        result = 1;
+    }
+
+    // Shutdown
+    ctx.shutdown();
+
+    if (g_shutdown) {
+        LogError("Session ended due to MCU shutdown!");
+        return 2;
+    }
+
+    return result;
+}
+

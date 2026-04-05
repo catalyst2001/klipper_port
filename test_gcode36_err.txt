@@ -1,0 +1,34 @@
+[StepGen] Phase1 done: cmds=101 steps[0]=43 steps[1]=38 steps[2]=12
+[StepGen] Phase2 start: genRange=[16904.862..16917.139] curPT=16902.911 ahead=[1.950..14.228] shutdown=0
+[StepGen] Phase2 done: totalSteps=93 timeThrottles=9 flowThrottles=0 cumulative=93
+[StepGen] Drain: target=16917.139 curPT=16919.602 waited=3002ms shutdown=0
+[StepGen] 16753ms
+[StepGen] Phase1 done: cmds=94 steps[0]=44 steps[1]=48 steps[2]=0
+[StepGen] Phase2 start: genRange=[16909.042..16918.493] curPT=16919.637 ahead=[-10.595..-1.143] shutdown=0
+[StepGen] Phase2 done: totalSteps=92 timeThrottles=0 flowThrottles=1 cumulative=185
+[StepGen] Drain: target=16918.493 curPT=16922.720 waited=3003ms shutdown=0
+[StepGen] 3100ms
+[StepGen] Phase1 done: cmds=74 steps[0]=34 steps[1]=38 steps[2]=0
+[StepGen] Phase2 start: genRange=[16918.495..16919.488] curPT=16922.732 ahead=[-4.237..-3.244] shutdown=0
+[StepGen] Phase2 done: totalSteps=72 timeThrottles=0 flowThrottles=1 cumulative=257
+[StepGen] Drain: target=16919.488 curPT=16925.786 waited=3001ms shutdown=0
+[StepGen] 3065ms
+[StepGen] Phase1 done: cmds=88 steps[0]=43 steps[1]=42 steps[2]=0
+[StepGen] Phase2 start: genRange=[16919.489..16920.204] curPT=16925.800 ahead=[-6.311..-5.596] shutdown=0
+[StepGen] Phase2 done: totalSteps=85 timeThrottles=0 flowThrottles=1 cumulative=342
+[StepGen] Drain: target=16920.204 curPT=16928.856 waited=3004ms shutdown=0
+[StepGen] 3068ms
+[StepGen] Phase1 done: cmds=80 steps[0]=39 steps[1]=39 steps[2]=0
+[StepGen] Phase2 start: genRange=[16920.207..16920.519] curPT=16928.867 ahead=[-8.660..-8.348] shutdown=0
+[StepGen] Phase2 done: totalSteps=78 timeThrottles=0 flowThrottles=1 cumulative=420
+[StepGen] Drain: target=16920.519 curPT=16931.924 waited=3001ms shutdown=0
+[StepGen] 3065ms
+[StepGen] Phase1 done: cmds=74 steps[0]=37 steps[1]=35 steps[2]=0
+[StepGen] Phase2 start: genRange=[16920.521..16921.138] curPT=16931.934 ahead=[-11.413..-10.796] shutdown=0
+[StepGen] Phase2 done: totalSteps=72 timeThrottles=0 flowThrottles=1 cumulative=492
+[StepGen] Drain: target=16921.138 curPT=16934.998 waited=3010ms shutdown=0
+[StepGen] 3073ms
+[StepGen] Phase1 done: cmds=70 steps[0]=35 steps[1]=33 steps[2]=0
+[StepGen] Phase2 start: genRange=[16921.138..16921.327] curPT=16935.008 ahead=[-13.870..-13.682] shutdown=0
+[KlipperMCU] !!! SHUTDOWN: Timer too close !!!
+[04:19:01.859] ERROR: Session ended due to MCU shutdown!

@@ -1,0 +1,181 @@
+[03:50:52.105] === Klipper Host C++ Test Tool ===
+[03:50:52.108] Mode: gcode gcode\snegir.gcode
+[03:50:52.108] Connecting to COM3...
+[03:50:52.384] Connected!
+[03:50:52.385] Running identify handshake...
+[KlipperMCU] Starting identify handshake...
+[KlipperMCU] Scanning for correct sequence number...
+  Trying seq=0...
+  Trying seq=1...
+  Trying seq=2...
+  Trying seq=3...
+  Trying seq=4...
+  Trying seq=5...
+  Trying seq=6...
+  Trying seq=7...
+  Trying seq=8...
+  Trying seq=9...
+  Trying seq=10...
+[KlipperMCU] Sequence synced at seq=10, got 40 bytes
+[KlipperMCU] Identify data received: 2971 bytes (compressed)
+[KlipperMCU] Identify JSON (8173 bytes):
+{"app":"Klipper","build_versions":"gcc: (15:9-2019-q4-0ubuntu1) 9.2.1 20191025 (release) [ARM/arm-9-branch revision 277599] binutils: (2.34-4ubuntu1+13ubuntu1) 2.34","commands":{"allocate_oids count=%c":8,"buttons_ack oid=%c count=%c":43,"buttons_add oid=%c pos=%c pin=%u pull_up=%c":45,"buttons_query oid=%c clock=%u rest_ticks=%u retransmit_count=%c invert=%c":44,"clear_shutdown":2,"config_ads1220 oid=%c spi_oid=%c data_ready_pin=%u":81,"config_adxl345 oid=%c spi_oid=%c":66,"config_analog_in oid=%c pin=%u":32,"config_buttons oid=%c button_count=%c":46,"config_counter oid=%c pin=%u pull_up=%c":53,"config_digital_out oid=%c pin=%u value=%c default_value=%c max_duration=%u":17,"config_endstop oid=%c pin=%c pull_up=%c":26,"config_hd44780 oid=%c rs_pin=%u e_pin=%u d4_pin=%u d5_pin=%u d6_pin=%u d7_pin=%u delay_ticks=%u":59,"config_hx71x oid=%c gain_channel=%c dout_pin=%u sclk_pin=%u":78,"config_i2c oid=%c":42,"config_icm20948 oid=%c i2c_oid=%c":75,"config_ldc1612 oid=%c i2c_oid=%c":87,"config_ldc1612_with_intb oid=%c i2c_oid=%c intb_pin=%c":86,"config_lis2dw oid=%c bus_oid=%c bus_oid_type=%c lis_chip_type=%c":69,"config_mpu9250 oid=%c i2c_oid=%c":72,"config_neopixel oid=%c pin=%u data_size=%hu bit_max_ticks=%u reset_min_ticks=%u":51,"config_spi oid=%c pin=%u cs_active_high=%c":38,"config_spi_angle oid=%c spi_oid=%c spi_angle_type=%c":90,"config_spi_shutdown oid=%c spi_oid=%c shutdown_msg=%*s":33,"config_spi_without_cs oid=%c":37,"config_st7920 oid=%c cs_pin=%u sclk_pin=%u sid_pin=%u sync_delay_ticks=%u cmd_delay_ticks=%u":56,"config_stepper oid=%c step_pin=%c dir_pin=%c invert_step=%c step_pulse_ticks=%u":23,"config_thermocouple oid=%c spi_oid=%c thermocouple_type=%c":63,"config_tmcuart oid=%c rx_pin=%u pull_up=%c tx_pin=%u bit_time=%u":48,"config_trsync oid=%c":30,"debug_nop":9,"debug_ping data=%*s":10,"debug_read order=%c addr=%u":12,"debug_write order=%c addr=%u val=%u":11,"emergency_stop":3,"endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c":25,"endstop_query_state oid=%c":24,"finalize_config crc=%u":6,"get_clock":5,"get_config":7,"get_uptime":4,"hd44780_send_cmds oid=%c cmds=%*s":58,"hd44780_send_data oid=%c data=%*s":57,"i2c_read oid=%c reg=%*s read_len=%u":39,"i2c_set_bus oid=%c i2c_bus=%u rate=%u address=%u":41,"i2c_set_software_bus oid=%c scl_pin=%u sda_pin=%u rate=%u address=%u":61,"i2c_write oid=%c data=%*s":40,"identify offset=%u count=%c":1,"ldc1612_setup_home oid=%c clock=%u threshold=%u trsync_oid=%c trigger_reason=%c error_reason=%c":85,"neopixel_send oid=%c":49,"neopixel_update oid=%c pos=%hu data=%*s":50,"query_ads1220 oid=%c rest_ticks=%u":80,"query_ads1220_status oid=%c":79,"query_adxl345 oid=%c rest_ticks=%u":65,"query_adxl345_status oid=%c":64,"query_analog_in oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u min_value=%hu max_value=%hu range_check_count=%c":31,"query_counter oid=%c clock=%u poll_ticks=%u sample_ticks=%u":52,"query_hx71x oid=%c rest_ticks=%u":77,"query_hx71x_status oid=%c":76,"query_icm20948 oid=%c rest_ticks=%u":74,"query_icm20948_status oid=%c":73,"query_ldc1612 oid=%c rest_ticks=%u":83,"query_ldc1612_home_state oid=%c":84,"query_lis2dw oid=%c rest_ticks=%u":68,"query_lis2dw_status oid=%c":67,"query_mpu9250 oid=%c rest_ticks=%u":71,"query_mpu9250_status oid=%c":70,"query_spi_angle oid=%c clock=%u rest_ticks=%u time_shift=%c":89,"query_status_ldc1612 oid=%c":82,"query_thermocouple oid=%c clock=%u rest_ticks=%u min_value=%u max_value=%u max_invalid_count=%c":62,"queue_digital_out oid=%c clock=%u on_ticks=%u":15,"queue_step oid=%c interval=%u count=%hu add=%hi":22,"reset":91,"reset_step_clock oid=%c clock=%u":20,"set_digital_out pin=%u value=%c":13,"set_digital_out_pwm_cycle oid=%c cycle_ticks=%u":16,"set_next_step_dir oid=%c dir=%c":21,"spi_angle_transfer oid=%c data=%*s":88,"spi_send oid=%c data=%*s":34,"spi_set_bus oid=%c spi_bus=%u mode=%u rate=%u":36,"spi_set_software_bus oid=%c miso_pin=%u mosi_pin=%u sclk_pin=%u mode=%u rate=%u":60,"spi_transfer oid=%c data=%*s":35,"st7920_send_cmds oid=%c cmds=%*s":55,"st7920_send_data oid=%c data=%*s":54,"stepper_get_position oid=%c":19,"stepper_stop_on_trigger oid=%c trsync_oid=%c":18,"tmcuart_send oid=%c write=%*s read=%c":47,"trsync_set_timeout oid=%c clock=%u":28,"trsync_start oid=%c report_clock=%u report_ticks=%u expire_reason=%c":29,"trsync_trigger oid=%c reason=%c":27,"update_digital_out oid=%c value=%c":14},"config":{"ADC_MAX":4095,"BUS_PINS_spi0":"PD20,PD21,PD22","BUS_PINS_twihs0":"PA4,PA3","BUS_PINS_twihs1":"PB5,PB4","BUS_PINS_twihs2":"PD28,PD27","BUS_PINS_usart0":"PB0,PB1,PB13","BUS_PINS_usart1":"PA21,PB4,PA23","BUS_PINS_usart2":"PD15,PD16,PD17","CLOCK_FREQ":300000000,"MCU":"same70q20b","STATS_SUMSQ_BASE":256,"STEPPER_OPTIMIZED_EDGE":38,"STEPPER_STEP_BOTH_EDGE":1},"enumerations":{"bus_oid_type":{"i2c":1,"spi":0},"i2c_bus":{"twihs0":[0,3]},"lis_chip_type":{"LIS2DW":0,"LIS3DH":1},"pin":{"ADC_TEMPERATURE":254,"PA0":[0,32],"PB0":[32,32],"PC0":[64,32],"PD0":[96,32],"PE0":[128,32]},"spi_angle_type":{"a1333":0,"as5047d":1,"mt6816":3,"mt6826s":4,"tle5012b":2},"spi_bus":{"spi0":[0,2],"usart0":[2,3]},"static_string_id":{"ADC out of range":26,"Addresses larger than 3 bytes are not supported":52,"Already finalized":13,"Can not set soft pwm cycle ticks while updates pending":20,"Can't add signal that is already active":25,"Can't assign oid":11,"Can't reset time when stepper active":22,"Command parser error":7,"Command request":8,"HX71x gain/channel out of range 1-4":44,"I2C NACK":31,"I2C NACK error encountered!":50,"I2C START NACK":30,"I2C START READ NACK":29,"I2C Timeout":28,"I2C timeout occured":49,"Invalid buttons retransmit count":32,"Invalid command":5,"Invalid count parameter":23,"Invalid i2c_setup parameters!":51,"Invalid move request size":14,"Invalid neopixel data_size":37,"Invalid neopixel update command":36,"Invalid oid type":12,"Invalid spi bus":53,"Invalid spi config":27,"Invalid spi_angle chip type":46,"Invalid thermocouple chip type":39,"Max of 8 buttons":34,"Message encode error":6,"Missed scheduling of next digital out event":21,"Move queue overflow":15,"Not a valid ADC pin":55,"Not a valid input pin":47,"Not an output pin":48,"Rescheduled timer in the past":54,"Scheduled digital out event will exceed max_duration":19,"Set button past maximum button count":33,"Shutdown cleared when not shutdown":2,"Stepper too far in past":24,"Thermocouple reader fault":38,"Timer too close":3,"alloc_chunk failed":17,"alloc_chunks failed":16,"angle sensor requires cs pin":45,"bus_type i2c unsupported":42,"bus_type invalid":41,"bus_type spi unsupported":43,"config_reset only available when shutdown":9,"model type invalid":40,"oids already allocated":10,"sentinel timer called":4,"tmcuart data too large":35,"update_digital_out not valid with active queue":18},"thermocouple_type":{"MAX31855":0,"MAX31856":1,"MAX31865":2,"MAX6675":3}},"license":"GNU GPLv3","responses":{"analog_in_state oid=%c next_clock=%u value=%hu":-24,"buttons_state oid=%c ack_count=%c state=%*s":-21,"clock clock=%u":-31,"config is_config=%c crc=%u is_shutdown=%c move_count=%hu":-30,"counter_state oid=%c next_clock=%u count=%u count_clock=%u":-18,"debug_result val=%u":-28,"endstop_state oid=%c homing=%c next_clock=%u pin_value=%c":-26,"i2c_read_response oid=%c response=%*s":-22,"identify_response offset=%u data=%.*s":0,"is_shutdown static_string_id=%hu":93,"ldc1612_home_state oid=%c homing=%c trigger_clock=%u":-16,"neopixel_result oid=%c success=%c":-19,"pong data=%*s":-29,"sensor_bulk_data oid=%c sequence=%hu data=%*s":-13,"sensor_bulk_status oid=%c clock=%u query_ticks=%u next_sequence=%hu buffered=%u possible_overflows=%hu":-14,"shutdown clock=%u static_string_id=%hu":94,"spi_angle_transfer_response oid=%c clock=%u response=%*s":-15,"spi_transfer_response oid=%c response=%*s":-23,"starting":92,"stats count=%u sum=%u sumsq=%u":95,"stepper_position oid=%c pos=%i":-27,"thermocouple_result oid=%c next_clock=%u value=%u fault=%c":-17,"tmcuart_response oid=%c read=%*s":-20,"trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u":-25,"uptime high=%u clock=%u":-32},"version":"?-20260329_215843-asus"}
+[KlipperMCU] Identified: ?-20260329_215843-asus
+[KlipperMCU] Commands: 91, Responses: 25
+[03:50:55.035] Identified! Version: ?-20260329_215843-asus
+[03:50:55.035] Build: gcc: (15:9-2019-q4-0ubuntu1) 9.2.1 20191025 (release) [ARM/arm-9-branch revision 277599] binutils: (2.34-4ubuntu1+13ubuntu1) 2.34
+[03:50:55.036] Commands: 91, Responses: 25
+[03:50:55.036]   Config: ADC_MAX = 4095
+[03:50:55.036]   Config: CLOCK_FREQ = 300000000
+[03:50:55.036]   Config: STATS_SUMSQ_BASE = 256
+[03:50:55.037]   Config: STEPPER_OPTIMIZED_EDGE = 38
+[03:50:55.037]   Config: STEPPER_STEP_BOTH_EDGE = 1
+[03:50:55.037] Initializing clock synchronization...
+[ClockSync] Initialized: estFreq=308128134.612418 Hz (nominal=300000000.000000), last_clock=4574786550781
+[03:50:55.804] Clock sync initialized: freq=308128135 Hz, RTT=29.852 ms
+[03:50:55.805] Loading config: configs/generic-duet3-6hc.cfg
+[Config] Parsed 15 sections from configs/generic-duet3-6hc.cfg
+[Config] Created stepper_x: step=PC18 dir=PB5 step_dist=0.001563mm
+[Config] TMC5160 [stepper_x]: 1.000000A cs=PD17 chain=1/6 µsteps=128
+[Config] Created stepper_y: step=PC16 dir=PD10 step_dist=0.001563mm
+[Config] TMC5160 [stepper_y]: 1.000000A cs=PD17 chain=2/6 µsteps=128
+[Config] Created stepper_z: step=PC28 dir=PA4 step_dist=0.000625mm
+[Config] TMC5160 [stepper_z]: 1.000000A cs=PD17 chain=3/6 µsteps=64
+[Config] Created extruder stepper: step=PC1 step_dist=0.010469mm
+[Config] Created extruder heater PWM: pin=PA24
+[Config] Created extruder sensor ADC: pin=PC29
+[Config] TMC5160 [extruder]: 0.600000A cs=PD17 chain=4/6 µsteps=16
+[Config] Created fan PWM (heater_fan heatbreak_fan): pin=PC8
+[Config] Created heater_bed PWM: pin=PA7
+[Config] Created heater_bed sensor ADC: pin=PC15
+[Config] Created fan PWM (heater_fan heatbreak_fan): pin=PA15
+[Config] Created fan PWM (fan): pin=PC5
+[Config] Printer: cartesian vel=350.000000 accel=3000.000000
+[Config] Stepper enable pin: !PA9 (OID=17)
+[03:50:55.813]   [stepper_x] stepper OID=0 dist=0.0015625mm
+[03:50:55.814]   [stepper_y] stepper OID=3 dist=0.0015625mm
+[03:50:55.814]   [stepper_z] stepper OID=6 dist=0.000625mm
+[03:50:55.814]   [extruder] stepper OID=9 dist=0.010469mm
+[03:50:55.814]   [extruder_sensor] ADC pin=PC29
+[03:50:55.815]   [heater_bed_sensor] ADC pin=PC15
+[03:50:55.815]   [stepper_enable] digital out pin=PA9
+[03:50:55.815]   [stepper_x] TMC5160 run=1A hold=0.5A ms=128
+[03:50:55.816]   [stepper_y] TMC5160 run=1A hold=0.5A ms=128
+[03:50:55.816]   [stepper_z] TMC5160 run=1A hold=0.5A ms=64
+[03:50:55.816]   [extruder] TMC5160 run=0.6A hold=0.3A ms=16
+[03:50:55.817]   Printer: cartesian vel=350 accel=3000 scv=5
+[03:50:55.817] Creating TMC5160 SPI bus objects...
+[03:50:55.817] Finalizing MCU configuration...
+[KlipperMCU] MCU is in shutdown state, clearing...
+[KlipperMCU] Shutdown cleared, is_config=1 crc=676570742
+[KlipperMCU] MCU already configured (CRC match), sending 13 restart/init commands...
+[KlipperMCU] Configuration finalized (CRC=676570742, move_count=1024)
+[03:50:56.048] Config finalized! OIDs=19
+[ClockSync] Initialized: estFreq=308008491.481224 Hz (nominal=300000000.000000), last_clock=4575096095847
+[03:50:56.838] Clock sync re-initialized: freq=308008491 Hz, RTT=29.692 ms
+[03:50:56.839] Toolhead initialized
+[03:50:56.840] G-code parser initialized
+[03:50:56.840] Initializing TMC5160 drivers...
+[TMC5160:stepper_x] Current: run=1.000000A hold=0.500000A R_sense=0.050000 → GS=56 IRUN=31 IHOLD=15
+[TMC5160:stepper_x] Current: run=1.000000A hold=0.500000A R_sense=0.050000 → GS=56 IRUN=31 IHOLD=15
+[TMC5160:stepper_x] Initializing registers...
+  GSTAT=0x0
+  GLOBALSCALER=56
+  IHOLD_IRUN=0x61f0f (IRUN=31 IHOLD=15)
+  CHOPCONF=0x1410153 (mres=1 intpol=0)
+  PWMCONF=0xc40c001e
+  GCONF=0xc [StealthChop]
+  DRV_STATUS: CS=15 SG=0 [StChop] [Standstill]
+[TMC5160:stepper_x] Init complete
+[03:50:56.925]   [stepper_x] Init OK - CS=15 SG=0 [StChop] [Standstill]
+[TMC5160:stepper_y] Current: run=1.000000A hold=0.500000A R_sense=0.050000 → GS=56 IRUN=31 IHOLD=15
+[TMC5160:stepper_y] Current: run=1.000000A hold=0.500000A R_sense=0.050000 → GS=56 IRUN=31 IHOLD=15
+[TMC5160:stepper_y] Initializing registers...
+  GSTAT=0x0
+  GLOBALSCALER=56
+  IHOLD_IRUN=0x61f0f (IRUN=31 IHOLD=15)
+  CHOPCONF=0x1410153 (mres=1 intpol=0)
+  PWMCONF=0xc40c001e
+  GCONF=0xc [StealthChop]
+  DRV_STATUS: CS=15 SG=0 [StChop] [Standstill]
+[TMC5160:stepper_y] Init complete
+[03:50:57.065]   [stepper_y] Init OK - CS=15 SG=0 [StChop] [Standstill]
+[TMC5160:stepper_z] Current: run=1.000000A hold=0.500000A R_sense=0.050000 → GS=56 IRUN=31 IHOLD=15
+[TMC5160:stepper_z] Current: run=1.000000A hold=0.500000A R_sense=0.050000 → GS=56 IRUN=31 IHOLD=15
+[TMC5160:stepper_z] Initializing registers...
+  GSTAT=0x0
+  GLOBALSCALER=56
+  IHOLD_IRUN=0x61f0f (IRUN=31 IHOLD=15)
+  CHOPCONF=0x2410153 (mres=2 intpol=0)
+  PWMCONF=0xc40c001e
+  GCONF=0xc [StealthChop]
+  DRV_STATUS: CS=15 SG=0 [StChop] [Standstill]
+[TMC5160:stepper_z] Init complete
+[03:50:57.173]   [stepper_z] Init OK - CS=15 SG=0 [StChop] [Standstill]
+[TMC5160:extruder] Current: run=0.600000A hold=0.300000A R_sense=0.050000 → GS=33 IRUN=31 IHOLD=15
+[TMC5160:extruder] Current: run=0.600000A hold=0.300000A R_sense=0.050000 → GS=33 IRUN=31 IHOLD=15
+[TMC5160:extruder] Initializing registers...
+  GSTAT=0x0
+  GLOBALSCALER=33
+  IHOLD_IRUN=0x61f0f (IRUN=31 IHOLD=15)
+  CHOPCONF=0x4410153 (mres=4 intpol=0)
+  PWMCONF=0xc40c001e
+  GCONF=0xc [StealthChop]
+  DRV_STATUS: CS=15 SG=1023 [StChop] [Standstill]
+[TMC5160:extruder] Init complete
+[03:50:57.281]   [extruder] Init OK - CS=15 SG=1023 [StChop] [Standstill]
+[03:50:57.282] === Initialization complete ===
+[03:50:57.307] Loaded gcode: gcode\snegir.gcode (2516 lines)
+[03:50:57.308] Print init: estPrintTime=15250.824 initialTime=15252.824 clock=4575132598159 estFreq=307303801 nomFreq=300000000
+[03:50:57.308] Starting print...
+[03:50:57.308] After line 6 (content=1): pos=(0.000,0.000,0.000) printTime=15252.824 elapsed=0.000s [G90]
+[03:50:57.309] After line 7 (content=2): pos=(0.000,0.000,0.000) printTime=15252.824 elapsed=0.001s [G92 X0 Y0 Z0]
+[03:50:57.309] After line 8 (content=3): pos=(0.000,0.000,0.000) printTime=15252.824 elapsed=0.001s [G00 X0.0000 Y0.0000 Z0.0000 F2100]
+[03:50:57.309] After line 9 (content=4): pos=(0.000,0.000,5.000) printTime=15252.824 elapsed=0.001s [G00 X0.0000 Y0.0000 Z5.0000 F500]
+[03:50:57.310] After line 13 (content=5): pos=(36.175,57.206,5.000) printTime=15253.426 elapsed=0.002s [G00 X36.1751 Y57.2061 F2100]
+[03:50:57.310] After line 18 (content=10): pos=(34.232,61.028,-9.500) printTime=15265.162 elapsed=0.002s [G02 X34.2324 Y61.0279 I575.1790 J227.0138 F360.000]
+[03:50:57.311] Flush #1 at line 18/2516 elapsed=0.0s ahead=14.396s printTime=15265.223
+[03:51:00.889] << [95] stats count=272 sum=1560964 sumsq=151972177
+[03:51:06.005] << [95] stats count=110 sum=70605 sumsq=379145
+[03:51:10.043] Flush #2 at line 28/2516 elapsed=12.7s ahead=5.305s printTime=15268.857
+[03:51:11.008] << [95] stats count=113 sum=76801 sumsq=474072
+[03:51:13.634] Flush #3 at line 38/2516 elapsed=16.3s ahead=3.310s printTime=15270.452
+[03:51:15.154] Flush #4 at line 48/2516 elapsed=17.8s ahead=2.629s printTime=15271.290
+[03:51:16.088] << [95] stats count=282 sum=435445 sumsq=5493762
+[03:51:16.181] Flush #5 at line 58/2516 elapsed=18.9s ahead=3.316s printTime=15273.005
+[03:51:17.890] !!! MCU SHUTDOWN: Move queue overflow !!!
+[03:51:17.892] << [94] shutdown clock=-1317127174 static_string_id=15
+[03:51:17.893] << [93] is_shutdown static_string_id=15
+[03:51:17.893] << [93] is_shutdown static_string_id=15
+[03:51:17.893] << [93] is_shutdown static_string_id=15
+[03:51:17.894] << [93] is_shutdown static_string_id=15
+[03:51:17.894] << [93] is_shutdown static_string_id=15
+[03:51:17.894] << [93] is_shutdown static_string_id=15
+[03:51:17.894] << [93] is_shutdown static_string_id=15
+[03:51:17.895] << [93] is_shutdown static_string_id=15
+[03:51:17.895] << [93] is_shutdown static_string_id=15
+[03:51:17.895] << [93] is_shutdown static_string_id=15
+[03:51:17.895] << [93] is_shutdown static_string_id=15
+[03:51:17.896] << [93] is_shutdown static_string_id=15
+[03:51:17.896] << [93] is_shutdown static_string_id=15
+[03:51:17.896] << [93] is_shutdown static_string_id=15
+[03:51:17.896] << [93] is_shutdown static_string_id=15
+[03:51:17.897] << [93] is_shutdown static_string_id=15
+[03:51:17.897] << [93] is_shutdown static_string_id=15
+[03:51:17.897] << [93] is_shutdown static_string_id=15
+[03:51:17.897] << [93] is_shutdown static_string_id=15
+[03:51:17.898] << [93] is_shutdown static_string_id=15
+[03:51:17.898] << [93] is_shutdown static_string_id=15
+[03:51:17.898] << [93] is_shutdown static_string_id=15
+[03:51:17.899] << [93] is_shutdown static_string_id=15
+[03:51:17.899] << [93] is_shutdown static_string_id=15
+[03:51:17.899] << [93] is_shutdown static_string_id=15
+[03:51:17.899] << [93] is_shutdown static_string_id=15
+[03:51:17.900] << [93] is_shutdown static_string_id=15
+[03:51:17.900] << [93] is_shutdown static_string_id=15
+[03:51:18.247] Flushing remaining moves...
+[03:51:18.251] Final position: (4.760,66.926,-9.500) contentLines=60 flushes=6
+[03:51:18.252] Print finished: 2516 lines, 20.9s, 0 errors
+[03:51:18.252] Waiting for MCU to finish executing steps...
+[03:51:18.252] Done.
+[03:51:18.529] Disconnected.

@@ -1,0 +1,74 @@
+[StepGen] Phase1 done: cmds=67 steps[0]=25 steps[1]=22 steps[2]=12
+[StepGen] Phase2 start: genRange=[17386.356..17398.273] curPT=17384.405 ahead=[1.951..13.868] shutdown=0
+[StepGen] Phase2 done: totalSteps=59 timeThrottles=8 flowThrottles=0 cumulative=59
+[StepGen] Drain: target=17398.273 curPT=17398.790 waited=1093ms shutdown=0
+[StepGen] 14443ms
+[StepGen] Phase1 done: cmds=92 steps[0]=45 steps[1]=45 steps[2]=0
+[StepGen] Phase2 start: genRange=[17390.537..17399.100] curPT=17398.825 ahead=[-8.288..0.274] shutdown=0
+[StepGen] Phase2 done: totalSteps=90 timeThrottles=0 flowThrottles=1 cumulative=149
+[StepGen] Drain: target=17399.100 curPT=17399.619 waited=728ms shutdown=0
+[StepGen] 811ms
+[StepGen] Phase1 done: cmds=76 steps[0]=34 steps[1]=39 steps[2]=0
+[StepGen] Phase2 start: genRange=[17399.101..17400.524] curPT=17399.632 ahead=[-0.530..0.892] shutdown=0
+[StepGen] Phase2 done: totalSteps=73 timeThrottles=1 flowThrottles=1 cumulative=222
+[StepGen] Drain: target=17400.524 curPT=17401.030 waited=914ms shutdown=0
+[StepGen] 1409ms
+[StepGen] Phase1 done: cmds=88 steps[0]=42 steps[1]=43 steps[2]=0
+[StepGen] Phase2 start: genRange=[17400.524..17401.365] curPT=17401.043 ahead=[-0.519..0.322] shutdown=0
+[StepGen] Phase2 done: totalSteps=85 timeThrottles=0 flowThrottles=1 cumulative=307
+[StepGen] Drain: target=17401.365 curPT=17401.873 waited=776ms shutdown=0
+[StepGen] 842ms
+[StepGen] Phase1 done: cmds=78 steps[0]=38 steps[1]=38 steps[2]=0
+[StepGen] Phase2 start: genRange=[17401.427..17401.738] curPT=17401.885 ahead=[-0.458..-0.147] shutdown=0
+[StepGen] Phase2 done: totalSteps=76 timeThrottles=0 flowThrottles=1 cumulative=383
+[StepGen] Drain: target=17401.738 curPT=17402.442 waited=502ms shutdown=0
+[StepGen] 567ms
+[StepGen] Phase1 done: cmds=76 steps[0]=38 steps[1]=36 steps[2]=0
+[StepGen] Phase2 start: genRange=[17401.738..17402.390] curPT=17402.454 ahead=[-0.715..-0.064] shutdown=0
+[StepGen] Phase2 done: totalSteps=74 timeThrottles=0 flowThrottles=1 cumulative=457
+[StepGen] Drain: target=17402.390 curPT=17403.009 waited=502ms shutdown=0
+[StepGen] 565ms
+[StepGen] Phase1 done: cmds=81 steps[0]=39 steps[1]=40 steps[2]=0
+[StepGen] Phase2 start: genRange=[17402.391..17402.789] curPT=17403.019 ahead=[-0.628..-0.230] shutdown=0
+[StepGen] Phase2 done: totalSteps=79 timeThrottles=0 flowThrottles=1 cumulative=536
+[StepGen] Drain: target=17402.789 curPT=17403.588 waited=515ms shutdown=0
+[StepGen] 579ms
+[StepGen] Phase1 done: cmds=75 steps[0]=38 steps[1]=33 steps[2]=0
+[StepGen] Phase2 start: genRange=[17402.790..17403.043] curPT=17403.599 ahead=[-0.810..-0.556] shutdown=0
+[StepGen] Phase2 done: totalSteps=71 timeThrottles=0 flowThrottles=1 cumulative=607
+[StepGen] Drain: target=17403.043 curPT=17404.156 waited=501ms shutdown=0
+[StepGen] 566ms
+[StepGen] Phase1 done: cmds=76 steps[0]=36 steps[1]=37 steps[2]=0
+[StepGen] Phase2 start: genRange=[17403.061..17403.774] curPT=17404.167 ahead=[-1.107..-0.393] shutdown=0
+[StepGen] Phase2 done: totalSteps=73 timeThrottles=0 flowThrottles=1 cumulative=680
+[StepGen] Drain: target=17403.774 curPT=17404.735 waited=514ms shutdown=0
+[StepGen] 579ms
+[StepGen] Phase1 done: cmds=75 steps[0]=38 steps[1]=35 steps[2]=0
+[StepGen] Phase2 start: genRange=[17403.777..17404.013] curPT=17404.748 ahead=[-0.971..-0.735] shutdown=0
+[StepGen] Phase2 done: totalSteps=73 timeThrottles=0 flowThrottles=1 cumulative=753
+[StepGen] Drain: target=17404.013 curPT=17405.302 waited=501ms shutdown=0
+[StepGen] 565ms
+[StepGen] Phase1 done: cmds=81 steps[0]=38 steps[1]=39 steps[2]=0
+[StepGen] Phase2 start: genRange=[17404.018..17404.345] curPT=17405.314 ahead=[-1.296..-0.970] shutdown=0
+[StepGen] Phase2 done: totalSteps=77 timeThrottles=0 flowThrottles=1 cumulative=830
+[StepGen] Drain: target=17404.345 curPT=17405.882 waited=515ms shutdown=0
+[StepGen] 577ms
+[StepGen] Phase1 done: cmds=87 steps[0]=44 steps[1]=41 steps[2]=0
+[StepGen] Phase2 start: genRange=[17404.358..17404.555] curPT=17405.893 ahead=[-1.536..-1.338] shutdown=0
+[StepGen] Phase2 done: totalSteps=85 timeThrottles=0 flowThrottles=1 cumulative=915
+[StepGen] Drain: target=17404.555 curPT=17406.449 waited=500ms shutdown=0
+[StepGen] 566ms
+[StepGen] Phase1 done: cmds=70 steps[0]=32 steps[1]=34 steps[2]=0
+[StepGen] Phase2 start: genRange=[17404.557..17404.663] curPT=17406.461 ahead=[-1.904..-1.798] shutdown=0
+[StepGen] Phase2 done: totalSteps=66 timeThrottles=0 flowThrottles=1 cumulative=981
+[StepGen] Drain: target=17404.663 curPT=17407.018 waited=505ms shutdown=0
+[StepGen] 567ms
+[StepGen] Phase1 done: cmds=86 steps[0]=43 steps[1]=41 steps[2]=0
+[StepGen] Phase2 start: genRange=[17404.663..17404.958] curPT=17407.030 ahead=[-2.367..-2.072] shutdown=0
+[StepGen] Phase2 done: totalSteps=84 timeThrottles=0 flowThrottles=1 cumulative=1065
+[StepGen] Drain: target=17404.958 curPT=17407.587 waited=503ms shutdown=0
+[StepGen] 567ms
+[StepGen] Phase1 done: cmds=90 steps[0]=43 steps[1]=43 steps[2]=0
+[StepGen] Phase2 start: genRange=[17404.999..17405.410] curPT=17407.599 ahead=[-2.599..-2.189] shutdown=0
+[KlipperMCU] !!! SHUTDOWN: Move queue overflow !!!
+[04:26:55.100] ERROR: Session ended due to MCU shutdown!

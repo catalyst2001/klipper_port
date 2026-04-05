@@ -51,10 +51,12 @@ bool MCU_digital_out::buildConfig() {
         << " max_duration=" << mdurTicks;
     m_mcu.addConfigCmd(cfg.str());
 
-    // Restart command: reset to shutdown value
+    // Restart command: restore to start value (not shutdown value!)
+    // On restart/reconnect, the pin should return to its working state.
+    // E.g. stepper enable pin must stay active after restart.
     std::ostringstream rst;
     rst << "update_digital_out oid=" << m_oid
-        << " value=" << (m_shutdownValue ? 1 : 0);
+        << " value=" << (m_startValue ? 1 : 0);
     m_mcu.addRestartCmd(rst.str());
 
     m_lastValue = m_startValue;

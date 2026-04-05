@@ -86,6 +86,18 @@ bool MCU_stepper::queueStep(int64_t interval, int64_t count, int64_t add) {
     return m_mcu.sendCommand("queue_step", params);
 }
 
+bool MCU_stepper::queueStepBatched(int64_t interval, int64_t count, int64_t add) {
+    std::map<std::string, int64_t> params = {
+        {"oid", m_oid},
+        {"interval", interval},
+        {"count", count},
+        {"add", add}
+    };
+    auto payload = m_mcu.encodeCommandPayload("queue_step", params);
+    if (payload.empty()) return false;
+    return m_mcu.queuePayload(payload);
+}
+
 bool MCU_stepper::setNextStepDir(bool forward) {
     bool dir = forward ^ m_invertDir;
     m_curDir = forward;
@@ -94,6 +106,18 @@ bool MCU_stepper::setNextStepDir(bool forward) {
         {"dir", dir ? 1 : 0}
     };
     return m_mcu.sendCommand("set_next_step_dir", params);
+}
+
+bool MCU_stepper::setNextStepDirBatched(bool forward) {
+    bool dir = forward ^ m_invertDir;
+    m_curDir = forward;
+    std::map<std::string, int64_t> params = {
+        {"oid", m_oid},
+        {"dir", dir ? 1 : 0}
+    };
+    auto payload = m_mcu.encodeCommandPayload("set_next_step_dir", params);
+    if (payload.empty()) return false;
+    return m_mcu.queuePayload(payload);
 }
 
 bool MCU_stepper::resetStepClock(int64_t clock) {
@@ -107,6 +131,19 @@ bool MCU_stepper::resetStepClock(int64_t clock) {
         m_clockInitialized = true;
     }
     return ok;
+}
+
+bool MCU_stepper::resetStepClockBatched(int64_t clock) {
+    std::map<std::string, int64_t> params = {
+        {"oid", m_oid},
+        {"clock", static_cast<int64_t>(static_cast<uint32_t>(clock))}
+    };
+    auto payload = m_mcu.encodeCommandPayload("reset_step_clock", params);
+    if (payload.empty()) return false;
+    if (!m_mcu.queuePayload(payload)) return false;
+    m_lastStepClock = clock;
+    m_clockInitialized = true;
+    return true;
 }
 
 // ========== MCU_endstop ==========

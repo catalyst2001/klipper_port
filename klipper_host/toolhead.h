@@ -1,5 +1,6 @@
 #pragma once
 
+#include "clock_sync.h"
 #include "trapq.h"
 #include "stepper.h"
 #include "input_shaper.h"
@@ -58,7 +59,7 @@ public:
     bool generateSteps();
 
     // Reset sync state — call at actual print start/end, not at every flush
-    void resetSyncState() { m_needStartSync = true; m_needCheckPause = -1.0; }
+    void resetSyncState() { m_needStartSync = true; m_needCheckPause = -1.0; m_stepClockSnapValid = false; }
 
     // Input shaper access
     InputShaper& getInputShaper() { return m_inputShaper; }
@@ -98,6 +99,12 @@ private:
     // Input shaper
     InputShaper m_inputShaper;
 
+    // Persistent clock snapshot for step clock computation.
+    // Taken once at the start of step generation and reused for ALL batches
+    // to avoid inter-call drift from changing frequency estimates.
+    ClockSync::ClockSnapshot m_stepClockSnap{};
+    bool m_stepClockSnapValid = false;
+
     // Lookahead: reverse + forward pass, then flush
     // lazy=true: only flush moves up to confirmed velocity peak (partial flush)
     // lazy=false: flush all moves (force complete stop at end)
@@ -115,7 +122,8 @@ private:
 
     // Generate steps for a single axis across all TrapMoves using input shaping
     // Uses secant/bisection method (Klipper's itersolve approach)
-    void generateShapedAxisSteps(int axis, const std::vector<TrapMove>& moves);
+    void generateShapedAxisSteps(int axis, const std::vector<TrapMove>& moves,
+                                  const ClockSync::ClockSnapshot& snap);
 
     // Clock-gate: wait until targetClock is within safe MCU timer range.
     // Returns false if MCU disconnected/shutdown (caller should abort).

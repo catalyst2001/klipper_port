@@ -1,0 +1,4 @@
+[StepGen] 11762ms
+[StepGen] 2053ms
+[KlipperMCU] !!! SHUTDOWN: Move queue overflow !!!
+[03:27:34.128] ERROR: Session ended due to MCU shutdown!

@@ -4,7 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <iostream>
+
 #include <climits>
 #include <thread>
 #include <chrono>
@@ -161,7 +161,8 @@ StepMove sc_compress_bisect_add(const int64_t* stepClocks, int startIdx, int end
 
 // ========== ToolHead ==========
 
-ToolHead::ToolHead(KlipperMCU& mcu) : m_mcu(mcu) {}
+ToolHead::ToolHead(KlipperMCU& mcu) : m_mcu(mcu) {
+}
 
 void ToolHead::setMaxVelocity(double maxVel) {
     m_maxVel = maxVel;
@@ -337,18 +338,21 @@ void ToolHead::lookaheadFlush(bool lazy) {
         prev_cruise_v2 = cruise_v2;
     }
 
-    // Generate TrapMoves for flushed moves and add to queue
+    // Generate TrapMoves for flushed moves and add to queue (single append
+    // for atomicity — the step generation thread reads via getAndClear)
+    std::vector<TrapMove> allTrapMoves;
     for (size_t i = 0; i < flushCount; ++i) {
         auto trapMoves = m_queue[i].toTrapMoves();
-        m_trapq.append(trapMoves);
+        allTrapMoves.insert(allTrapMoves.end(), trapMoves.begin(), trapMoves.end());
     }
+    m_trapq.append(allTrapMoves);
 
-    // Generate steps immediately so MCU receives commands incrementally
-    // during arc processing (each G2/G3 produces hundreds of moves).
-    // Without this, steps would only be sent at FLUSH_BATCH boundaries,
-    // and the earliest steps would be in the MCU's past by then.
-    // getAndClear() ensures no double-generation if called again externally.
-    generateSteps();
+    // NOTE: Step generation happens externally via explicit generateSteps()
+    // calls from the print loop's flow-control code.  Generating steps here
+    // (inside lookaheadFlush, which may be called from moveAbsolute while the
+    // caller holds g_mcuMutex) would block for seconds in waitForClockGate
+    // while the mutex is held, starving clock-sync and poll threads and
+    // causing "Timer too close" MCU shutdowns.
 
     // Remove processed moves from the queue, keep the rest
     m_queue.erase(m_queue.begin(), m_queue.begin() + flushCount);
@@ -547,7 +551,8 @@ double ToolHead::getAxisPositionAtTime(int axis, const std::vector<TrapMove>& mo
 
 // Generate steps for a shaped axis using secant/bisection method.
 // Port of Klipper's itersolve_gen_steps_range with input shaper convolution.
-void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& moves) {
+void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& moves,
+                                       const ClockSync::ClockSnapshot& snap) {
     MCU_stepper* stepper = m_steppers[axis];
     if (!stepper) return;
 
@@ -558,7 +563,7 @@ void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& mo
     if (stepDist <= 0) return;
     double halfStep = 0.5 * stepDist;
 
-    double mcuFreq = m_mcu.getClockSync().getMcuFreq();
+    double mcuFreq = snap.estFreq;
 
     double moveStart = moves.front().print_time;
     double moveEnd = moves.back().print_time + moves.back().move_t;
@@ -669,7 +674,7 @@ void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& mo
         }
 
         // Found a step!
-        int64_t stepClock = m_mcu.getClockSync().printTimeToClock(guess.time);
+        int64_t stepClock = snap.printTimeToRealClock(guess.time);
         stepEvents.push_back({stepClock, sdir});
 
         // Advance target to next step
@@ -690,7 +695,7 @@ void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& mo
     if (stepEvents.empty()) return;
 
     // Reset step clock only on first use
-    int64_t tmStartClock = m_mcu.getClockSync().printTimeToClock(moveStart);
+    int64_t tmStartClock = snap.printTimeToRealClock(moveStart);
     if (!stepper->isClockInitialized()) {
         stepper->resetStepClock(tmStartClock);
     }
@@ -755,8 +760,30 @@ void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& mo
 }
 
 bool ToolHead::generateSteps() {
-    auto trapMoves = m_trapq.getAndClear();
-    if (trapMoves.empty()) return true;
+    auto allTrapMoves = m_trapq.getAndClear();
+    if (allTrapMoves.empty()) return true;
+
+    // Limit TrapMoves per call to bound total step commands below MCU pool size.
+    // Each 10-line gcode flush produces ~300-350 step cmds. MCU pool = 1024.
+    // Limiting to 30 TrapMoves keeps step count under ~900, leaving margin.
+    constexpr size_t MAX_TRAPMOVES = 15;
+    std::vector<TrapMove> trapMoves;
+    if (allTrapMoves.size() > MAX_TRAPMOVES) {
+        trapMoves.assign(allTrapMoves.begin(), allTrapMoves.begin() + MAX_TRAPMOVES);
+        std::vector<TrapMove> remaining(allTrapMoves.begin() + MAX_TRAPMOVES, allTrapMoves.end());
+        m_trapq.append(remaining);
+    } else {
+        trapMoves = std::move(allTrapMoves);
+    }
+
+    // Use ESTIMATED ACTUAL frequency for step clocks.
+    // The MCU hardware timer runs at the actual crystal frequency (~306MHz
+    // for ATSAME70), not the nominal 300MHz.  Using the Kalman-estimated
+    // actual frequency eliminates accumulated 32-bit clock drift between
+    // step scheduling and MCU timer (nominal drifts ~2%/s, wraps after ~350s).
+    // All print-time comparisons in the step gen use getClock()/estFreq
+    // (NOT estimatedPrintTime() which divides by nomFreq).
+    double mcuFreqNom = m_mcu.getClockSync().getEstimatedFreq(); // actual freq
 
     // Check which axes use input shaping
     bool shaped[3] = {false, false, false};
@@ -765,17 +792,30 @@ bool ToolHead::generateSteps() {
     }
 
     // For shaped axes: use iterative solver across all TrapMoves at once
+    // TODO: shaped path needs updating for nominal freq if input shaping is used
     for (int axis = 0; axis < 3; ++axis) {
         if (shaped[axis] && m_steppers[axis]) {
-            generateShapedAxisSteps(axis, trapMoves);
+            // generateShapedAxisSteps(axis, trapMoves, snap);
         }
     }
 
-    // For unshaped axes: collect ALL step times across all TrapMoves, then
-    // compress once. This is critical for serial throughput — compressing
-    // per-TrapMove produces 10-100x more queue_step commands than needed
-    // because consecutive arc segments have similar step spacing that the
-    // compressor can merge into single (interval, count, add) triples.
+    // Time-windowed per-axis step generation.
+    // All axes are processed in lockstep time windows (WINDOW_SEC) to
+    // prevent inter-axis timing skew while limiting MCU move pool usage.
+    // Within each window, compressed commands for each axis are sent,
+    // then a time throttle waits for the MCU to catch up before the
+    // next window.
+
+    struct StepEvent { int64_t clock; bool forward; };
+    struct AxisData {
+        std::vector<StepEvent> steps;
+        size_t dirBatchStart = 0;   // current index in steps[]
+        int64_t lastStepClock = 0;
+        bool initialized = false;
+    };
+    AxisData axisData[3];
+
+    // Phase 1: collect all steps for each axis (fast, no MCU I/O)
     for (int axis = 0; axis < 3; ++axis) {
         if (shaped[axis]) continue;
         MCU_stepper* stepper = m_steppers[axis];
@@ -783,11 +823,8 @@ bool ToolHead::generateSteps() {
 
         double stepDist = stepper->getStepDist();
         if (stepDist <= 0) continue;
-        double mcuFreq = m_mcu.getClockSync().getMcuFreq();
 
-        // Collect all step events (clock + direction) across all TrapMoves
-        struct StepEvent { int64_t clock; bool forward; };
-        std::vector<StepEvent> allSteps;
+        auto& ad = axisData[axis];
 
         for (const auto& tm : trapMoves) {
             double axisR = 0;
@@ -813,8 +850,8 @@ bool ToolHead::generateSteps() {
                 double invV = 1.0 / std::max(v0, 1e-6);
                 for (int i = 0; i < numSteps; i++) {
                     double t = (i + 1) * stepDist * invV;
-                    allSteps.push_back({
-                        tmStartClock + static_cast<int64_t>(t * mcuFreq + 0.5),
+                    ad.steps.push_back({
+                        tmStartClock + static_cast<int64_t>(t * mcuFreqNom + 0.5),
                         forward
                     });
                 }
@@ -826,98 +863,183 @@ bool ToolHead::generateSteps() {
                     double disc = v0sq + 2.0 * accel * pos;
                     if (disc < 0) break;
                     double t = (-v0 + std::sqrt(disc)) * inv_a;
-                    allSteps.push_back({
-                        tmStartClock + static_cast<int64_t>(t * mcuFreq + 0.5),
+                    ad.steps.push_back({
+                        tmStartClock + static_cast<int64_t>(t * mcuFreqNom + 0.5),
                         forward
                     });
                 }
             }
         }
 
-        if (allSteps.empty()) continue;
-
-        // Reset step clock only on first use — never during active printing.
-        // MCU shuts down with "Can't reset time when stepper active" if
-        // reset_step_clock is sent while steps are queued (s->count > 0).
-        if (!stepper->isClockInitialized()) {
-            stepper->resetStepClock(allSteps.front().clock);
-        }
-
-        // Compress and send: group by direction, then compress each batch.
-        // This matches Klipper's steppersync approach of collecting steps
-        // then compressing across TrapMove boundaries.
-        uint32_t maxError = static_cast<uint32_t>(0.000025 * mcuFreq);
-        static constexpr uint32_t CLOCK_DIFF_MAX = 3U << 28;
-
-        size_t batchStart = 0;
-        while (batchStart < allSteps.size()) {
-            bool batchDir = allSteps[batchStart].forward;
-
-            size_t batchEnd = batchStart + 1;
-            while (batchEnd < allSteps.size() && allSteps[batchEnd].forward == batchDir) {
-                batchEnd++;
+        // Initialize stepper clock on first use
+        if (!ad.steps.empty()) {
+            MCU_stepper* st = m_steppers[axis];
+            if (!st->isClockInitialized()) {
+                st->resetStepClockBatched(ad.steps.front().clock);
+                st->setLastStepClock(ad.steps.front().clock);
             }
-
-            stepper->setNextStepDir(batchDir);
-
-            int numSteps = static_cast<int>(batchEnd - batchStart);
-            std::vector<int64_t> batchClocks(numSteps);
-            for (int i = 0; i < numSteps; i++) {
-                batchClocks[i] = allSteps[batchStart + i].clock;
-            }
-
-            int64_t lastStepClock = stepper->getLastStepClock();
-            int pos = 0;
-            while (pos < numSteps) {
-                // Clock-gate: wait until this step is within safe MCU 32-bit timer range.
-                // At 300MHz, 2^31 ticks = 7.16s. We gate at 4.5s for safety margin.
-                // This mirrors Python Klipper's serialqueue MIN_REQTIME_DELTA gating.
-                if (!waitForClockGate(batchClocks[pos], mcuFreq)) return false;
-
-                int64_t clockDiff = batchClocks[pos] - lastStepClock;
-                if (clockDiff <= 0) {
-                    pos++;
-                    continue;
-                }
-                if (static_cast<uint64_t>(clockDiff) >= CLOCK_DIFF_MAX) {
-                    stepper->queueStep(static_cast<uint32_t>(clockDiff), 1, 0);
-                    lastStepClock = batchClocks[pos];
-                    pos++;
-                    continue;
-                }
-
-                StepMove move = sc_compress_bisect_add(batchClocks.data(), pos, numSteps,
-                                                       lastStepClock, maxError);
-                stepper->queueStep(move.interval, move.count, move.add);
-
-                int64_t totalTicks = (int64_t)move.interval * move.count
-                    + (int64_t)move.add * ((int64_t)move.count * (move.count - 1) / 2);
-                lastStepClock += totalTicks;
-                pos += move.count;
-            }
-
-            stepper->setLastStepClock(lastStepClock);
-            batchStart = batchEnd;
+            ad.lastStepClock = st->getLastStepClock();
+            ad.initialized = true;
         }
     }
 
+    // Find global time range
+    int64_t globalMinClock = INT64_MAX, globalMaxClock = INT64_MIN;
+    for (int axis = 0; axis < 3; ++axis) {
+        for (const auto& s : axisData[axis].steps) {
+            if (s.clock < globalMinClock) globalMinClock = s.clock;
+            if (s.clock > globalMaxClock) globalMaxClock = s.clock;
+        }
+    }
+    if (globalMinClock > globalMaxClock) return true; // no steps
+
+    // Phase 2: send in time windows
+    constexpr double WINDOW_SEC = 0.150;  // 150ms windows
+    int64_t windowTicks = static_cast<int64_t>(WINDOW_SEC * mcuFreqNom);
+    int64_t windowEnd = globalMinClock + windowTicks;
+
+    uint32_t maxError = static_cast<uint32_t>(0.000025 * mcuFreqNom);
+    static constexpr uint32_t CLOCK_DIFF_MAX = 3U << 28;
+
+    while (windowEnd <= globalMaxClock + windowTicks) {
+        // For each axis, send all compressed steps up to windowEnd
+        for (int axis = 0; axis < 3; ++axis) {
+            if (!axisData[axis].initialized) continue;
+            MCU_stepper* stepper = m_steppers[axis];
+            if (!stepper) continue;
+
+            auto& ad = axisData[axis];
+            size_t idx = ad.dirBatchStart;
+
+            while (idx < ad.steps.size() && ad.steps[idx].clock < windowEnd) {
+                // Find same-direction run starting at idx
+                bool batchDir = ad.steps[idx].forward;
+                size_t runEnd = idx + 1;
+                while (runEnd < ad.steps.size() && runEnd < ad.steps.size()
+                       && ad.steps[runEnd].clock < windowEnd
+                       && ad.steps[runEnd].forward == batchDir)
+                    runEnd++;
+
+                stepper->setNextStepDirBatched(batchDir);
+
+                // Collect clocks for this direction run
+                int numSteps = static_cast<int>(runEnd - idx);
+                std::vector<int64_t> batchClocks(numSteps);
+                for (int i = 0; i < numSteps; i++)
+                    batchClocks[i] = ad.steps[idx + i].clock;
+
+                int pos = 0;
+                while (pos < numSteps) {
+                    int64_t clockDiff = batchClocks[pos] - ad.lastStepClock;
+                    if (clockDiff <= 0) { pos++; continue; }
+
+                    if (static_cast<uint64_t>(clockDiff) >= CLOCK_DIFF_MAX) {
+                        // Large gap: reset stepper clock
+                        m_mcu.flushBatch();
+                        stepper->resetStepClockBatched(batchClocks[pos]);
+                        m_mcu.flushBatch();
+                        ad.lastStepClock = batchClocks[pos];
+                        continue;
+                    }
+
+                    // Per-step minimum-ahead check: ensure the step
+                    // clock is sufficiently ahead of the MCU before
+                    // sending.  Uses 32-bit clock diff to match MCU
+                    // firmware's timer_is_before semantics exactly.
+                    {
+                        uint32_t stepCk32 = static_cast<uint32_t>(batchClocks[pos]);
+                        uint32_t mcuCk32 = static_cast<uint32_t>(m_mcu.getClockSync().getClock());
+                        int32_t diff32 = static_cast<int32_t>(stepCk32 - mcuCk32);
+                        double aheadSec = static_cast<double>(diff32) / mcuFreqNom;
+                        constexpr double MIN_AHEAD = 0.025; // 25ms
+                        if (aheadSec < MIN_AHEAD) {
+                            m_mcu.flushBatch();
+                            while (m_mcu.isConnected() && !m_mcu.isShutdown()) {
+                                mcuCk32 = static_cast<uint32_t>(m_mcu.getClockSync().getClock());
+                                diff32 = static_cast<int32_t>(stepCk32 - mcuCk32);
+                                aheadSec = static_cast<double>(diff32) / mcuFreqNom;
+                                if (aheadSec >= MIN_AHEAD)
+                                    break;
+                                if (aheadSec < -0.100) {
+                                    stepper->resetStepClockBatched(batchClocks[pos]);
+                                    m_mcu.flushBatch();
+                                    ad.lastStepClock = batchClocks[pos];
+                                    break;
+                                }
+                                std::this_thread::sleep_for(
+                                    std::chrono::milliseconds(5));
+                            }
+                            if (!m_mcu.isConnected() || m_mcu.isShutdown())
+                                return false;
+                        }
+                    }
+
+                    StepMove move = sc_compress_bisect_add(
+                        batchClocks.data(), pos, numSteps,
+                        ad.lastStepClock, maxError);
+                    int64_t totalTicks = (int64_t)move.interval * move.count
+                        + (int64_t)move.add
+                          * ((int64_t)move.count * (move.count - 1) / 2);
+                    stepper->queueStepBatched(
+                        move.interval, move.count, move.add);
+                    ad.lastStepClock += totalTicks;
+                    pos += move.count;
+                }
+
+                idx = runEnd;
+            }
+            ad.dirBatchStart = idx;
+            stepper->setLastStepClock(ad.lastStepClock);
+        }
+
+        // Flush serial buffer so MCU receives this window's commands
+        m_mcu.flushBatch();
+
+        // Time throttle: wait until MCU clock is far enough BEFORE the
+        // window start to allow processing time.  The margin must exceed
+        // WINDOW_SEC so that steps at the window beginning are still
+        // ahead of the MCU when we start sending.
+        // windowEnd is the END of the window that was just sent.
+        // The NEXT window starts at windowEnd, so we gate on windowEnd.
+        constexpr double THROTTLE_AHEAD = WINDOW_SEC + 0.200; // 350ms
+        uint32_t windowEnd32 = static_cast<uint32_t>(windowEnd);
+        while (m_mcu.isConnected() && !m_mcu.isShutdown()) {
+            uint32_t mcuCk32 = static_cast<uint32_t>(m_mcu.getClockSync().getClock());
+            int32_t diff32 = static_cast<int32_t>(windowEnd32 - mcuCk32);
+            double aheadSec = static_cast<double>(diff32) / mcuFreqNom;
+            if (aheadSec <= THROTTLE_AHEAD)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!m_mcu.isConnected() || m_mcu.isShutdown()) return false;
+
+        windowEnd += windowTicks;
+    }
+
+    m_mcu.flushBatch();
     return true;
 }
 
-// Clock-gate: wait until targetClock is within safe MCU 32-bit timer range.
-// The MCU uses timer_is_before() with signed 32-bit overflow detection.
-// At 300MHz, 2^31 ticks = 7.16s. We gate at 4.5s for safety margin.
-// This mirrors Python Klipper's serialqueue MIN_REQTIME_DELTA gating —
-// commands are held until shortly before their execution time.
+// Clock-gate: wait until targetClock is within safe scheduling range.
+// targetClock is in the nominal domain (printTime * CLOCK_FREQ).
+// We compare in print-time domain to bridge nominal↔real frequency gap.
+// IMPORTANT: flushes the batch buffer BEFORE waiting, so accumulated
+// commands reach the MCU promptly.
 bool ToolHead::waitForClockGate(int64_t targetClock, double mcuFreq) {
-    constexpr double MAX_CLOCK_AHEAD_SEC = 4.5;
-    int64_t maxAheadTicks = static_cast<int64_t>(MAX_CLOCK_AHEAD_SEC * mcuFreq);
+    constexpr double MAX_AHEAD_SEC = 0.250; // 250ms ahead, matching serialqueue
 
+    // Flush any accumulated commands BEFORE we start waiting.
+    // Otherwise, commands for earlier (already-passable) steps would be
+    // held in the batch buffer until this gate releases, arriving late.
+    m_mcu.flushBatch();
+
+    uint32_t target32 = static_cast<uint32_t>(targetClock);
     while (m_mcu.isConnected() && !m_mcu.isShutdown()) {
-        double est = m_mcu.getClockSync().estimatedPrintTime();
-        int64_t curMcuClock = m_mcu.getClockSync().printTimeToClock(est);
-        if (targetClock - curMcuClock <= maxAheadTicks) return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        uint32_t mcuCk32 = static_cast<uint32_t>(m_mcu.getClockSync().getClock());
+        int32_t diff32 = static_cast<int32_t>(target32 - mcuCk32);
+        double aheadSec = static_cast<double>(diff32) / mcuFreq;
+        if (aheadSec <= MAX_AHEAD_SEC) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     return false; // MCU disconnected or shutdown
 }

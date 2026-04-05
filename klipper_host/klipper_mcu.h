@@ -180,8 +180,23 @@ public:
     // Request a move queue slot (needed for scheduled commands)
     void requestMoveQueueSlot();
 
+    // ---- Command Batching ----
+    // Encode a command into raw bytes (without sending)
+    std::vector<uint8_t> encodeCommandPayload(const std::string& cmdName,
+        const std::map<std::string, int64_t>& intParams = {},
+        const std::map<std::string, std::vector<uint8_t>>& bufParams = {});
+
+    // Queue an encoded command payload for batched sending.
+    // Automatically flushes when the message would exceed MESSAGE_PAYLOAD_MAX.
+    bool queuePayload(const std::vector<uint8_t>& payload);
+
+    // Flush any accumulated batch payloads as a single message.
+    bool flushBatch();
+
 private:
     SerialPort m_serial;
+    std::string m_portName;
+    uint32_t m_baudRate = 250000;
     uint8_t m_sendSeq = 0;
     uint8_t m_recvSeq = 0;
     bool m_needSync = true;
@@ -226,6 +241,15 @@ private:
     std::string m_shutdownMsg;
     mutable std::mutex m_shutdownMutex;
     ShutdownCallback m_shutdownCallback;
+
+    // Serial write mutex — serializes sendRawFrame across threads.
+    // generateSteps() sends queue_step commands without the application-level
+    // mutex, while pollThread/clockSyncThread also access the serial port.
+    // This mutex prevents interleaved WriteFile calls and m_sendSeq races.
+    std::mutex m_sendMutex;
+
+    // Batch accumulator for command payloads
+    std::vector<uint8_t> m_batchBuf;
 
     // Expanded enumerations (fully expanded ranges, e.g. PA0=0, PA1=1, ...)
     std::map<std::string, std::map<std::string, int>> m_expandedEnums;

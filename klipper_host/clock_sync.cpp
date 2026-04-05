@@ -92,8 +92,9 @@ bool ClockSync::connect(KlipperMCU& mcu) {
         return false;
     }
 
-    std::cout << "[ClockSync] Initialized: freq=" << std::fixed
-              << getEstimatedFreq() << " Hz, last_clock=" << m_lastClock << std::endl;
+    std::cout << "[ClockSync] Initialized: estFreq=" << std::fixed
+              << getEstimatedFreq() << " Hz (nominal=" << m_mcuFreq
+              << "), last_clock=" << m_lastClock << std::endl;
     return true;
 }
 
@@ -195,6 +196,15 @@ double ClockSync::estimatedPrintTime(double eventTime) const {
 
 double ClockSync::estimatedPrintTime() const {
     return estimatedPrintTime(hostTime());
+}
+
+int64_t ClockSync::getClock() const {
+    return getClock(hostTime());
+}
+
+ClockSync::ClockSnapshot ClockSync::getClockSnapshot() const {
+    double now = hostTime();
+    return {getClock(now), estimatedPrintTime(now), getEstimatedFreq()};
 }
 
 int64_t ClockSync::clock32ToClock64(uint32_t clock32) const {
