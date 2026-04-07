@@ -22,7 +22,8 @@ SerialQueue::~SerialQueue() {
 
 // ---- Public API ----
 
-bool SerialQueue::start(SerialPort& port, double baud_adjust) {
+bool SerialQueue::start(SerialPort& port, double baud_adjust,
+                        uint8_t initial_send_seq, uint8_t initial_receive_seq) {
     if (m_running.load()) return false;
     m_port = &port;
     m_bittimeAdjust = baud_adjust;
@@ -30,10 +31,13 @@ bool SerialQueue::start(SerialPort& port, double baud_adjust) {
     // Reset state
     m_inputPos = 0;
     m_needSync = true;
-    m_sendSeq = 1;
-    m_receiveSeq = 1;
+    // Sequence numbers must continue from KlipperMCU's current state.
+    // The MCU remembers its expected host seq; starting from 1 would cause
+    // a NAK storm because the MCU rejects frames with wrong sequence.
+    m_sendSeq = initial_send_seq;
+    m_receiveSeq = initial_send_seq;   // all prior sends are ACK'd
     m_ignoreNakSeq = 0;
-    m_lastAckSeq = 0;
+    m_lastAckSeq = initial_send_seq > 0 ? initial_send_seq - 1 : 0;
     m_retransmitSeq = 0;
     m_rttSampleSeq = 0;
     m_srtt = 0.0;
@@ -311,6 +315,15 @@ void SerialQueue::processInput() {
         uint8_t recv_seq_byte = m_inputBuf[MESSAGE_HEADER_SIZE - 1];
         uint8_t seq_nibble = recv_seq_byte & MESSAGE_SEQ_MASK;
 
+        // Collect callback data under m_lock, then invoke callback
+        // OUTSIDE m_lock to avoid recursive lock deadlock (SRWLOCK
+        // is non-recursive; the callback may call updateClockEstimate
+        // which also takes m_lock).
+        bool hasPayload = false;
+        uint8_t payloadBuf[MESSAGE_MAX];
+        int payloadLen = 0;
+        double cb_sent_time = 0.0, cb_receive_time = 0.0;
+
         {
             PlatformLockGuard lk(m_lock);
 
@@ -321,20 +334,19 @@ void SerialQueue::processInput() {
             int payloadStart = MESSAGE_HEADER_SIZE;
             int payloadEnd = msgLen - MESSAGE_TRAILER_SIZE;
             if (payloadEnd > payloadStart) {
-                const uint8_t* payload = m_inputBuf + payloadStart;
-                int payloadLen = payloadEnd - payloadStart;
+                payloadLen = payloadEnd - payloadStart;
+                std::memcpy(payloadBuf, m_inputBuf + payloadStart, payloadLen);
+                cb_sent_time = m_lastReceiveSentTime;
+                cb_receive_time = eventtime;
+                hasPayload = true;
 
-                // Calculate approximate sent time for this response
-                double sent_time = m_lastReceiveSentTime;
-                double receive_time = eventtime;
-
-                handleMessage(payload, payloadLen, eventtime);
-
-                // Also invoke user callback
-                if (m_receiveCallback) {
-                    m_receiveCallback(payload, payloadLen, sent_time, receive_time);
-                }
+                handleMessage(m_inputBuf + payloadStart, payloadLen, eventtime);
             }
+        }
+
+        // Invoke user callback outside m_lock
+        if (hasPayload && m_receiveCallback) {
+            m_receiveCallback(payloadBuf, payloadLen, cb_sent_time, cb_receive_time);
         }
 
         // Consume message from buffer
@@ -458,6 +470,64 @@ double SerialQueue::checkSendCommand(int buflen, double eventtime) {
     if (m_readyBytes == 0)
         return 0.0;  // nothing to send, no wake needed
 
+    // If a full frame's worth of data is ready, check if the commands
+    // are close enough to send immediately.  Commands with req_clocks
+    // far in the future must still be held by the MIN_REQTIME_DELTA gate
+    // to prevent 32-bit MCU clock wrapping issues.
+    static constexpr int MESSAGE_PAYLOAD_MAX = MESSAGE_MAX - MESSAGE_MIN;
+    if (m_readyBytes >= MESSAGE_PAYLOAD_MAX && m_ce.est_freq > 0.0) {
+        // Find minimum req_clock across all ready queues
+        uint64_t minReqClockFF = SQ_MAX_CLOCK;
+        for (auto* cq : m_readyQueues) {
+            if (!cq->ready.empty()) {
+                uint64_t rc = cq->ready.front().req_clock;
+                if (rc < minReqClockFF) minReqClockFF = rc;
+            }
+        }
+        if (minReqClockFF < SQ_MAX_CLOCK) {
+            double dt = eventtime - m_ce.conv_time;
+            uint64_t ack_clock_ff = static_cast<uint64_t>(
+                m_ce.conv_clock + static_cast<int64_t>(dt * m_ce.est_freq));
+            uint64_t maxAhead = static_cast<uint64_t>(2.0 * m_ce.est_freq);
+            if (minReqClockFF <= ack_clock_ff + maxAhead)
+                return -1.0; // PR_NOW — close enough, send immediately
+        } else {
+            return -1.0; // No clock-gated commands, send immediately
+        }
+        // Fall through to normal MIN_REQTIME_DELTA gate
+    } else if (m_readyBytes >= MESSAGE_PAYLOAD_MAX) {
+        return -1.0; // No freq info, send immediately
+    }
+
+    // MIN_REQTIME_DELTA gate: don't send commands until their req_clock
+    // is within ~100ms of the current estimated MCU clock.  This prevents
+    // flooding the MCU with step commands far ahead of execution,
+    // matching Python Klipper's serialqueue.c behavior.
+    if (m_ce.est_freq > 0.0) {
+        // Find minimum req_clock across all ready queues
+        uint64_t minReqClock = SQ_MAX_CLOCK;
+        for (auto* cq : m_readyQueues) {
+            if (!cq->ready.empty()) {
+                uint64_t rc = cq->ready.front().req_clock;
+                if (rc < minReqClock) minReqClock = rc;
+            }
+        }
+        if (minReqClock < SQ_MAX_CLOCK) {
+            double dt = eventtime - m_ce.conv_time;
+            uint64_t ack_clock = static_cast<uint64_t>(
+                m_ce.conv_clock + static_cast<int64_t>(dt * m_ce.est_freq));
+            if (m_needAckBytes > 0)
+                ack_clock += static_cast<uint64_t>(calculateBittime(m_needAckBytes) * m_ce.est_freq);
+            uint64_t reqDelta = static_cast<uint64_t>(SQ_MIN_REQTIME_DELTA * m_ce.est_freq);
+            if (minReqClock > ack_clock + reqDelta) {
+                // Command is too far in the future — sleep until it's within range
+                double sleepTime = static_cast<double>(
+                    static_cast<int64_t>(minReqClock - ack_clock - reqDelta)) / m_ce.est_freq;
+                return eventtime + (std::max)(0.001, sleepTime);
+            }
+        }
+    }
+
     return -1.0; // PR_NOW equivalent — send now
 }
 
@@ -479,6 +549,20 @@ int SerialQueue::buildAndSendCommand(uint8_t* buf, int pending, double eventtime
         if (!bestCQ) break;
 
         auto& qm = bestCQ->ready.front();
+
+        // Don't include commands with req_clock too far in the future.
+        // Sending 32-bit clock values > 2^31 ticks ahead of the MCU
+        // causes "Timer too close" because the MCU's signed comparison
+        // interprets them as being in the past.
+        if (m_ce.est_freq > 0.0 && qm.req_clock < SQ_MAX_CLOCK) {
+            double dt = eventtime - m_ce.conv_time;
+            uint64_t ack_ck = static_cast<uint64_t>(
+                m_ce.conv_clock + static_cast<int64_t>(dt * m_ce.est_freq));
+            // Max 5 seconds ahead (~1.5B ticks at 300MHz, well under 2^31)
+            uint64_t maxAhead = static_cast<uint64_t>(5.0 * m_ce.est_freq);
+            if (qm.req_clock > ack_ck + maxAhead)
+                break;  // stop filling frame — remaining commands too far ahead
+        }
 
         // Check if it fits in this frame
         if (len + qm.len > MESSAGE_MAX - MESSAGE_TRAILER_SIZE)

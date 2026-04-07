@@ -746,12 +746,20 @@ void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& mo
             StepMove move = sc_compress_bisect_add(batchClocks.data(), pos, numSteps,
                                                    lastStepClock, maxError);
 
-            uint64_t minCk = static_cast<uint64_t>(batchClocks[pos]);
-            stepper->queueStepTimed(move.interval, move.count, move.add,
-                                     minCk, minCk);
-
             int64_t totalTicks = (int64_t)move.interval * move.count
                 + (int64_t)move.add * ((int64_t)move.count * (move.count - 1) / 2);
+
+            // min_clock = steppersync avail (0 when slots free, future clock
+            // when full).  Do NOT use lastStepClock — that blocks the command
+            // until the MCU finishes the previous batch, causing stepper starvation.
+            // The MIN_REQTIME_DELTA gate in the SQ handles actual send timing.
+            uint64_t minCk = 0;
+            uint64_t endCk = static_cast<uint64_t>(lastStepClock + totalTicks);
+            uint64_t reqCk = static_cast<uint64_t>(batchClocks[pos]);
+            minCk = m_mcu.stepSyncAdjustMinClock(minCk, endCk);
+            stepper->queueStepTimed(move.interval, move.count, move.add,
+                                     minCk, reqCk);
+
             lastStepClock += totalTicks;
             pos += move.count;
         }
@@ -782,6 +790,33 @@ bool ToolHead::generateSteps() {
     auto allTrapMoves = m_trapq.getAndClear();
     if (allTrapMoves.empty()) return true;
 
+    // Limit the print_time span processed per call to avoid 32-bit clock
+    // wrapping.  At 300MHz the uint32 wraps every ~14.3s; steps more than
+    // 2^31 ticks (~7.16s) apart are ambiguous in 32-bit signed arithmetic
+    // and cause MCU "Timer too close" shutdowns.  Use 4 seconds as a
+    // conservative limit.
+    static constexpr double MAX_BATCH_TIME = 4.0;  // seconds of print_time
+    double batchStartTime = allTrapMoves.front().print_time;
+    double batchEndTimeLimit = batchStartTime + MAX_BATCH_TIME;
+
+    // Find the split point: include TrapMoves whose print_time is within limit
+    size_t processCount = allTrapMoves.size();
+    for (size_t i = 0; i < allTrapMoves.size(); ++i) {
+        if (allTrapMoves[i].print_time > batchEndTimeLimit) {
+            processCount = i;
+            break;
+        }
+    }
+    if (processCount == 0) processCount = 1;  // always process at least one
+
+    // Put remaining TrapMoves back for the next generateSteps call
+    if (processCount < allTrapMoves.size()) {
+        std::vector<TrapMove> deferred(
+            allTrapMoves.begin() + processCount, allTrapMoves.end());
+        allTrapMoves.resize(processCount);
+        m_trapq.prepend(deferred);  // push back to front for next call
+    }
+
     m_stepGenRunning.store(true, std::memory_order_release);
     struct RunGuard {
         std::atomic<bool>& flag;
@@ -792,7 +827,9 @@ bool ToolHead::generateSteps() {
     // SerialQueue handles clock-gating and flow control).
     std::vector<TrapMove>& trapMoves = allTrapMoves;
 
-    double mcuFreqNom = m_mcu.getClockSync().getEstimatedFreq();
+    // Step clocks use nominal frequency (printTimeToClock domain).
+    // This is self-consistent: printTimeToClock(estimatedPrintTime()) == getClock().
+    double mcuFreqNom = m_mcu.getClockSync().getMcuFreq();
 
     // Check which axes use input shaping
     bool shaped[3] = {false, false, false};
@@ -906,10 +943,6 @@ bool ToolHead::generateSteps() {
         int64_t lastStepClock;
         if (!stepper->isClockInitialized()) {
             int64_t resetClock = ad.firstTmStartClock;
-            std::cerr << "[StepGen] Reset clock axis=" << axis
-                      << " oid=" << stepper->getOid()
-                      << " clock=" << resetClock
-                      << " steps=" << ad.steps.size() << std::endl;
             stepper->resetStepClockTimed(resetClock,
                                           0, static_cast<uint64_t>(resetClock));
             lastStepClock = resetClock;
@@ -949,9 +982,13 @@ bool ToolHead::generateSteps() {
 
                 // CLOCK_DIFF_MAX handling: if the gap exceeds CDMAX,
                 // re-anchor with a reset_step_clock at the next step time.
+                // min_clock = lastStepClock so MCU waits until all prior
+                // queue_step commands have completed (count reaches 0)
+                // before processing the reset.
                 if (static_cast<uint64_t>(clockDiff) >= CLOCK_DIFF_MAX) {
+                    uint64_t resetMinClock = static_cast<uint64_t>(lastStepClock);
                     stepper->resetStepClockTimed(batchClocks[idx],
-                        0, static_cast<uint64_t>(batchClocks[idx]));
+                        resetMinClock, static_cast<uint64_t>(batchClocks[idx]));
                     lastStepClock = batchClocks[idx];
                     continue;
                 }
@@ -959,16 +996,26 @@ bool ToolHead::generateSteps() {
                 StepMove move = sc_compress_bisect_add(
                     batchClocks.data(), idx, numSteps,
                     lastStepClock, maxError);
+
+                if (move.count == 0) {
+                    idx++;
+                    continue;
+                }
+
                 int64_t totalTicks = (int64_t)move.interval * move.count
                     + (int64_t)move.add
                       * ((int64_t)move.count * (move.count - 1) / 2);
 
                 // Submit with clock-gating:
-                // min_clock = first step clock (don't send until MCU reaches this)
+                // min_clock = steppersync avail (0 when slots free).  Do NOT use
+                // lastStepClock — see generateAxisSteps for rationale.
                 // req_clock = first step clock (priority ordering)
-                uint64_t minCk = static_cast<uint64_t>(batchClocks[idx]);
+                uint64_t minCk = 0;
+                uint64_t endCk = static_cast<uint64_t>(lastStepClock + totalTicks);
+                uint64_t reqCk = static_cast<uint64_t>(batchClocks[idx]);
+                minCk = m_mcu.stepSyncAdjustMinClock(minCk, endCk);
                 stepper->queueStepTimed(move.interval, move.count, move.add,
-                                         minCk, minCk);
+                                         minCk, reqCk);
 
                 lastStepClock += totalTicks;
                 idx += move.count;

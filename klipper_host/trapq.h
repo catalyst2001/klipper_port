@@ -124,6 +124,9 @@ public:
     // Append sub-moves from a processed Move
     void append(const std::vector<TrapMove>& moves);
 
+    // Prepend moves (for returning unprocessed moves to the front)
+    void prepend(const std::vector<TrapMove>& moves);
+
     // Get all pending trap moves (for step generation)
     std::vector<TrapMove> getAndClear();
 
