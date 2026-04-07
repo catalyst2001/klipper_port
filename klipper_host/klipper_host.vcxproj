@@ -144,9 +144,12 @@
     <ClCompile Include="tmc5160.cpp" />
     <ClCompile Include="input_shaper.cpp" />
     <ClCompile Include="miniz_impl.cpp" />
+    <ClCompile Include="serial_queue.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="serial_port.h" />
+    <ClInclude Include="platform_sync.h" />
+    <ClInclude Include="serial_queue.h" />
     <ClInclude Include="klipper_proto.h" />
     <ClInclude Include="klipper_mcu.h" />
     <ClInclude Include="clock_sync.h" />

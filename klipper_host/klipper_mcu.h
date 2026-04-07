@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serial_port.h"
+#include "serial_queue.h"
 #include "klipper_proto.h"
 #include "clock_sync.h"
 
@@ -107,6 +108,10 @@ public:
     // Returns false if MCU is unresponsive.
     bool clockSyncPoll();
 
+    // Async clock sync poll via SerialQueue (non-blocking).
+    // Sends get_clock through SerialQueue; response handled by receive callback.
+    void clockSyncPollAsync();
+
     // ---- OID Management ----
     // Allocate a new OID. Returns the next sequential OID number.
     int createOid();
@@ -180,7 +185,7 @@ public:
     // Request a move queue slot (needed for scheduled commands)
     void requestMoveQueueSlot();
 
-    // ---- Command Batching ----
+    // ---- Command Batching (legacy path, used only before SerialQueue starts) ----
     // Encode a command into raw bytes (without sending)
     std::vector<uint8_t> encodeCommandPayload(const std::string& cmdName,
         const std::map<std::string, int64_t>& intParams = {},
@@ -192,6 +197,34 @@ public:
 
     // Flush any accumulated batch payloads as a single message.
     bool flushBatch();
+
+    // ---- SerialQueue (background-threaded serial with clock-gating) ----
+    // Start the SerialQueue background thread. Call after finalizeConfig() + initClockSync().
+    bool startSerialQueue();
+
+    // Stop the SerialQueue background thread.
+    void stopSerialQueue();
+
+    // Get the SerialQueue (for step generation to submit commands directly).
+    SerialQueue& getSerialQueue() { return m_serialQueue; }
+    const SerialQueue& getSerialQueue() const { return m_serialQueue; }
+
+    // Check if SerialQueue is active (i.e., started and running).
+    bool isSerialQueueActive() const { return m_serialQueue.isRunning(); }
+
+    // Submit a timed command via SerialQueue.
+    // cmdName: command name (e.g. "queue_step")
+    // min_clock, req_clock: clock-gating parameters
+    // cq: CommandQueue to use (nullptr = default queue)
+    void sendTimed(const std::string& cmdName,
+                   const std::map<std::string, int64_t>& intParams,
+                   uint64_t min_clock, uint64_t req_clock,
+                   CommandQueue* cq = nullptr);
+
+    // Submit a raw encoded payload via SerialQueue.
+    void sendTimedRaw(const uint8_t* payload, int len,
+                      uint64_t min_clock, uint64_t req_clock,
+                      CommandQueue* cq = nullptr);
 
 private:
     SerialPort m_serial;
@@ -254,6 +287,12 @@ private:
 
     // Batch accumulator for command payloads
     std::vector<uint8_t> m_batchBuf;
+
+    // SerialQueue (background-threaded serial with clock-gating)
+    SerialQueue m_serialQueue;
+
+    // Async clock sync: sentTime for the last get_clock via SerialQueue
+    std::atomic<double> m_clockSyncSentTime{0.0};
 
     // Expanded enumerations (fully expanded ranges, e.g. PA0=0, PA1=1, ...)
     std::map<std::string, std::map<std::string, int>> m_expandedEnums;

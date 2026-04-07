@@ -583,6 +583,24 @@ bool KlipperMCU::clockSyncPoll() {
     return true;
 }
 
+void KlipperMCU::clockSyncPollAsync() {
+    if (!isConnected() || m_isShutdown) return;
+
+    m_clockSync.incrementPending();
+
+    // Record sent time before send (used by receive callback to feed ClockSync)
+    double sentTime = MonotonicClock::now();
+    m_clockSyncSentTime.store(sentTime, std::memory_order_release);
+
+    // Encode get_clock and submit via SerialQueue default queue (no clock gating)
+    auto payload = encodeCommandPayload("get_clock");
+    if (!payload.empty()) {
+        m_serialQueue.send(m_serialQueue.getDefaultCommandQueue(),
+                           payload.data(), static_cast<int>(payload.size()),
+                           0, 0);
+    }
+}
+
 // ============================================================
 // OID Management
 // ============================================================
@@ -1231,4 +1249,106 @@ bool KlipperMCU::firmwareRestart() {
 
     m_lastError = "No reset command available";
     return false;
+}
+
+// ======================================================================
+// SerialQueue integration
+// ======================================================================
+
+bool KlipperMCU::startSerialQueue() {
+    if (m_serialQueue.isRunning()) return true;
+    if (!m_serial.isOpen()) {
+        m_lastError = "Serial port not open";
+        return false;
+    }
+
+    // Setup receive callback: dispatch responses to OID handlers, shutdown detection,
+    // and async clock sync updates.
+    m_serialQueue.setReceiveCallback(
+        [this](const uint8_t* msg, int len, double sent_time, double receive_time) {
+            (void)sent_time;
+            if (len <= 0) return;
+
+            // Decode response
+            auto resp = decodeResponse(msg, len);
+            checkShutdownResponse(resp);
+
+            // Handle async clock sync response
+            if (resp.name == "clock") {
+                double storedSentTime = m_clockSyncSentTime.load(std::memory_order_acquire);
+                if (storedSentTime > 0.0) {
+                    uint32_t clock32 = static_cast<uint32_t>(resp.intParams["clock"]);
+                    m_clockSync.handleClockResponse(clock32, storedSentTime, receive_time);
+                    m_clockSyncSentTime.store(0.0, std::memory_order_release);
+
+                    // Feed updated clock estimate back to SerialQueue
+                    auto snap = m_clockSync.getClockSnapshot();
+                    SQClockEstimate ce;
+                    ce.last_clock = snap.baseClock;
+                    ce.conv_clock = snap.baseClock;
+                    ce.conv_time = receive_time;
+                    ce.est_freq = snap.estFreq;
+                    m_serialQueue.updateClockEstimate(ce);
+                }
+            }
+
+            // OID dispatch
+            if (!resp.name.empty()) {
+                auto oidIt = resp.intParams.find("oid");
+                if (oidIt != resp.intParams.end()) {
+                    std::string key = resp.name + ":" + std::to_string(oidIt->second);
+                    auto handlerIt = m_oidHandlers.find(key);
+                    if (handlerIt != m_oidHandlers.end()) {
+                        handlerIt->second(resp);
+                    }
+                }
+            }
+
+            // General callback
+            if (m_responseCallback) {
+                m_responseCallback(resp.msgId, resp.name, resp.intParams, resp.bufParams);
+            }
+        });
+
+    // Calculate baud adjust: time per byte at current baud rate
+    // baud_adjust = 10 bits per byte / baud_rate (seconds per byte)
+    double baudAdjust = 10.0 / m_baudRate;
+
+    // Seed clock estimate from current clock sync state
+    {
+        auto snap = m_clockSync.getClockSnapshot();
+        SQClockEstimate ce;
+        ce.last_clock = snap.baseClock;
+        ce.conv_clock = snap.baseClock;
+        ce.conv_time = MonotonicClock::now();
+        ce.est_freq = snap.estFreq;
+        m_serialQueue.updateClockEstimate(ce);
+    }
+
+    if (!m_serialQueue.start(m_serial, baudAdjust)) {
+        m_lastError = "Failed to start SerialQueue thread";
+        return false;
+    }
+    return true;
+}
+
+void KlipperMCU::stopSerialQueue() {
+    m_serialQueue.stop();
+}
+
+void KlipperMCU::sendTimed(const std::string& cmdName,
+                            const std::map<std::string, int64_t>& intParams,
+                            uint64_t min_clock, uint64_t req_clock,
+                            CommandQueue* cq) {
+    auto payload = encodeCommandPayload(cmdName, intParams);
+    if (payload.empty()) return;
+    sendTimedRaw(payload.data(), static_cast<int>(payload.size()),
+                 min_clock, req_clock, cq);
+}
+
+void KlipperMCU::sendTimedRaw(const uint8_t* payload, int len,
+                               uint64_t min_clock, uint64_t req_clock,
+                               CommandQueue* cq) {
+    if (!cq) cq = m_serialQueue.getDefaultCommandQueue();
+    m_serialQueue.send(cq, payload, len, min_clock, req_clock);
 }

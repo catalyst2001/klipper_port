@@ -160,6 +160,57 @@ bool MCU_stepper::resetStepClockBatched(int64_t clock) {
     return true;
 }
 
+// ---- SerialQueue timed methods ----
+
+void MCU_stepper::queueStepTimed(int64_t interval, int64_t count, int64_t add,
+                                  uint64_t min_clock, uint64_t req_clock) {
+    std::map<std::string, int64_t> params = {
+        {"oid", m_oid},
+        {"interval", interval},
+        {"count", count},
+        {"add", add}
+    };
+    auto payload = m_mcu.encodeCommandPayload("queue_step", params);
+    if (payload.empty()) return;
+    // Lazily allocate per-stepper command queue
+    if (!m_cmdQueue)
+        m_cmdQueue = m_mcu.getSerialQueue().allocCommandQueue();
+    m_mcu.sendTimedRaw(payload.data(), static_cast<int>(payload.size()),
+                       min_clock, req_clock, m_cmdQueue);
+}
+
+void MCU_stepper::setNextStepDirTimed(bool forward, uint64_t min_clock,
+                                       uint64_t req_clock) {
+    bool dir = forward ^ m_invertDir;
+    m_curDir = forward;
+    std::map<std::string, int64_t> params = {
+        {"oid", m_oid},
+        {"dir", dir ? 1 : 0}
+    };
+    auto payload = m_mcu.encodeCommandPayload("set_next_step_dir", params);
+    if (payload.empty()) return;
+    if (!m_cmdQueue)
+        m_cmdQueue = m_mcu.getSerialQueue().allocCommandQueue();
+    m_mcu.sendTimedRaw(payload.data(), static_cast<int>(payload.size()),
+                       min_clock, req_clock, m_cmdQueue);
+}
+
+void MCU_stepper::resetStepClockTimed(int64_t clock, uint64_t min_clock,
+                                       uint64_t req_clock) {
+    std::map<std::string, int64_t> params = {
+        {"oid", m_oid},
+        {"clock", static_cast<int64_t>(static_cast<uint32_t>(clock))}
+    };
+    auto payload = m_mcu.encodeCommandPayload("reset_step_clock", params);
+    if (payload.empty()) return;
+    if (!m_cmdQueue)
+        m_cmdQueue = m_mcu.getSerialQueue().allocCommandQueue();
+    m_mcu.sendTimedRaw(payload.data(), static_cast<int>(payload.size()),
+                       min_clock, req_clock, m_cmdQueue);
+    m_lastStepClock = clock;
+    m_clockInitialized = true;
+}
+
 // ========== MCU_endstop ==========
 
 MCU_endstop::MCU_endstop(KlipperMCU& mcu) : m_mcu(mcu) {}

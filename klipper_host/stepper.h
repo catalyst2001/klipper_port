@@ -29,13 +29,23 @@ public:
     bool queueStep(int64_t interval, int64_t count, int64_t add);
     bool queueStepBatched(int64_t interval, int64_t count, int64_t add);
 
+    // Runtime: send queue_step via SerialQueue with clock-gating
+    void queueStepTimed(int64_t interval, int64_t count, int64_t add,
+                        uint64_t min_clock, uint64_t req_clock);
+
     // Runtime: set next step direction (true = forward)
     bool setNextStepDir(bool forward);
     bool setNextStepDirBatched(bool forward);
 
+    // Runtime: set direction via SerialQueue with clock-gating
+    void setNextStepDirTimed(bool forward, uint64_t min_clock, uint64_t req_clock);
+
     // Runtime: reset step clock
     bool resetStepClock(int64_t clock);
     bool resetStepClockBatched(int64_t clock);
+
+    // Runtime: reset step clock via SerialQueue
+    void resetStepClockTimed(int64_t clock, uint64_t min_clock, uint64_t req_clock);
 
     // Getters
     int getOid() const { return m_oid; }
@@ -70,6 +80,9 @@ private:
     bool m_curDir = true;
     int64_t m_lastStepClock = 0;  // absolute clock of last queued step
     bool m_clockInitialized = false;
+
+    // Per-stepper command queue for SerialQueue (clock-gated path)
+    struct CommandQueue* m_cmdQueue = nullptr;
 };
 
 // MCU_endstop: OID-based endstop with trsync support for homing.

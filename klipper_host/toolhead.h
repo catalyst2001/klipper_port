@@ -68,8 +68,6 @@ public:
         m_needStartSync = true;
         m_needCheckPause = -1.0;
         m_stepClockSnapValid = false;
-        m_pendingWindows.clear();
-        m_totalPendingCmds = 0;
         m_stepGenPrintTime.store(0.0, std::memory_order_release);
         for (int i = 0; i < 3; i++)
             if (m_steppers[i]) m_steppers[i]->resetClockInitialized();
@@ -124,10 +122,6 @@ private:
     ClockSync::ClockSnapshot m_stepClockSnap{};
     bool m_stepClockSnapValid = false;
 
-    // MCU move pool flow control (persistent across generateSteps calls)
-    struct PendingWindow { int64_t endClock; int cmdCount; };
-    std::vector<PendingWindow> m_pendingWindows;
-    int m_totalPendingCmds = 0;
 
     // Step gen pause flag (for homing)
     std::atomic<bool> m_stepGenPaused{false};
@@ -156,10 +150,6 @@ private:
     // Uses secant/bisection method (Klipper's itersolve approach)
     void generateShapedAxisSteps(int axis, const std::vector<TrapMove>& moves,
                                   const ClockSync::ClockSnapshot& snap);
-
-    // Clock-gate: wait until targetClock is within safe MCU timer range.
-    // Returns false if MCU disconnected/shutdown (caller should abort).
-    bool waitForClockGate(int64_t targetClock, double mcuFreq);
 
     // Helper: get axis position at any absolute print time across TrapMoves
     static double getAxisPositionAtTime(int axis, const std::vector<TrapMove>& moves,

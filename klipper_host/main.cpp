@@ -76,6 +76,12 @@ static void signalHandler(int) {
 // ---- Background: ProcessIncoming + response logging ----
 static void pollThread(KlipperMCU& mcu) {
     while (g_running) {
+        // When SerialQueue is active, it owns all serial I/O.
+        // Responses are dispatched via its receive callback.
+        if (mcu.isSerialQueueActive()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
         {
             std::lock_guard<std::mutex> lock(g_mcuMutex);
             if (!mcu.isConnected()) {
@@ -103,7 +109,10 @@ static void pollThread(KlipperMCU& mcu) {
 // ---- Background: Clock sync polling ----
 static void clockSyncThread(KlipperMCU& mcu) {
     while (g_running) {
-        {
+        if (mcu.isSerialQueueActive()) {
+            // Async path: send get_clock via SerialQueue, response handled by callback
+            mcu.clockSyncPollAsync();
+        } else {
             std::lock_guard<std::mutex> lock(g_mcuMutex);
             if (!mcu.isConnected()) break;
             if (!mcu.clockSyncPoll()) {
@@ -306,6 +315,14 @@ struct TestContext {
             }
         }
 
+        // 11. Start SerialQueue (after TMC init — SerialQueue takes over serial I/O)
+        Log("Starting SerialQueue...");
+        if (!mcu.startSerialQueue()) {
+            LogError("Failed to start SerialQueue: " + mcu.getLastError());
+            return false;
+        }
+        Log("SerialQueue started");
+
         Log("=== Initialization complete ===");
         return true;
     }
@@ -314,6 +331,7 @@ struct TestContext {
         g_running = false;
         if (pollTh.joinable()) pollTh.join();
         if (clockSyncTh.joinable()) clockSyncTh.join();
+        mcu.stopSerialQueue();
         mcu.disconnect();
         Log("Disconnected.");
     }
