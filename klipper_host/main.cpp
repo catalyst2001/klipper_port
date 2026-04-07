@@ -320,7 +320,7 @@ struct TestContext {
 };
 
 // ---- Mode: run gcode file ----
-static int runGcodeFile(TestContext& ctx, const std::string& filePath) {
+static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t startLine = 0) {
     std::ifstream file(filePath);
     if (!file.is_open()) {
         LogError("Cannot open file: " + filePath);
@@ -331,6 +331,32 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath) {
     while (std::getline(file, line))
         lines.push_back(line);
     Log("Loaded gcode: " + filePath + " (" + std::to_string(lines.size()) + " lines)");
+
+    // --start-line: skip to the specified line, but execute setup commands
+    // (homing, mode setting, etc.) before it
+    if (startLine > 0 && startLine < lines.size()) {
+        Log("Skipping to line " + std::to_string(startLine) + " (executing setup commands)...");
+        std::vector<std::string> preamble;
+        for (size_t i = 0; i < startLine; ++i) {
+            std::string t = lines[i];
+            // Trim
+            while (!t.empty() && (t[0] == ' ' || t[0] == '\t')) t.erase(t.begin());
+            if (t.empty() || t[0] == ';' || t[0] == '%' || t[0] == '(') continue;
+            // Keep setup commands: G28, G90, G91, G92, M-codes
+            if (t[0] == 'M' || t[0] == 'm' ||
+                t.substr(0, 3) == "G28" || t.substr(0, 3) == "G90" ||
+                t.substr(0, 3) == "G91" || t.substr(0, 3) == "G92") {
+                preamble.push_back(lines[i]);
+            }
+        }
+        Log("Preamble: " + std::to_string(preamble.size()) + " setup commands");
+        // Replace lines: preamble + lines from startLine onward
+        std::vector<std::string> newLines;
+        newLines.insert(newLines.end(), preamble.begin(), preamble.end());
+        newLines.insert(newLines.end(), lines.begin() + startLine, lines.end());
+        lines = std::move(newLines);
+        Log("Effective lines: " + std::to_string(lines.size()));
+    }
 
     constexpr double BUFFER_TIME_START = 4.0;
     constexpr double BUFFER_TIME_HIGH  = 4.0;
@@ -667,7 +693,8 @@ static void printUsage(const char* exe) {
               << "  " << exe << " info                   - show MCU info\n\n"
               << "Options:\n"
               << "  --port <COMx>     - serial port (default COM3)\n"
-              << "  --config <file>   - config file (default configs/generic-duet3-6hc.cfg)\n";
+              << "  --config <file>   - config file (default configs/generic-duet3-6hc.cfg)\n"
+              << "  --start-line <N>  - skip to line N (skip non-move lines before it)\n";
 }
 
 // ---- Main ----
@@ -680,6 +707,7 @@ int main(int argc, char* argv[]) {
     std::string modeArg;
     std::string port = "COM3";
     std::string configPath = "configs/generic-duet3-6hc.cfg";
+    size_t g_startLine = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -687,6 +715,8 @@ int main(int argc, char* argv[]) {
             port = argv[++i];
         } else if (arg == "--config" && i + 1 < argc) {
             configPath = argv[++i];
+        } else if (arg == "--start-line" && i + 1 < argc) {
+            g_startLine = std::stoull(argv[++i]);
         } else if (mode.empty()) {
             mode = arg;
         } else if (modeArg.empty()) {
@@ -717,7 +747,7 @@ int main(int argc, char* argv[]) {
             LogError("gcode mode requires a file path");
             result = 1;
         } else {
-            result = runGcodeFile(ctx, modeArg);
+            result = runGcodeFile(ctx, modeArg, g_startLine);
         }
     } else if (mode == "move") {
         if (modeArg.empty()) {

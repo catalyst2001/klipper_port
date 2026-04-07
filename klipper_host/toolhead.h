@@ -68,6 +68,8 @@ public:
         m_needStartSync = true;
         m_needCheckPause = -1.0;
         m_stepClockSnapValid = false;
+        m_pendingWindows.clear();
+        m_totalPendingCmds = 0;
         for (int i = 0; i < 3; i++)
             if (m_steppers[i]) m_steppers[i]->resetClockInitialized();
     }
@@ -115,6 +117,11 @@ private:
     // to avoid inter-call drift from changing frequency estimates.
     ClockSync::ClockSnapshot m_stepClockSnap{};
     bool m_stepClockSnapValid = false;
+
+    // MCU move pool flow control (persistent across generateSteps calls)
+    struct PendingWindow { int64_t endClock; int cmdCount; };
+    std::vector<PendingWindow> m_pendingWindows;
+    int m_totalPendingCmds = 0;
 
     // Step gen pause flag (for homing)
     std::atomic<bool> m_stepGenPaused{false};

@@ -951,13 +951,28 @@ bool ToolHead::generateSteps() {
     };
     AxisState axState[3];
 
+    // Move pool flow control: use PERSISTENT counters (member variables)
+    // to track outstanding queue_step commands across generateSteps() calls.
+    // The MCU move pool is shared — commands from previous calls may still
+    // be queued, so local-only counting misses cumulative overflow.
+    const int MCU_MOVE_POOL = m_mcu.getMcuMoveCount();
+    const int MAX_PENDING_CMDS = (MCU_MOVE_POOL > 0) ? MCU_MOVE_POOL * 3 / 4 : 768;
+    int cmdsThisWindow = 0;
+
+    // Free pending windows from prior generateSteps() calls that MCU has executed
     {
         int64_t mcuCk = m_mcu.getClockSync().getClock();
+        while (!m_pendingWindows.empty() && m_pendingWindows.front().endClock <= mcuCk) {
+            m_totalPendingCmds -= m_pendingWindows.front().cmdCount;
+            m_pendingWindows.erase(m_pendingWindows.begin());
+        }
+
         std::cerr << "[StepGen] Phase2 start mcuCk=" << mcuCk
                   << " globalMin=" << globalMinClock
                   << " globalMax=" << globalMaxClock
                   << " lead=" << (double)(globalMinClock - mcuCk) / mcuFreqNom
-                  << "s" << std::endl;
+                  << "s pending=" << m_totalPendingCmds
+                  << "/" << MCU_MOVE_POOL << std::endl;
     }
 
     int64_t windowStart = globalMinClock;
@@ -965,6 +980,36 @@ bool ToolHead::generateSteps() {
     while (true) {
         int64_t windowEnd = windowStart + WINDOW_TICKS;
         bool anyRemaining = false;
+
+        // Skip windows that are already in the past — don't waste time
+        // processing steps that can't be sent in time
+        {
+            int64_t mcuCkNow = m_mcu.getClockSync().getClock();
+            double windowLeadSec = static_cast<double>(windowStart - mcuCkNow) / mcuFreqNom;
+            if (windowLeadSec < -0.200) {
+                // This window is >200ms in the past, skip it entirely
+                std::cerr << "[StepGen] SKIP_WINDOW lead=" << windowLeadSec
+                          << "s windowStart=" << windowStart << std::endl;
+                // Advance all axes' positions past this window
+                for (int axis = 0; axis < 3; ++axis) {
+                    auto& ad = axisData[axis];
+                    auto& as = axState[axis];
+                    if (!ad.initialized) continue;
+                    while (as.pos < ad.steps.size() && ad.steps[as.pos].clock <= windowEnd)
+                        as.pos++;
+                    if (as.pos < ad.steps.size()) anyRemaining = true;
+                }
+                if (!anyRemaining) break;
+                // Advance window
+                int64_t nextStep = INT64_MAX;
+                for (int axis = 0; axis < 3; ++axis) {
+                    if (axState[axis].pos < axisData[axis].steps.size())
+                        nextStep = std::min(nextStep, axisData[axis].steps[axState[axis].pos].clock);
+                }
+                windowStart = (nextStep > windowEnd) ? nextStep : windowEnd;
+                continue;
+            }
+        }
 
         for (int axis = 0; axis < 3; ++axis) {
             auto& ad = axisData[axis];
@@ -1071,7 +1116,7 @@ bool ToolHead::generateSteps() {
                         int64_t stepCk64 = batchClocks[pos];
                         int64_t mcuCk64 = m_mcu.getClockSync().getClock();
                         double aheadSec = static_cast<double>(stepCk64 - mcuCk64) / mcuFreqNom;
-                        constexpr double MIN_AHEAD_S = 0.025;
+                        constexpr double MIN_AHEAD_S = 0.050;
                         if (aheadSec < MIN_AHEAD_S) {
                             std::cerr << "[StepGen] MIN_AHEAD axis=" << axis
                                       << " aheadSec=" << aheadSec
@@ -1080,14 +1125,23 @@ bool ToolHead::generateSteps() {
                                       << " lastStepCk=" << as.lastStepClock
                                       << std::endl;
                             m_mcu.flushBatch();
+                            bool skippedPast = false;
                             while (m_mcu.isConnected() && !m_mcu.isShutdown()) {
                                 mcuCk64 = m_mcu.getClockSync().getClock();
                                 aheadSec = static_cast<double>(stepCk64 - mcuCk64) / mcuFreqNom;
                                 if (aheadSec >= MIN_AHEAD_S) break;
                                 if (aheadSec < -0.100) {
-                                    stepper->resetStepClockBatched(batchClocks[pos]);
-                                    m_mcu.flushBatch();
-                                    as.lastStepClock = batchClocks[pos];
+                                    // Steps too far in the past — skip ALL
+                                    // remaining steps in this direction run.
+                                    // Don't try to resetStepClock with tight
+                                    // margin — that triggers Timer too close.
+                                    // Don't update lastStepClock — MCU stepper
+                                    // is still at the last actually-sent clock.
+                                    std::cerr << "[StepGen] SKIP_RUN axis=" << axis
+                                              << " skipped=" << (numSteps - pos)
+                                              << std::endl;
+                                    pos = numSteps;
+                                    skippedPast = true;
                                     break;
                                 }
                                 std::this_thread::sleep_for(
@@ -1095,6 +1149,7 @@ bool ToolHead::generateSteps() {
                             }
                             if (!m_mcu.isConnected() || m_mcu.isShutdown())
                                 return false;
+                            if (skippedPast) continue;
                         }
                     }
 
@@ -1106,6 +1161,7 @@ bool ToolHead::generateSteps() {
                           * ((int64_t)move.count * (move.count - 1) / 2);
                     stepper->queueStepBatched(
                         move.interval, move.count, move.add);
+                    cmdsThisWindow++;
                     as.lastStepClock += totalTicks;
                     pos += move.count;
                 }
@@ -1121,18 +1177,39 @@ bool ToolHead::generateSteps() {
         // Flush commands for all axes after each window
         m_mcu.flushBatch();
 
-        // Per-window throttle: don't get too far ahead of MCU
+        // Track move pool usage for this window
+        if (cmdsThisWindow > 0) {
+            m_pendingWindows.push_back({windowEnd, cmdsThisWindow});
+            m_totalPendingCmds += cmdsThisWindow;
+            cmdsThisWindow = 0;
+        }
+
+        // Per-window throttle: time-ahead + move pool count
         {
             m_mcu.processIncoming(0);
             int64_t mcuCk64 = m_mcu.getClockSync().getClock();
+
+            // Free windows that the MCU has already executed past
+            while (!m_pendingWindows.empty() && m_pendingWindows.front().endClock <= mcuCk64) {
+                m_totalPendingCmds -= m_pendingWindows.front().cmdCount;
+                m_pendingWindows.erase(m_pendingWindows.begin());
+            }
+
             double aheadSec = static_cast<double>(windowEnd - mcuCk64) / mcuFreqNom;
-            if (aheadSec > MAX_AHEAD) {
-                std::cerr << "[StepGen] Throttle aheadSec=" << aheadSec << std::endl;
+            bool needWait = (aheadSec > MAX_AHEAD) || (m_totalPendingCmds > MAX_PENDING_CMDS);
+            if (needWait) {
+                std::cerr << "[StepGen] Throttle aheadSec=" << aheadSec
+                          << " pending=" << m_totalPendingCmds
+                          << "/" << MCU_MOVE_POOL << std::endl;
                 while (m_mcu.isConnected() && !m_mcu.isShutdown()) {
                     m_mcu.processIncoming(0);
                     mcuCk64 = m_mcu.getClockSync().getClock();
+                    while (!m_pendingWindows.empty() && m_pendingWindows.front().endClock <= mcuCk64) {
+                        m_totalPendingCmds -= m_pendingWindows.front().cmdCount;
+                        m_pendingWindows.erase(m_pendingWindows.begin());
+                    }
                     aheadSec = static_cast<double>(windowEnd - mcuCk64) / mcuFreqNom;
-                    if (aheadSec <= MAX_AHEAD) break;
+                    if (aheadSec <= MAX_AHEAD && m_totalPendingCmds <= MAX_PENDING_CMDS) break;
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
                 if (!m_mcu.isConnected() || m_mcu.isShutdown()) return false;
@@ -1150,16 +1227,28 @@ bool ToolHead::generateSteps() {
 
     // Final flush and end-of-batch throttle
     m_mcu.flushBatch();
+    // Account for any remaining commands in the last window
+    if (cmdsThisWindow > 0) {
+        m_pendingWindows.push_back({globalMaxClock, cmdsThisWindow});
+        m_totalPendingCmds += cmdsThisWindow;
+        cmdsThisWindow = 0;
+    }
     {
         int64_t lastCk64 = globalMaxClock;
         int64_t mcuCk64 = m_mcu.getClockSync().getClock();
         double aheadSec = static_cast<double>(lastCk64 - mcuCk64) / mcuFreqNom;
-        std::cerr << "[StepGen] EndThrottle aheadSec=" << aheadSec << std::endl;
+        std::cerr << "[StepGen] EndThrottle aheadSec=" << aheadSec
+                  << " pending=" << m_totalPendingCmds
+                  << "/" << MCU_MOVE_POOL << std::endl;
         while (m_mcu.isConnected() && !m_mcu.isShutdown()) {
             m_mcu.processIncoming(0);
             mcuCk64 = m_mcu.getClockSync().getClock();
+            while (!m_pendingWindows.empty() && m_pendingWindows.front().endClock <= mcuCk64) {
+                m_totalPendingCmds -= m_pendingWindows.front().cmdCount;
+                m_pendingWindows.erase(m_pendingWindows.begin());
+            }
             aheadSec = static_cast<double>(lastCk64 - mcuCk64) / mcuFreqNom;
-            if (aheadSec <= MAX_AHEAD) break;
+            if (aheadSec <= MAX_AHEAD && m_totalPendingCmds <= MAX_PENDING_CMDS / 2) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         if (!m_mcu.isConnected() || m_mcu.isShutdown()) return false;
