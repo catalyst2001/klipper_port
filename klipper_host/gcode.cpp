@@ -300,6 +300,14 @@ bool GCodeParser::cmdG28(const std::map<char, double>& params) {
     // concurrent step generation)
     m_toolhead.flush();
     m_toolhead.pauseStepGen();  // waits for in-flight generateSteps() to finish
+
+    // Stop SerialQueue so homing can use the direct serial path.
+    // Must happen before syncPosition: the SQ thread would otherwise
+    // read responses from the serial port, causing syncPosition to timeout.
+    // pauseStepGen guarantees no in-flight generateSteps, so no commands
+    // are being submitted to SQ; stopping it is safe.
+    m_mcu.stopSerialQueue();
+
     // Sync barrier: round-trip to MCU confirms all scheduled steps are settled
     for (int a = 0; a < 3; ++a) {
         if (m_rails[a])
@@ -326,12 +334,15 @@ bool GCodeParser::cmdG28(const std::map<char, double>& params) {
             m_mcu.sendCommand("trsync_trigger", trParams);
             // Drain any remaining trsync_state reports
             m_mcu.processIncoming(50);
+            // Clear SF_NEED_RESET on MCU stepper (matches Python note_homing_end)
+            m_rails[i]->getStepper().resetStepClock(0);
             // Sync barrier: round-trip confirms MCU finished this axis
             m_rails[i]->getStepper().syncPosition();
             std::cout << "[GCode] " << axisNames[i] << " homed OK" << std::endl;
         } else {
             m_lastMsg = std::string("Failed to home ") + axisNames[i] + " axis";
             std::cout << "[GCode] " << m_lastMsg << std::endl;
+            m_mcu.startSerialQueue();
             m_toolhead.resumeStepGen();
             return false;
         }
@@ -348,6 +359,13 @@ bool GCodeParser::cmdG28(const std::map<char, double>& params) {
     // Re-base print time with a sufficient buffer — homing consumed real time
     // but no print moves, so the old printTime is now too close to the MCU clock.
     m_toolhead.resetSyncState();
+    m_mcu.stepSyncReset();
+
+    // Restart SerialQueue for clock-gated step delivery.
+    // Must happen after resetSyncState (which resets stepper clock tracking)
+    // and before resumeStepGen (which begins submitting commands to SQ).
+    m_mcu.startSerialQueue();
+
     double newPrintTime = m_mcu.getClockSync().estimatedPrintTime() + 4.0;
     m_toolhead.setNextPrintTime(newPrintTime);
     m_toolhead.resumeStepGen();

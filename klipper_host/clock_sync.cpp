@@ -53,9 +53,8 @@ bool ClockSync::connect(KlipperMCU& mcu) {
     uint32_t clk = static_cast<uint32_t>(intP["clock"]);
     m_lastClock = (static_cast<int64_t>(high) << 32) | clk;
 
-    double midTime = (sentTime + recvTime) * 0.5;
     m_clockAvg = static_cast<double>(m_lastClock);
-    m_timeAvg = midTime;
+    m_timeAvg = sentTime;  // Match Python: use sent_time, NOT midpoint
     m_clockEst = {m_timeAvg, m_clockAvg, m_mcuFreq};
     m_predictionVariance = (0.001 * m_mcuFreq) * (0.001 * m_mcuFreq);
 

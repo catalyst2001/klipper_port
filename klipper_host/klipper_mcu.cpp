@@ -708,8 +708,9 @@ bool KlipperMCU::finalizeConfig() {
     bool isConfig = configParams["is_config"] != 0;
     uint32_t mcuCrc = static_cast<uint32_t>(configParams["crc"]);
 
-    // Step 1.5: If MCU is in shutdown, clear it (avoid full reset on USB CDC devices).
-    //           If stale state with moves, reset.
+    // Step 1.5: If MCU is in shutdown, clear it and force full reset.
+    //           Stepper state (s->count) may survive clear_shutdown.
+    bool needsRestart = false;
     if (configParams["is_shutdown"] != 0) {
         std::cout << "[KlipperMCU] MCU is in shutdown state, clearing..." << std::endl;
         // Send clear_shutdown and re-query config
@@ -739,10 +740,13 @@ bool KlipperMCU::finalizeConfig() {
         }
         std::cout << "[KlipperMCU] Shutdown cleared, is_config=" << isConfig
                   << " crc=" << mcuCrc << std::endl;
+        // Always do a full reset after shutdown — stepper state (s->count)
+        // may be non-zero even when move_count == 0, causing
+        // "Can't reset time when stepper active" during homing.
+        needsRestart = true;
     }
 
-    bool needsRestart = false;
-    if (configParams.count("move_count") && configParams["move_count"] > 0) {
+    if (!needsRestart && configParams.count("move_count") && configParams["move_count"] > 0) {
         std::cout << "[KlipperMCU] Stale MCU state detected (move_count="
                   << configParams["move_count"] << "), resetting..." << std::endl;
         needsRestart = true;
@@ -1003,6 +1007,7 @@ bool KlipperMCU::finalizeConfig() {
 
     m_configFinalized = true;
     m_mcuMoveCount = static_cast<int>(configParams["move_count"]);
+    stepSyncReset();
     std::cout << "[KlipperMCU] Configuration finalized (CRC=" << configCrc 
               << ", move_count=" << configParams["move_count"] << ")" << std::endl;
     return true;
@@ -1188,7 +1193,19 @@ void KlipperMCU::checkShutdownResponse(const ParsedResponse& resp) {
             m_shutdownMsg = msg;
         }
 
-        std::cerr << "[KlipperMCU] !!! SHUTDOWN: " << msg << " !!!" << std::endl;
+        // Log MCU clock from shutdown response for debugging
+        auto clockIt = resp.intParams.find("clock");
+        uint32_t shutdownClock32 = clockIt != resp.intParams.end()
+            ? static_cast<uint32_t>(clockIt->second) : 0;
+        double mcuUptimeSec = static_cast<double>(shutdownClock32) / m_clockSync.getMcuFreq();
+        int64_t estClock64 = m_clockSync.getClock();
+        double estPrintTime = m_clockSync.estimatedPrintTime();
+        std::cerr << "[KlipperMCU] !!! SHUTDOWN: " << msg
+                  << " | mcu_clock32=" << shutdownClock32
+                  << " mcu_uptime=" << std::fixed << std::setprecision(3) << mcuUptimeSec << "s"
+                  << " estClock64=" << estClock64
+                  << " estPrintTime=" << std::setprecision(3) << estPrintTime
+                  << " !!!" << std::endl;
 
         if (m_shutdownCallback) {
             m_shutdownCallback(msg);
@@ -1325,7 +1342,9 @@ bool KlipperMCU::startSerialQueue() {
         m_serialQueue.updateClockEstimate(ce);
     }
 
-    if (!m_serialQueue.start(m_serial, baudAdjust)) {
+    // Pass current protocol sequence numbers so SerialQueue frames
+    // are accepted by the MCU (which remembers its expected seq).
+    if (!m_serialQueue.start(m_serial, baudAdjust, m_sendSeq, m_recvSeq)) {
         m_lastError = "Failed to start SerialQueue thread";
         return false;
     }
@@ -1333,6 +1352,11 @@ bool KlipperMCU::startSerialQueue() {
 }
 
 void KlipperMCU::stopSerialQueue() {
+    if (!m_serialQueue.isRunning()) return;
+    // Preserve protocol sequence numbers so the direct serial path
+    // (used during homing) continues where the SQ left off.
+    m_sendSeq = m_serialQueue.currentSendSeq();
+    m_recvSeq = m_serialQueue.currentReceiveSeq();
     m_serialQueue.stop();
 }
 
@@ -1351,4 +1375,36 @@ void KlipperMCU::sendTimedRaw(const uint8_t* payload, int len,
                                CommandQueue* cq) {
     if (!cq) cq = m_serialQueue.getDefaultCommandQueue();
     m_serialQueue.send(cq, payload, len, min_clock, req_clock);
+}
+
+// ======================================================================
+// StepperSync: move queue flow control
+// ======================================================================
+
+uint64_t KlipperMCU::stepSyncAdjustMinClock(uint64_t minClock, uint64_t endClock) {
+    std::lock_guard<std::mutex> lk(m_stepSyncMutex);
+    if (m_stepSyncHeap.empty()) return minClock;
+
+    // Pop the earliest-available slot
+    uint64_t avail = m_stepSyncHeap.top();
+    m_stepSyncHeap.pop();
+
+    // Push when this new command's slot becomes free
+    m_stepSyncHeap.push(endClock);
+
+    // Return the effective min_clock: can't send before slot is free
+    return (avail > minClock) ? avail : minClock;
+}
+
+void KlipperMCU::stepSyncReset() {
+    std::lock_guard<std::mutex> lk(m_stepSyncMutex);
+    while (!m_stepSyncHeap.empty()) m_stepSyncHeap.pop();
+    // Reserve slots for non-stepper move pool users (digital_out, PWM, etc.)
+    // and a safety margin for SQ clock estimation variance.
+    // Python Klipper subtracts _reserved_move_slots here.
+    int reserved = 12;  // ~6 for digital_out/PWM + safety margin
+    int usable = (m_mcuMoveCount - reserved) / 2;  // use half (conservative)
+    if (usable < 64) usable = 64;
+    for (int i = 0; i < usable; i++)
+        m_stepSyncHeap.push(0);
 }

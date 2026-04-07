@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <queue>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -226,6 +227,13 @@ public:
                       uint64_t min_clock, uint64_t req_clock,
                       CommandQueue* cq = nullptr);
 
+    // StepperSync: move queue flow control (matches Klipper's steppersync.c).
+    // Adjusts min_clock for queue_step commands so we never exceed the MCU's
+    // move queue capacity. Call for each queue_step; pass the clock at which
+    // the step command's last step will finish (endClock).
+    uint64_t stepSyncAdjustMinClock(uint64_t minClock, uint64_t endClock);
+    void stepSyncReset();
+
 private:
     SerialPort m_serial;
     std::string m_portName;
@@ -293,6 +301,11 @@ private:
 
     // Async clock sync: sentTime for the last get_clock via SerialQueue
     std::atomic<double> m_clockSyncSentTime{0.0};
+
+    // StepperSync: min-heap tracking move queue slot availability
+    // Each entry is the clock at which one move queue slot becomes free.
+    std::priority_queue<uint64_t, std::vector<uint64_t>, std::greater<uint64_t>> m_stepSyncHeap;
+    std::mutex m_stepSyncMutex;
 
     // Expanded enumerations (fully expanded ranges, e.g. PA0=0, PA1=1, ...)
     std::map<std::string, std::map<std::string, int>> m_expandedEnums;

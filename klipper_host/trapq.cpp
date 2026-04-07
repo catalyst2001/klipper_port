@@ -165,6 +165,11 @@ void TrapQ::append(const std::vector<TrapMove>& moves) {
     m_moves.insert(m_moves.end(), moves.begin(), moves.end());
 }
 
+void TrapQ::prepend(const std::vector<TrapMove>& moves) {
+    std::lock_guard<std::mutex> lk(m_mutex);
+    m_moves.insert(m_moves.begin(), moves.begin(), moves.end());
+}
+
 std::vector<TrapMove> TrapQ::getAndClear() {
     std::lock_guard<std::mutex> lk(m_mutex);
     std::vector<TrapMove> result;

@@ -89,7 +89,10 @@ public:
 
     // Initialize with an open serial port handle (takes ownership of I/O).
     // The SerialPort object must remain valid for the lifetime of SerialQueue.
-    bool start(SerialPort& port, double baud_adjust = 0.0);
+    // initial_send_seq / initial_receive_seq: current protocol sequence numbers
+    // (must match MCU state to avoid NAK storm on first frame).
+    bool start(SerialPort& port, double baud_adjust = 0.0,
+               uint8_t initial_send_seq = 1, uint8_t initial_receive_seq = 1);
 
     // Stop the background thread and clean up.
     void stop();
@@ -133,6 +136,10 @@ public:
 
     // Check if background thread is running.
     bool isRunning() const { return m_running.load(std::memory_order_acquire); }
+
+    // Current protocol sequence numbers (for save/restore across stop/start).
+    uint8_t currentSendSeq() const { return static_cast<uint8_t>(m_sendSeq & MESSAGE_SEQ_MASK); }
+    uint8_t currentReceiveSeq() const { return static_cast<uint8_t>(m_receiveSeq & MESSAGE_SEQ_MASK); }
 
     // Get stats
     struct Stats {
