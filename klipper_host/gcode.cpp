@@ -194,7 +194,7 @@ bool GCodeParser::cmdG0G1(const std::map<char, double>& params) {
         if (zIt != params.end()) target.z += zIt->second;
     }
 
-    m_toolhead.moveAbsolute(target, m_feedrate);
+    m_toolhead.moveAbsolute(target, m_feedrate * m_speedFactor);
     return true;
 }
 
@@ -249,7 +249,7 @@ bool GCodeParser::cmdG2G3(bool clockwise, const std::map<char, double>& params) 
     if (radius < 1e-6) {
         // Degenerate arc — treat as linear move
         Vec3 target{endX, endY, endZ};
-        m_toolhead.moveAbsolute(target, m_feedrate);
+        m_toolhead.moveAbsolute(target, m_feedrate * m_speedFactor);
         return true;
     }
 
@@ -280,12 +280,12 @@ bool GCodeParser::cmdG2G3(bool clockwise, const std::map<char, double>& params) 
         pt.x = centerX + radius * std::cos(angle);
         pt.y = centerY + radius * std::sin(angle);
         pt.z = curPos.z + zStep * s;
-        m_toolhead.moveAbsolute(pt, m_feedrate);
+        m_toolhead.moveAbsolute(pt, m_feedrate * m_speedFactor);
     }
 
     // Ensure we end exactly at the target
     Vec3 finalPt{endX, endY, endZ};
-    m_toolhead.moveAbsolute(finalPt, m_feedrate);
+    m_toolhead.moveAbsolute(finalPt, m_feedrate * m_speedFactor);
     return true;
 }
 
@@ -300,8 +300,11 @@ bool GCodeParser::cmdG28(const std::map<char, double>& params) {
     // concurrent step generation)
     m_toolhead.flush();
     m_toolhead.pauseStepGen();  // waits for in-flight generateSteps() to finish
-    // Wait for MCU to finish executing any steps already sent
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Sync barrier: round-trip to MCU confirms all scheduled steps are settled
+    for (int a = 0; a < 3; ++a) {
+        if (m_rails[a])
+            m_rails[a]->getStepper().syncPosition();
+    }
 
     int axes[] = {0, 1, 2};
     bool homeFlags[] = {homeX, homeY, homeZ};
@@ -323,6 +326,8 @@ bool GCodeParser::cmdG28(const std::map<char, double>& params) {
             m_mcu.sendCommand("trsync_trigger", trParams);
             // Drain any remaining trsync_state reports
             m_mcu.processIncoming(50);
+            // Sync barrier: round-trip confirms MCU finished this axis
+            m_rails[i]->getStepper().syncPosition();
             std::cout << "[GCode] " << axisNames[i] << " homed OK" << std::endl;
         } else {
             m_lastMsg = std::string("Failed to home ") + axisNames[i] + " axis";

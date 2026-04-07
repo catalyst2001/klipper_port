@@ -46,6 +46,12 @@ public:
     void setCommandedPosition(int64_t pos) { m_commandedPos = pos; }
     bool getCurrentDir() const { return m_curDir; }
 
+    // Synchronization: send stepper_get_position to MCU and wait for response.
+    // Acts as a command-level barrier — MCU won't respond until all prior
+    // commands/events have been processed. Returns current position, or
+    // INT64_MIN on timeout.
+    int64_t syncPosition(int timeoutMs = 2000);
+
     // Step clock tracking for inter-move continuity
     int64_t getLastStepClock() const { return m_lastStepClock; }
     void setLastStepClock(int64_t clock) { m_lastStepClock = clock; m_clockInitialized = true; }

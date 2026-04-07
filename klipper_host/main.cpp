@@ -320,7 +320,7 @@ struct TestContext {
 };
 
 // ---- Mode: run gcode file ----
-static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t startLine = 0) {
+static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t startLine = 0, double speedFactor = 1.0) {
     std::ifstream file(filePath);
     if (!file.is_open()) {
         LogError("Cannot open file: " + filePath);
@@ -331,6 +331,10 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
     while (std::getline(file, line))
         lines.push_back(line);
     Log("Loaded gcode: " + filePath + " (" + std::to_string(lines.size()) + " lines)");
+    if (speedFactor != 1.0) {
+        Log("Speed factor: " + std::to_string(speedFactor) + "x");
+        ctx.gcode->setSpeedFactor(speedFactor);
+    }
 
     // --start-line: skip to the specified line, but execute setup commands
     // (homing, mode setting, etc.) before it
@@ -415,6 +419,15 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
     for (size_t i = 0; i < lines.size(); ++i) {
         if (!g_running) break;
 
+        // Stall detector: check if main loop is making progress
+        static auto lastProgressTime = std::chrono::steady_clock::now();
+        static size_t lastProgressLine = 0;
+        auto nowPt = std::chrono::steady_clock::now();
+        if (i != lastProgressLine) {
+            lastProgressTime = nowPt;
+            lastProgressLine = i;
+        }
+
         // Health check
         {
             std::lock_guard<std::mutex> lock(g_mcuMutex);
@@ -492,6 +505,7 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
         if (linesSinceFlush >= FLUSH_BATCH || i == lines.size() - 1) {
             linesSinceFlush = 0;
             flushCount++;
+            auto flushStart = std::chrono::steady_clock::now();
 
             {
                 std::lock_guard<std::mutex> lock(g_mcuMutex);
@@ -518,21 +532,60 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
                 Log(ss.str());
             }
 
-            // Backpressure: wait if host is too far ahead of MCU.
-            // The step gen thread drains the trapq in parallel, so the
-            // MCU clock advances while we wait here.
-            for (;;) {
-                if (!g_running) break;
-                {
-                    std::lock_guard<std::mutex> lock(g_mcuMutex);
-                    if (!ctx.mcu.isConnected() || ctx.mcu.isShutdown()) break;
-                    ahead = ctx.toolhead->getNextPrintTime()
-                          - ctx.mcu.getClockSync().estimatedPrintTime();
+            // Backpressure: wait if host is too far ahead of MCU OR stepGen.
+            // Key constraint: lead = ahead(MCU) - STEPGEN_BUFFER_HIGH > 0
+            // must hold so oldest unprocessed TrapMove is always in MCU's future.
+            // In steady state ahead(MCU) ≈ 1.0-1.5s, so STEPGEN_BUFFER_HIGH < 1.0.
+            constexpr double STEPGEN_BUFFER_HIGH = 0.5; // max seconds gcode can be ahead of stepGen
+            {
+                auto bpStart = std::chrono::steady_clock::now();
+                bool logged = false;
+                for (;;) {
+                    if (!g_running) break;
+                    double aheadMcu, aheadStepGen, printTime, sgTime;
+                    {
+                        std::lock_guard<std::mutex> lock(g_mcuMutex);
+                        if (!ctx.mcu.isConnected() || ctx.mcu.isShutdown()) break;
+                        printTime = ctx.toolhead->getNextPrintTime();
+                        aheadMcu = printTime - ctx.mcu.getClockSync().estimatedPrintTime();
+                        sgTime = ctx.toolhead->getStepGenPrintTime();
+                        // sgTime=0 means stepGen hasn't processed any batch yet.
+                        // Don't apply stepGen backpressure until first batch completes,
+                        // otherwise gcode blocks if initial commands produce no TrapMoves.
+                        aheadStepGen = (sgTime > 0.0) ? (printTime - sgTime) : 0.0;
+                    }
+                    if (aheadMcu < BUFFER_TIME_HIGH && aheadStepGen <= STEPGEN_BUFFER_HIGH) break;
+                    auto bpElapsed = std::chrono::steady_clock::now() - bpStart;
+                    double bpSec = std::chrono::duration<double>(bpElapsed).count();
+                    if (!logged && bpSec > 1.0) {
+                        std::cerr << "[Backpressure] WAIT aheadMcu=" << aheadMcu
+                                  << " aheadStepGen=" << aheadStepGen
+                                  << " printTime=" << printTime
+                                  << " sgTime=" << sgTime << std::endl;
+                        logged = true;
+                    }
+                    if (bpSec > 10.0) {
+                        std::cerr << "[Backpressure] TIMEOUT aheadMcu=" << aheadMcu
+                                  << " aheadStepGen=" << aheadStepGen
+                                  << " printTime=" << printTime
+                                  << " sgTime=" << sgTime << std::endl;
+                        break;
+                    }
+                    double waitSec = (std::max)(aheadMcu - BUFFER_TIME_LOW,
+                                              aheadStepGen - STEPGEN_BUFFER_HIGH * 0.5);
+                    int waitMs = (std::max)(5, (std::min)(200, static_cast<int>(waitSec * 1000)));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
                 }
-                if (ahead < BUFFER_TIME_HIGH) break;
-                double waitSec = ahead - BUFFER_TIME_LOW;
-                int waitMs = (std::max)(10, (std::min)(500, static_cast<int>(waitSec * 1000)));
-                std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+            }
+
+            // Log if flush+backpressure took too long
+            {
+                auto flushMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - flushStart).count();
+                if (flushMs > 2000) {
+                    std::cerr << "[GcodeLoop] Flush+BP took " << flushMs
+                              << "ms at line " << (i + 1) << std::endl;
+                }
             }
         }
     }
@@ -694,7 +747,8 @@ static void printUsage(const char* exe) {
               << "Options:\n"
               << "  --port <COMx>     - serial port (default COM3)\n"
               << "  --config <file>   - config file (default configs/generic-duet3-6hc.cfg)\n"
-              << "  --start-line <N>  - skip to line N (skip non-move lines before it)\n";
+              << "  --start-line <N>  - skip to line N (skip non-move lines before it)\n"
+              << "  --speed-factor <X> - speed multiplier (e.g. 2.0 for 2x speed)\n";
 }
 
 // ---- Main ----
@@ -708,6 +762,7 @@ int main(int argc, char* argv[]) {
     std::string port = "COM3";
     std::string configPath = "configs/generic-duet3-6hc.cfg";
     size_t g_startLine = 0;
+    double g_speedFactor = 1.0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -717,6 +772,8 @@ int main(int argc, char* argv[]) {
             configPath = argv[++i];
         } else if (arg == "--start-line" && i + 1 < argc) {
             g_startLine = std::stoull(argv[++i]);
+        } else if (arg == "--speed-factor" && i + 1 < argc) {
+            g_speedFactor = std::stod(argv[++i]);
         } else if (mode.empty()) {
             mode = arg;
         } else if (modeArg.empty()) {
@@ -747,7 +804,7 @@ int main(int argc, char* argv[]) {
             LogError("gcode mode requires a file path");
             result = 1;
         } else {
-            result = runGcodeFile(ctx, modeArg, g_startLine);
+            result = runGcodeFile(ctx, modeArg, g_startLine, g_speedFactor);
         }
     } else if (mode == "move") {
         if (modeArg.empty()) {

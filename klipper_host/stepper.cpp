@@ -6,12 +6,26 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <climits>
 
 static constexpr int64_t MAX_SCHEDULE_TICKS = (1LL << 31) - 1;
 
 // ========== MCU_stepper ==========
 
 MCU_stepper::MCU_stepper(KlipperMCU& mcu) : m_mcu(mcu) {}
+
+int64_t MCU_stepper::syncPosition(int timeoutMs) {
+    std::map<std::string, int64_t> outParams;
+    std::map<std::string, std::vector<uint8_t>> outBuf;
+    std::map<std::string, int64_t> params = {{"oid", m_oid}};
+    if (!m_mcu.sendWithResponse("stepper_get_position", "stepper_position",
+                                 outParams, outBuf, params, {}, timeoutMs)) {
+        std::cerr << "[Stepper] syncPosition timeout oid=" << m_oid << std::endl;
+        return INT64_MIN;
+    }
+    auto it = outParams.find("pos");
+    return (it != outParams.end()) ? it->second : INT64_MIN;
+}
 
 void MCU_stepper::setupPin(const std::string& stepPin, const std::string& dirPin) {
     m_stepPin = stepPin;
@@ -344,7 +358,9 @@ bool PrinterRail::homeAxis(KlipperMCU& mcu) {
     }
 
     // Phase 2: Retract
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // Sync barrier: trsync already stopped the stepper (count=0, moves freed).
+    // Round-trip to MCU confirms all prior state changes are settled.
+    m_stepper.syncPosition();
     {
         double printTime = clockSync.estimatedPrintTime() + 0.1;
         int64_t startClock = clockSync.printTimeToClock(printTime);
@@ -369,6 +385,8 @@ bool PrinterRail::homeAxis(KlipperMCU& mcu) {
     }
 
     // Phase 3: Slow home
+    // Sync barrier: confirm MCU finished executing retract steps.
+    m_stepper.syncPosition();
     {
         double printTime = clockSync.estimatedPrintTime() + 0.1;
         int64_t homeClock = clockSync.printTimeToClock(printTime);

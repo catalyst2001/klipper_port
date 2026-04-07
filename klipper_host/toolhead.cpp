@@ -981,32 +981,17 @@ bool ToolHead::generateSteps() {
         int64_t windowEnd = windowStart + WINDOW_TICKS;
         bool anyRemaining = false;
 
-        // Skip windows that are already in the past — don't waste time
-        // processing steps that can't be sent in time
+        // Check if window is past MCU clock. If so, skip it —
+        // individual steps within are unrecoverable (MCU rejects past timers).
+        // With STEPGEN_BUFFER_HIGH backpressure this should be rare.
         {
             int64_t mcuCkNow = m_mcu.getClockSync().getClock();
             double windowLeadSec = static_cast<double>(windowStart - mcuCkNow) / mcuFreqNom;
             if (windowLeadSec < -0.200) {
-                // This window is >200ms in the past, skip it entirely
                 std::cerr << "[StepGen] SKIP_WINDOW lead=" << windowLeadSec
                           << "s windowStart=" << windowStart << std::endl;
-                // Advance all axes' positions past this window
-                for (int axis = 0; axis < 3; ++axis) {
-                    auto& ad = axisData[axis];
-                    auto& as = axState[axis];
-                    if (!ad.initialized) continue;
-                    while (as.pos < ad.steps.size() && ad.steps[as.pos].clock <= windowEnd)
-                        as.pos++;
-                    if (as.pos < ad.steps.size()) anyRemaining = true;
-                }
-                if (!anyRemaining) break;
-                // Advance window
-                int64_t nextStep = INT64_MAX;
-                for (int axis = 0; axis < 3; ++axis) {
-                    if (axState[axis].pos < axisData[axis].steps.size())
-                        nextStep = std::min(nextStep, axisData[axis].steps[axState[axis].pos].clock);
-                }
-                windowStart = (nextStep > windowEnd) ? nextStep : windowEnd;
+                // Advance past this window — steps are lost
+                windowStart = windowEnd;
                 continue;
             }
         }
@@ -1111,45 +1096,47 @@ bool ToolHead::generateSteps() {
                         continue;
                     }
 
-                    // MIN_AHEAD check
+                    // MIN_AHEAD check: ensure step is >50ms ahead of MCU clock.
+                    // With STEPGEN_BUFFER_HIGH backpressure, this should be rare.
+                    // If step is close to MCU clock, wait briefly.
+                    // If step is past MCU clock (>100ms), skip this direction run
+                    // to prevent MCU shutdown — steps are lost but print continues.
                     {
                         int64_t stepCk64 = batchClocks[pos];
                         int64_t mcuCk64 = m_mcu.getClockSync().getClock();
                         double aheadSec = static_cast<double>(stepCk64 - mcuCk64) / mcuFreqNom;
                         constexpr double MIN_AHEAD_S = 0.050;
-                        if (aheadSec < MIN_AHEAD_S) {
-                            std::cerr << "[StepGen] MIN_AHEAD axis=" << axis
+                        if (aheadSec < -0.100) {
+                            // Step is in the past — skip this direction run
+                            std::cerr << "[StepGen] SKIP_RUN axis=" << axis
                                       << " aheadSec=" << aheadSec
-                                      << " stepCk=" << stepCk64
-                                      << " mcuCk=" << mcuCk64
-                                      << " lastStepCk=" << as.lastStepClock
-                                      << std::endl;
+                                      << " steps=" << numSteps << std::endl;
+                            as.pos = runEnd;
+                            break; // break out of step compression loop
+                        }
+                        if (aheadSec < MIN_AHEAD_S) {
                             m_mcu.flushBatch();
-                            bool skippedPast = false;
                             while (m_mcu.isConnected() && !m_mcu.isShutdown()) {
                                 mcuCk64 = m_mcu.getClockSync().getClock();
                                 aheadSec = static_cast<double>(stepCk64 - mcuCk64) / mcuFreqNom;
                                 if (aheadSec >= MIN_AHEAD_S) break;
                                 if (aheadSec < -0.100) {
-                                    // Steps too far in the past — skip ALL
-                                    // remaining steps in this direction run.
-                                    // Don't try to resetStepClock with tight
-                                    // margin — that triggers Timer too close.
-                                    // Don't update lastStepClock — MCU stepper
-                                    // is still at the last actually-sent clock.
+                                    // Slipped past while waiting — skip
                                     std::cerr << "[StepGen] SKIP_RUN axis=" << axis
-                                              << " skipped=" << (numSteps - pos)
-                                              << std::endl;
-                                    pos = numSteps;
-                                    skippedPast = true;
+                                              << " aheadSec=" << aheadSec
+                                              << " steps=" << numSteps << std::endl;
                                     break;
                                 }
+                                m_mcu.processIncoming(0);
                                 std::this_thread::sleep_for(
-                                    std::chrono::milliseconds(5));
+                                    std::chrono::milliseconds(2));
                             }
                             if (!m_mcu.isConnected() || m_mcu.isShutdown())
                                 return false;
-                            if (skippedPast) continue;
+                            if (aheadSec < -0.100) {
+                                as.pos = runEnd;
+                                break;
+                            }
                         }
                     }
 
@@ -1227,6 +1214,15 @@ bool ToolHead::generateSteps() {
 
     // Final flush and end-of-batch throttle
     m_mcu.flushBatch();
+
+    // Update stepGen progress — the gcode thread uses this for backpressure.
+    // Publish the end time of the last TrapMove we processed.
+    {
+        const auto& lastTM = trapMoves.back();
+        double batchEndTime = lastTM.print_time + lastTM.move_t;
+        m_stepGenPrintTime.store(batchEndTime, std::memory_order_release);
+    }
+
     // Account for any remaining commands in the last window
     if (cmdsThisWindow > 0) {
         m_pendingWindows.push_back({globalMaxClock, cmdsThisWindow});

@@ -724,7 +724,7 @@ bool KlipperMCU::finalizeConfig() {
     }
 
     bool needsRestart = false;
-    if (!isConfig && configParams.count("move_count") && configParams["move_count"] > 0) {
+    if (configParams.count("move_count") && configParams["move_count"] > 0) {
         std::cout << "[KlipperMCU] Stale MCU state detected (move_count="
                   << configParams["move_count"] << "), resetting..." << std::endl;
         needsRestart = true;

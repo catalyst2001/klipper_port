@@ -70,8 +70,14 @@ public:
         m_stepClockSnapValid = false;
         m_pendingWindows.clear();
         m_totalPendingCmds = 0;
+        m_stepGenPrintTime.store(0.0, std::memory_order_release);
         for (int i = 0; i < 3; i++)
             if (m_steppers[i]) m_steppers[i]->resetClockInitialized();
+    }
+
+    // Get the last print_time processed by stepGen (for backpressure)
+    double getStepGenPrintTime() const {
+        return m_stepGenPrintTime.load(std::memory_order_acquire);
     }
 
     // Input shaper access
@@ -126,6 +132,10 @@ private:
     // Step gen pause flag (for homing)
     std::atomic<bool> m_stepGenPaused{false};
     std::atomic<bool> m_stepGenRunning{false};
+
+    // Backpressure: last print_time that stepGen has actually sent to MCU.
+    // The gcode thread must not get too far ahead of this value.
+    std::atomic<double> m_stepGenPrintTime{0.0};
 
     // Lookahead: reverse + forward pass, then flush
     // lazy=true: only flush moves up to confirmed velocity peak (partial flush)

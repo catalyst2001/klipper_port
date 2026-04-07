@@ -47,6 +47,10 @@ public:
     double getFeedrate() const { return m_feedrate; }
     void setFeedrate(double f) { m_feedrate = f; }
 
+    // Speed factor (1.0 = normal, 2.0 = double speed)
+    void setSpeedFactor(double f) { m_speedFactor = f; }
+    double getSpeedFactor() const { return m_speedFactor; }
+
     // Register custom command handler
     using CommandHandler = std::function<bool(const std::map<char, double>& params)>;
     void registerCommand(const std::string& cmd, CommandHandler handler);
@@ -59,6 +63,7 @@ private:
     Vec3 m_basePos;         // G92 offset
     bool m_absoluteMode = true;
     double m_feedrate = 25.0;  // mm/s (default)
+    double m_speedFactor = 1.0;  // speed multiplier (M220 equivalent)
     bool m_homed[3] = {false, false, false};
 
     // Axis rails for homing
