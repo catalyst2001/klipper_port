@@ -1392,6 +1392,10 @@ uint64_t KlipperMCU::stepSyncAdjustMinClock(uint64_t minClock, uint64_t endClock
     // Push when this new command's slot becomes free
     m_stepSyncHeap.push(endClock);
 
+    m_stepSyncTotal.fetch_add(1, std::memory_order_relaxed);
+    if (avail > 0)
+        m_stepSyncGated.fetch_add(1, std::memory_order_relaxed);
+
     // Return the effective min_clock: can't send before slot is free
     return (avail > minClock) ? avail : minClock;
 }
@@ -1399,12 +1403,17 @@ uint64_t KlipperMCU::stepSyncAdjustMinClock(uint64_t minClock, uint64_t endClock
 void KlipperMCU::stepSyncReset() {
     std::lock_guard<std::mutex> lk(m_stepSyncMutex);
     while (!m_stepSyncHeap.empty()) m_stepSyncHeap.pop();
-    // Reserve slots for non-stepper move pool users (digital_out, PWM, etc.)
-    // and a safety margin for SQ clock estimation variance.
-    // Python Klipper subtracts _reserved_move_slots here.
-    int reserved = 12;  // ~6 for digital_out/PWM + safety margin
-    int usable = (m_mcuMoveCount - reserved) / 2;  // use half (conservative)
+    // Reserve a large margin of move slots.
+    // Python Klipper's steppersync_flush uses a move_clock parameter to limit
+    // how many commands are submitted per cycle, preventing MCU queue overflow.
+    // Our code submits all commands at once, so endClocks age out and the
+    // heap-based gating becomes ineffective at high speeds.
+    // Using move_count/2 leaves ample free slots on the MCU for timing
+    // inaccuracies (USB vs UART bittime estimation mismatch).
+    int usable = m_mcuMoveCount / 2;
     if (usable < 64) usable = 64;
+    m_stepSyncTotal.store(0, std::memory_order_relaxed);
+    m_stepSyncGated.store(0, std::memory_order_relaxed);
     for (int i = 0; i < usable; i++)
         m_stepSyncHeap.push(0);
 }

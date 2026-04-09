@@ -33,6 +33,7 @@
 #include "gcode.h"
 #include "tmc5160.h"
 #include "input_shaper.h"
+#include "reactor.h"
 
 // ---- Global state ----
 static std::mutex g_mcuMutex;
@@ -74,10 +75,10 @@ static void signalHandler(int) {
 }
 
 // ---- Background: ProcessIncoming + response logging ----
+// (Not used with reactor — serial queue handles I/O.  Kept for non-reactor
+// modes like monitor/info where serial queue is active.)
 static void pollThread(KlipperMCU& mcu) {
     while (g_running) {
-        // When SerialQueue is active, it owns all serial I/O.
-        // Responses are dispatched via its receive callback.
         if (mcu.isSerialQueueActive()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
@@ -110,7 +111,6 @@ static void pollThread(KlipperMCU& mcu) {
 static void clockSyncThread(KlipperMCU& mcu) {
     while (g_running) {
         if (mcu.isSerialQueueActive()) {
-            // Async path: send get_clock via SerialQueue, response handled by callback
             mcu.clockSyncPollAsync();
         } else {
             std::lock_guard<std::mutex> lock(g_mcuMutex);
@@ -134,11 +134,13 @@ static void clockSyncThread(KlipperMCU& mcu) {
 // ---- Initialization sequence (matches GUI flow) ----
 struct TestContext {
     KlipperMCU mcu;
+    Reactor reactor;
     std::unique_ptr<ConfigResult> config;
     std::unique_ptr<ToolHead> toolhead;
     std::unique_ptr<GCodeParser> gcode;
     std::vector<std::unique_ptr<MCU_SPI>> spiObjects;
     std::vector<std::unique_ptr<TMC5160>> tmcDrivers;
+    // Legacy threads for non-reactor modes (monitor, info)
     std::thread pollTh;
     std::thread clockSyncTh;
 
@@ -250,8 +252,12 @@ struct TestContext {
         }
         Log("Config finalized! OIDs=" + std::to_string(mcu.getOidCount()));
 
-        // 6. Re-init clock sync after finalize
-        mcu.initClockSync();
+        // 6. Re-init clock sync after finalizeConfig (MCU may have been reset,
+        //    which resets its clock to 0 — the step-3 sync data would be stale)
+        if (!mcu.initClockSync()) {
+            LogError("Clock sync re-init failed: " + mcu.getLastError());
+            return false;
+        }
         {
             auto& cs = mcu.getClockSync();
             auto dbg = cs.getDebugInfo();
@@ -262,19 +268,20 @@ struct TestContext {
             Log(ss.str());
         }
 
-        // 7. Start background threads (AFTER finalize — finalize may reset MCU)
+        // 7. Set shutdown callback
         mcu.setShutdownCallback([](const std::string& reason) {
             Log("!!! MCU SHUTDOWN: " + reason + " !!!");
             g_shutdown = true;
             g_running = false;
         });
-        pollTh = std::thread(pollThread, std::ref(mcu));
-        clockSyncTh = std::thread(clockSyncThread, std::ref(mcu));
+        // NOTE: Legacy poll/clockSync threads are NOT started here.
+        // For reactor-based gcode mode, the reactor handles clock sync.
+        // For monitor/info modes, call startLegacyThreads() explicitly.
 
-        // 8. Create ToolHead
+        // 8. Create ToolHead with reactor support
         {
-            std::lock_guard<std::mutex> lock(g_mcuMutex);
             toolhead = std::make_unique<ToolHead>(mcu);
+            toolhead->setReactor(&reactor);
             double basePrintTime = mcu.getClockSync().estimatedPrintTime() + 0.25;
             toolhead->setNextPrintTime(basePrintTime);
             toolhead->setMaxVelocity(config->maxVelocity);
@@ -302,14 +309,11 @@ struct TestContext {
                 driver->setCurrent(tc.runCurrent, tc.holdCurrent, tc.senseResistor);
                 driver->setMicrosteps(tc.microsteps, tc.interpolate);
                 driver->setStealthChop(tc.stealthChop);
-                {
-                    std::lock_guard<std::mutex> lock(g_mcuMutex);
-                    if (driver->initRegisters()) {
-                        auto status = driver->readStatus();
-                        Log("  [" + tc.name + "] Init OK - " + TMC5160::formatStatus(status));
-                    } else {
-                        LogError("  [" + tc.name + "] Init FAILED");
-                    }
+                if (driver->initRegisters()) {
+                    auto status = driver->readStatus();
+                    Log("  [" + tc.name + "] Init OK - " + TMC5160::formatStatus(status));
+                } else {
+                    LogError("  [" + tc.name + "] Init FAILED");
                 }
                 tmcDrivers.push_back(std::move(driver));
             }
@@ -327,8 +331,14 @@ struct TestContext {
         return true;
     }
 
+    void startLegacyThreads() {
+        pollTh = std::thread(pollThread, std::ref(mcu));
+        clockSyncTh = std::thread(clockSyncThread, std::ref(mcu));
+    }
+
     void shutdown() {
         g_running = false;
+        reactor.end();
         if (pollTh.joinable()) pollTh.join();
         if (clockSyncTh.joinable()) clockSyncTh.join();
         mcu.stopSerialQueue();
@@ -337,7 +347,7 @@ struct TestContext {
     }
 };
 
-// ---- Mode: run gcode file ----
+// ---- Mode: run gcode file (reactor-based) ----
 static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t startLine = 0, double speedFactor = 1.0) {
     std::ifstream file(filePath);
     if (!file.is_open()) {
@@ -355,16 +365,13 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
     }
 
     // --start-line: skip to the specified line, but execute setup commands
-    // (homing, mode setting, etc.) before it
     if (startLine > 0 && startLine < lines.size()) {
         Log("Skipping to line " + std::to_string(startLine) + " (executing setup commands)...");
         std::vector<std::string> preamble;
         for (size_t i = 0; i < startLine; ++i) {
             std::string t = lines[i];
-            // Trim
             while (!t.empty() && (t[0] == ' ' || t[0] == '\t')) t.erase(t.begin());
             if (t.empty() || t[0] == ';' || t[0] == '%' || t[0] == '(') continue;
-            // Keep setup commands: G28, G90, G91, G92, M-codes
             if (t[0] == 'M' || t[0] == 'm' ||
                 t.substr(0, 3) == "G28" || t.substr(0, 3) == "G90" ||
                 t.substr(0, 3) == "G91" || t.substr(0, 3) == "G92") {
@@ -372,7 +379,6 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
             }
         }
         Log("Preamble: " + std::to_string(preamble.size()) + " setup commands");
-        // Replace lines: preamble + lines from startLine onward
         std::vector<std::string> newLines;
         newLines.insert(newLines.end(), preamble.begin(), preamble.end());
         newLines.insert(newLines.end(), lines.begin() + startLine, lines.end());
@@ -380,19 +386,14 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
         Log("Effective lines: " + std::to_string(lines.size()));
     }
 
-    constexpr double BUFFER_TIME_START = 4.0;
-    constexpr double BUFFER_TIME_HIGH  = 4.0;
-    constexpr double BUFFER_TIME_LOW   = 1.0;
     constexpr size_t FLUSH_BATCH = 10;
-    size_t linesSinceFlush = 0;
     size_t errorCount = 0;
 
-    // Init print state
+    // Init print state (uses BUFFER_TIME_START from trapq.h = 0.250)
+    ctx.toolhead->resetSyncState();
+    double initialTime = ctx.mcu.getClockSync().estimatedPrintTime() + BUFFER_TIME_START;
+    ctx.toolhead->setNextPrintTime(initialTime);
     {
-        std::lock_guard<std::mutex> lock(g_mcuMutex);
-        ctx.toolhead->resetSyncState();
-        double initialTime = ctx.mcu.getClockSync().estimatedPrintTime() + BUFFER_TIME_START;
-        ctx.toolhead->setNextPrintTime(initialTime);
         auto& cs = ctx.mcu.getClockSync();
         std::ostringstream ss;
         ss << "Print init: estPrintTime=" << std::fixed << std::setprecision(3)
@@ -402,225 +403,153 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
            << " nomFreq=" << cs.getMcuFreq();
         Log(ss.str());
     }
-    Log("Starting print...");
+    Log("Starting print (reactor-based)...");
 
     auto startTime = std::chrono::steady_clock::now();
     size_t contentLines = 0;
     size_t flushCount = 0;
+    size_t gcodeIdx = 0;
+    size_t linesSinceFlush = 0;
 
-    // Step generation thread: decouples gcode processing from serial I/O.
-    // The main thread builds moves (trapq); this thread sends them to MCU.
-    // generateSteps self-paces via clock-gating (waits until MCU clock is
-    // close enough before sending each step batch).
-    std::atomic<bool> stepGenDone{false};
-    std::thread stepGenThread([&]() {
-        while (ctx.mcu.isConnected() && !ctx.mcu.isShutdown()) {
-            auto t0 = std::chrono::steady_clock::now();
-            bool ok = ctx.toolhead->generateSteps();
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - t0).count();
-            if (ms > 500) {
-                std::cerr << "[StepGen] " << ms << "ms" << std::endl;
-            }
-            if (!ok) break; // MCU error
-            if (stepGenDone.load(std::memory_order_acquire)) {
-                // Final drain: process any remaining TrapMoves
-                ctx.toolhead->generateSteps();
-                break;
-            }
-            // Brief sleep when trapq was empty to avoid busy-waiting
-            if (ms < 2)
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // ---- Reactor timer: clock sync (every ~984ms) ----
+    auto clockSyncTimer = ctx.reactor.registerTimer([&](double eventtime) -> double {
+        if (!g_running) return REACTOR_NEVER;
+        if (ctx.mcu.isSerialQueueActive()) {
+            ctx.mcu.clockSyncPollAsync();
         }
-    });
+        return eventtime + 0.984;
+    }, ctx.reactor.monotonic() + 0.984);
 
-    for (size_t i = 0; i < lines.size(); ++i) {
-        if (!g_running) break;
-
-        // Stall detector: check if main loop is making progress
-        static auto lastProgressTime = std::chrono::steady_clock::now();
-        static size_t lastProgressLine = 0;
-        auto nowPt = std::chrono::steady_clock::now();
-        if (i != lastProgressLine) {
-            lastProgressTime = nowPt;
-            lastProgressLine = i;
+    // ---- Reactor timer: step generation (every 25ms) ----
+    auto stepGenTimer = ctx.reactor.registerTimer([&](double eventtime) -> double {
+        if (!g_running) return REACTOR_NEVER;
+        if (ctx.mcu.isConnected() && !ctx.mcu.isShutdown()) {
+            ctx.toolhead->generateSteps();
         }
+        return eventtime + 0.025;
+    }, ctx.reactor.monotonic() + 0.025);
 
-        // Health check
-        {
-            std::lock_guard<std::mutex> lock(g_mcuMutex);
-            if (!ctx.mcu.isConnected()) {
-                LogError("MCU disconnected at line " + std::to_string(i + 1)
-                         + " content=" + std::to_string(contentLines));
-                break;
-            }
-            if (ctx.mcu.isShutdown()) {
-                std::string shutMsg = ctx.mcu.getShutdownMsg();
-                double ahead = ctx.toolhead->getNextPrintTime()
-                             - ctx.mcu.getClockSync().estimatedPrintTime();
-                std::ostringstream ss;
-                ss << "MCU SHUTDOWN at line " << (i + 1) << "/" << lines.size()
-                   << " content=" << contentLines
-                   << " ahead=" << std::fixed << std::setprecision(3) << ahead << "s"
-                   << " reason=\"" << shutMsg << "\"";
-                LogError(ss.str());
-                break;
-            }
-        }
-
-        const std::string& cmd = lines[i];
-        // Skip empty/comment lines
-        {
-            std::string trimmed = cmd;
-            while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
-                trimmed.erase(trimmed.begin());
-            if (trimmed.empty() || trimmed[0] == ';' || trimmed[0] == '%' || trimmed[0] == '(')
-                continue;
-        }
-
-        // Execute
-        bool execOk;
-        {
-            std::lock_guard<std::mutex> lock(g_mcuMutex);
-            double minTime = ctx.mcu.getClockSync().estimatedPrintTime() + 0.25;
-            if (minTime > ctx.toolhead->getNextPrintTime())
-                ctx.toolhead->setNextPrintTime(minTime);
-            execOk = ctx.gcode->executeLine(cmd);
-        }
-        if (!execOk) {
-            std::string msg = ctx.gcode->getLastMessage();
-            if (!msg.empty() && msg.find("Unknown") == std::string::npos) {
-                LogError("Line " + std::to_string(i + 1) + ": " + msg + " [" + cmd + "]");
-                errorCount++;
-            }
-        }
-
-        contentLines++;
-        linesSinceFlush++;
-
-        // Periodic line logging: first 5, then every 100 content lines
-        if (contentLines <= 5 || contentLines % 100 == 0) {
-            std::lock_guard<std::mutex> lock(g_mcuMutex);
-            auto p = ctx.toolhead->getPosition();
-            auto elapsed = std::chrono::steady_clock::now() - startTime;
-            double sec = std::chrono::duration<double>(elapsed).count();
+    // ---- Reactor timer: gcode processing ----
+    auto gcodeTimer = ctx.reactor.registerTimer([&](double eventtime) -> double {
+        // Health check (before g_running so shutdown diagnostics are logged)
+        if (ctx.mcu.isShutdown()) {
+            std::string shutMsg = ctx.mcu.getShutdownMsg();
             double ahead = ctx.toolhead->getNextPrintTime()
                          - ctx.mcu.getClockSync().estimatedPrintTime();
             std::ostringstream ss;
-            ss << "L" << (i + 1) << "/" << lines.size()
-               << " #" << contentLines
-               << " pos=(" << std::fixed << std::setprecision(2)
-               << p.x << "," << p.y << "," << p.z << ")"
-               << " ahead=" << std::setprecision(3) << ahead << "s"
-               << " t=" << std::setprecision(1) << sec << "s"
-               << " [" << cmd << "]";
-            if (ctx.mcu.isShutdown())
-                ss << " !! MCU SHUTDOWN !!";
-            Log(ss.str());
+            ss << "MCU SHUTDOWN at line " << (gcodeIdx + 1) << "/" << lines.size()
+               << " content=" << contentLines
+               << " ahead=" << std::fixed << std::setprecision(3) << ahead << "s"
+               << " reason=\"" << shutMsg << "\""
+               << " stepSync(total=" << ctx.mcu.getStepSyncTotal()
+               << " gated=" << ctx.mcu.getStepSyncGated() << ")";
+            LogError(ss.str());
+            ctx.reactor.end();
+            return REACTOR_NEVER;
+        }
+        if (!g_running || gcodeIdx >= lines.size()) {
+            // Final flush + step gen
+            if (ctx.mcu.isConnected() && !ctx.mcu.isShutdown()) {
+                ctx.toolhead->flush();
+                ctx.toolhead->generateSteps();
+            }
+            ctx.reactor.end();
+            return REACTOR_NEVER;
         }
 
-        // Flush periodically to push moves into TrapQ for the step gen thread
-        if (linesSinceFlush >= FLUSH_BATCH || i == lines.size() - 1) {
-            linesSinceFlush = 0;
-            flushCount++;
-            auto flushStart = std::chrono::steady_clock::now();
+        if (!ctx.mcu.isConnected()) {
+            LogError("MCU disconnected at line " + std::to_string(gcodeIdx + 1)
+                     + " content=" + std::to_string(contentLines));
+            ctx.reactor.end();
+            return REACTOR_NEVER;
+        }
 
+        // Process a batch of gcode lines
+        for (size_t batch = 0; batch < FLUSH_BATCH && gcodeIdx < lines.size() && g_running;
+             ++gcodeIdx) {
+            const std::string& cmd = lines[gcodeIdx];
+            // Skip empty/comment lines
             {
-                std::lock_guard<std::mutex> lock(g_mcuMutex);
-                ctx.toolhead->flush();
+                std::string trimmed = cmd;
+                while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
+                    trimmed.erase(trimmed.begin());
+                if (trimmed.empty() || trimmed[0] == ';' || trimmed[0] == '%' || trimmed[0] == '(')
+                    continue;
             }
 
-            // Log some flushes for diagnostics
+            // Execute gcode line (moveAbsolute → checkPause → reactor.pause
+            // handles backpressure automatically)
+            bool execOk = ctx.gcode->executeLine(cmd);
+            if (!execOk) {
+                std::string msg = ctx.gcode->getLastMessage();
+                if (!msg.empty() && msg.find("Unknown") == std::string::npos) {
+                    LogError("Line " + std::to_string(gcodeIdx + 1) + ": " + msg + " [" + cmd + "]");
+                    errorCount++;
+                }
+            }
+
+            contentLines++;
+            batch++;
+
+            // Periodic logging: first 5, then every 100 content lines
+            if (contentLines <= 5 || contentLines % 100 == 0) {
+                auto p = ctx.toolhead->getPosition();
+                auto elapsed = std::chrono::steady_clock::now() - startTime;
+                double sec = std::chrono::duration<double>(elapsed).count();
+                double ahead = ctx.toolhead->getNextPrintTime()
+                             - ctx.mcu.getClockSync().estimatedPrintTime();
+                std::ostringstream ss;
+                ss << "L" << (gcodeIdx + 1) << "/" << lines.size()
+                   << " #" << contentLines
+                   << " pos=(" << std::fixed << std::setprecision(2)
+                   << p.x << "," << p.y << "," << p.z << ")"
+                   << " ahead=" << std::setprecision(3) << ahead << "s"
+                   << " t=" << std::setprecision(1) << sec << "s"
+                   << " [" << cmd << "]";
+                Log(ss.str());
+            }
+        }
+
+        // Flush after each batch
+        ctx.toolhead->flush();
+        flushCount++;
+
+        // Backpressure: pause gcode coroutine if too far ahead of MCU.
+        // This yields back to the reactor, allowing stepGen and clockSync
+        // timers to run, matching Python Klipper's ToolHead._check_pause().
+        ctx.toolhead->checkPause();
+
+        // Log flush diagnostics
+        {
             auto elapsed = std::chrono::steady_clock::now() - startTime;
             double sec = std::chrono::duration<double>(elapsed).count();
-            double ahead;
-            double printTime;
-            {
-                std::lock_guard<std::mutex> lock(g_mcuMutex);
-                printTime = ctx.toolhead->getNextPrintTime();
-                ahead = printTime - ctx.mcu.getClockSync().estimatedPrintTime();
-            }
-            if (flushCount <= 5 || flushCount % 10 == 0 || i == lines.size() - 1) {
+            double printTime = ctx.toolhead->getNextPrintTime();
+            double ahead = printTime - ctx.mcu.getClockSync().estimatedPrintTime();
+            if (flushCount <= 5 || flushCount % 10 == 0 || gcodeIdx >= lines.size()) {
                 std::ostringstream ss;
-                ss << "Flush #" << flushCount << " at line " << (i + 1)
+                ss << "Flush #" << flushCount << " at line " << gcodeIdx
                    << "/" << lines.size()
                    << " elapsed=" << std::fixed << std::setprecision(1) << sec << "s"
                    << " ahead=" << std::setprecision(3) << ahead << "s"
-                   << " printTime=" << std::setprecision(3) << printTime;
+                   << " printTime=" << std::setprecision(3) << printTime
+                   << " steps=" << ctx.mcu.getStepSyncTotal()
+                   << " gated=" << ctx.mcu.getStepSyncGated();
                 Log(ss.str());
             }
-
-            // Backpressure: wait if host is too far ahead of MCU OR stepGen.
-            // Key constraint: lead = ahead(MCU) - STEPGEN_BUFFER_HIGH > 0
-            // must hold so oldest unprocessed TrapMove is always in MCU's future.
-            // In steady state ahead(MCU) ≈ 1.0-1.5s, so STEPGEN_BUFFER_HIGH < 1.0.
-            constexpr double STEPGEN_BUFFER_HIGH = 0.5; // max seconds gcode can be ahead of stepGen
-            {
-                auto bpStart = std::chrono::steady_clock::now();
-                bool logged = false;
-                for (;;) {
-                    if (!g_running) break;
-                    double aheadMcu, aheadStepGen, printTime, sgTime;
-                    {
-                        std::lock_guard<std::mutex> lock(g_mcuMutex);
-                        if (!ctx.mcu.isConnected() || ctx.mcu.isShutdown()) break;
-                        printTime = ctx.toolhead->getNextPrintTime();
-                        aheadMcu = printTime - ctx.mcu.getClockSync().estimatedPrintTime();
-                        sgTime = ctx.toolhead->getStepGenPrintTime();
-                        // sgTime=0 means stepGen hasn't processed any batch yet.
-                        // Don't apply stepGen backpressure until first batch completes,
-                        // otherwise gcode blocks if initial commands produce no TrapMoves.
-                        aheadStepGen = (sgTime > 0.0) ? (printTime - sgTime) : 0.0;
-                    }
-                    if (aheadMcu < BUFFER_TIME_HIGH && aheadStepGen <= STEPGEN_BUFFER_HIGH) break;
-                    auto bpElapsed = std::chrono::steady_clock::now() - bpStart;
-                    double bpSec = std::chrono::duration<double>(bpElapsed).count();
-                    if (!logged && bpSec > 1.0) {
-                        std::cerr << "[Backpressure] WAIT aheadMcu=" << aheadMcu
-                                  << " aheadStepGen=" << aheadStepGen
-                                  << " printTime=" << printTime
-                                  << " sgTime=" << sgTime << std::endl;
-                        logged = true;
-                    }
-                    if (bpSec > 10.0) {
-                        std::cerr << "[Backpressure] TIMEOUT aheadMcu=" << aheadMcu
-                                  << " aheadStepGen=" << aheadStepGen
-                                  << " printTime=" << printTime
-                                  << " sgTime=" << sgTime << std::endl;
-                        break;
-                    }
-                    double waitSec = (std::max)(aheadMcu - BUFFER_TIME_LOW,
-                                              aheadStepGen - STEPGEN_BUFFER_HIGH * 0.5);
-                    int waitMs = (std::max)(5, (std::min)(200, static_cast<int>(waitSec * 1000)));
-                    std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
-                }
-            }
-
-            // Log if flush+backpressure took too long
-            {
-                auto flushMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - flushStart).count();
-                if (flushMs > 2000) {
-                    std::cerr << "[GcodeLoop] Flush+BP took " << flushMs
-                              << "ms at line " << (i + 1) << std::endl;
-                }
-            }
         }
-    }
 
-    // Final flush + stop step generation thread
-    Log("Flushing remaining moves...");
-    {
-        std::lock_guard<std::mutex> lock(g_mcuMutex);
-        if (ctx.mcu.isConnected() && !ctx.mcu.isShutdown())
-            ctx.toolhead->flush();
-    }
-    stepGenDone.store(true, std::memory_order_release);
-    stepGenThread.join();
-    {
-        std::lock_guard<std::mutex> lock(g_mcuMutex);
-        ctx.toolhead->resetSyncState();
-    }
+        return REACTOR_NOW;  // process next batch immediately (checkPause limits rate)
+    }, REACTOR_NOW);
+
+    // ---- Run reactor event loop (blocks until end() is called) ----
+    ctx.reactor.run();
+
+    // Cleanup
+    ctx.reactor.unregisterTimer(clockSyncTimer);
+    ctx.reactor.unregisterTimer(stepGenTimer);
+    ctx.reactor.unregisterTimer(gcodeTimer);
+
+    ctx.toolhead->resetSyncState();
 
     auto elapsed = std::chrono::steady_clock::now() - startTime;
     double totalSec = std::chrono::duration<double>(elapsed).count();
@@ -632,22 +561,20 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
            << " contentLines=" << contentLines << " flushes=" << flushCount;
         Log(ps.str());
     }
-    std::ostringstream ss;
-    ss << "Print finished: " << lines.size() << " lines, "
-       << std::fixed << std::setprecision(1) << totalSec << "s, "
-       << errorCount << " errors";
-    Log(ss.str());
+    {
+        std::ostringstream ss;
+        ss << "Print finished: " << lines.size() << " lines, "
+           << std::fixed << std::setprecision(1) << totalSec << "s, "
+           << errorCount << " errors";
+        Log(ss.str());
+    }
 
     // Wait for MCU to finish executing remaining queued steps
     Log("Waiting for MCU to finish executing steps...");
     for (int w = 0; w < 300 && g_running; ++w) {
-        double ahead;
-        {
-            std::lock_guard<std::mutex> lock(g_mcuMutex);
-            if (!ctx.mcu.isConnected() || ctx.mcu.isShutdown()) break;
-            ahead = ctx.toolhead->getNextPrintTime()
-                  - ctx.mcu.getClockSync().estimatedPrintTime();
-        }
+        if (!ctx.mcu.isConnected() || ctx.mcu.isShutdown()) break;
+        double ahead = ctx.toolhead->getNextPrintTime()
+                     - ctx.mcu.getClockSync().estimatedPrintTime();
         if (ahead <= 0.2) break;
         if (w % 20 == 0) {
             std::ostringstream ss;
@@ -665,46 +592,29 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
 static int runGcodeBlock(TestContext& ctx, const std::string& gcodeBlock) {
     Log("Executing: " + gcodeBlock);
 
-    {
-        std::lock_guard<std::mutex> lock(g_mcuMutex);
-        ctx.toolhead->resetSyncState();
-        double now = ctx.mcu.getClockSync().estimatedPrintTime() + 0.25;
-        ctx.toolhead->setNextPrintTime(now);
-    }
+    ctx.toolhead->resetSyncState();
+    double now = ctx.mcu.getClockSync().estimatedPrintTime() + 0.25;
+    ctx.toolhead->setNextPrintTime(now);
 
-    int count;
-    {
-        std::lock_guard<std::mutex> lock(g_mcuMutex);
-        count = ctx.gcode->executeBlock(gcodeBlock);
-    }
+    int count = ctx.gcode->executeBlock(gcodeBlock);
     if (count <= 0) {
         LogError("Execute failed: " + ctx.gcode->getLastMessage());
         return 1;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(g_mcuMutex);
-        ctx.toolhead->flush();
-    }
+    ctx.toolhead->flush();
     ctx.toolhead->generateSteps();
 
     Log("Waiting for motion to complete...");
     for (int w = 0; w < 100 && g_running; ++w) {
-        double ahead;
-        {
-            std::lock_guard<std::mutex> lock(g_mcuMutex);
-            if (!ctx.mcu.isConnected() || ctx.mcu.isShutdown()) break;
-            ahead = ctx.toolhead->getNextPrintTime()
-                  - ctx.mcu.getClockSync().estimatedPrintTime();
-        }
+        if (!ctx.mcu.isConnected() || ctx.mcu.isShutdown()) break;
+        double ahead = ctx.toolhead->getNextPrintTime()
+                     - ctx.mcu.getClockSync().estimatedPrintTime();
         if (ahead <= 0.2) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    {
-        std::lock_guard<std::mutex> lock(g_mcuMutex);
-        ctx.toolhead->resetSyncState();
-    }
+    ctx.toolhead->resetSyncState();
 
     Vec3 pos = ctx.toolhead->getPosition();
     std::ostringstream posStr;
@@ -818,6 +728,7 @@ int main(int argc, char* argv[]) {
     // Run selected mode
     int result = 0;
     if (mode == "gcode") {
+        // Reactor-based: no legacy threads needed
         if (modeArg.empty()) {
             LogError("gcode mode requires a file path");
             result = 1;
@@ -825,6 +736,7 @@ int main(int argc, char* argv[]) {
             result = runGcodeFile(ctx, modeArg, g_startLine, g_speedFactor);
         }
     } else if (mode == "move") {
+        ctx.startLegacyThreads();
         if (modeArg.empty()) {
             LogError("move mode requires a gcode string");
             result = 1;
@@ -832,9 +744,11 @@ int main(int argc, char* argv[]) {
             result = runGcodeBlock(ctx, modeArg);
         }
     } else if (mode == "monitor") {
+        ctx.startLegacyThreads();
         int seconds = modeArg.empty() ? 30 : std::stoi(modeArg);
         result = runMonitor(ctx, seconds);
     } else if (mode == "info") {
+        ctx.startLegacyThreads();
         result = runInfo(ctx);
     } else {
         LogError("Unknown mode: " + mode);
