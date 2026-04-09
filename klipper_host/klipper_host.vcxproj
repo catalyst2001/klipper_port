@@ -145,6 +145,7 @@
     <ClCompile Include="input_shaper.cpp" />
     <ClCompile Include="miniz_impl.cpp" />
     <ClCompile Include="serial_queue.cpp" />
+    <ClCompile Include="reactor.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="serial_port.h" />
@@ -162,6 +163,7 @@
     <ClInclude Include="klipper_config.h" />
     <ClInclude Include="tmc5160.h" />
     <ClInclude Include="input_shaper.h" />
+    <ClInclude Include="reactor.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\.editorconfig" />

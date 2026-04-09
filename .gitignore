@@ -19,3 +19,4 @@
 # Test output files
 test_*.txt
 cdb_*.txt
+/test_logs

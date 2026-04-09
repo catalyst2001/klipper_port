@@ -233,6 +233,8 @@ public:
     // the step command's last step will finish (endClock).
     uint64_t stepSyncAdjustMinClock(uint64_t minClock, uint64_t endClock);
     void stepSyncReset();
+    uint64_t getStepSyncTotal() const { return m_stepSyncTotal.load(std::memory_order_relaxed); }
+    uint64_t getStepSyncGated() const { return m_stepSyncGated.load(std::memory_order_relaxed); }
 
 private:
     SerialPort m_serial;
@@ -306,6 +308,8 @@ private:
     // Each entry is the clock at which one move queue slot becomes free.
     std::priority_queue<uint64_t, std::vector<uint64_t>, std::greater<uint64_t>> m_stepSyncHeap;
     std::mutex m_stepSyncMutex;
+    std::atomic<uint64_t> m_stepSyncTotal{0};   // total queue_step commands
+    std::atomic<uint64_t> m_stepSyncGated{0};   // commands gated (avail > 0)
 
     // Expanded enumerations (fully expanded ranges, e.g. PA0=0, PA1=1, ...)
     std::map<std::string, std::map<std::string, int>> m_expandedEnums;

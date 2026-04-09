@@ -12,6 +12,7 @@
 #include <atomic>
 
 class KlipperMCU;
+class Reactor;
 
 // ToolHead: manages motion planning with lookahead.
 // Corresponds to Klipper's ToolHead (toolhead.py).
@@ -82,8 +83,15 @@ public:
     InputShaper& getInputShaper() { return m_inputShaper; }
     const InputShaper& getInputShaper() const { return m_inputShaper; }
 
+    // Reactor support (for pause-based backpressure)
+    void setReactor(Reactor* r) { m_reactor = r; }
+
+    // Backpressure: pause if host is too far ahead of MCU
+    void checkPause();
+
 private:
     KlipperMCU& m_mcu;
+    Reactor* m_reactor = nullptr;
 
     // Motion parameters
     double m_maxVel = 100.0;      // mm/s
@@ -135,9 +143,6 @@ private:
     // lazy=true: only flush moves up to confirmed velocity peak (partial flush)
     // lazy=false: flush all moves (force complete stop at end)
     void lookaheadFlush(bool lazy);
-
-    // Backpressure: sleep if host is too far ahead of MCU
-    void checkPause();
 
     // Sync print_time to MCU clock on first move after idle
     void syncPrintTime();

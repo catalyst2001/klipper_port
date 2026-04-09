@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "toolhead.h"
 #include "klipper_mcu.h"
+#include "reactor.h"
 
 #include <algorithm>
 #include <cmath>
@@ -211,6 +212,10 @@ void ToolHead::moveAbsolute(const Vec3& pos, double speed) {
     m_junctionFlush -= m_queue.back().min_move_t;
     if (m_junctionFlush <= 0.0) {
         lookaheadFlush(true);
+        // Check backpressure after flushing (like Python's _check_pause)
+        if (m_needCheckPause >= 0.0) {
+            checkPause();
+        }
     }
 
     // Note: backpressure (waiting when host is ahead of MCU) is handled
@@ -369,20 +374,26 @@ void ToolHead::syncPrintTime() {
     }
 }
 
-// Backpressure: block if host is too far ahead of MCU.
+// Backpressure: pause if host is too far ahead of MCU.
 // Port of Klipper's ToolHead._check_pause()
+// When a reactor is set, yields the coroutine (allowing other reactor
+// timers like step generation and clock sync to proceed).  Otherwise
+// falls back to thread sleep.
 void ToolHead::checkPause() {
     while (true) {
         double est = m_mcu.getClockSync().estimatedPrintTime();
         double pauseTime = m_nextPrintTime - est - BUFFER_TIME_HIGH;
         if (pauseTime <= 0.0) break;
 
-        // Sleep for the calculated time, clamped to [5ms, 1s]
-        int sleepMs = static_cast<int>(std::max(5.0, std::min(1000.0, pauseTime * 1000.0)));
-        std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
-
-        // Process incoming MCU responses while waiting (keeps clock sync alive)
-        m_mcu.processIncoming(0);
+        double clampedPause = std::max(0.005, std::min(1.0, pauseTime));
+        if (m_reactor) {
+            // Yield to reactor — other timers (stepgen, clocksync) run
+            m_reactor->pause(m_reactor->monotonic() + clampedPause);
+        } else {
+            int sleepMs = static_cast<int>(clampedPause * 1000.0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+            m_mcu.processIncoming(0);
+        }
     }
     // Update check threshold
     m_needCheckPause = m_nextPrintTime;
@@ -790,32 +801,9 @@ bool ToolHead::generateSteps() {
     auto allTrapMoves = m_trapq.getAndClear();
     if (allTrapMoves.empty()) return true;
 
-    // Limit the print_time span processed per call to avoid 32-bit clock
-    // wrapping.  At 300MHz the uint32 wraps every ~14.3s; steps more than
-    // 2^31 ticks (~7.16s) apart are ambiguous in 32-bit signed arithmetic
-    // and cause MCU "Timer too close" shutdowns.  Use 4 seconds as a
-    // conservative limit.
-    static constexpr double MAX_BATCH_TIME = 4.0;  // seconds of print_time
-    double batchStartTime = allTrapMoves.front().print_time;
-    double batchEndTimeLimit = batchStartTime + MAX_BATCH_TIME;
-
-    // Find the split point: include TrapMoves whose print_time is within limit
-    size_t processCount = allTrapMoves.size();
-    for (size_t i = 0; i < allTrapMoves.size(); ++i) {
-        if (allTrapMoves[i].print_time > batchEndTimeLimit) {
-            processCount = i;
-            break;
-        }
-    }
-    if (processCount == 0) processCount = 1;  // always process at least one
-
-    // Put remaining TrapMoves back for the next generateSteps call
-    if (processCount < allTrapMoves.size()) {
-        std::vector<TrapMove> deferred(
-            allTrapMoves.begin() + processCount, allTrapMoves.end());
-        allTrapMoves.resize(processCount);
-        m_trapq.prepend(deferred);  // push back to front for next call
-    }
+    // With reactor-based pacing (BUFFER_TIME_HIGH ≈ 1.0s), the print_time
+    // span is naturally limited to ~1–1.5s, well within the 32-bit clock
+    // safe range (~7.16s at 300MHz).  No artificial batching needed.
 
     m_stepGenRunning.store(true, std::memory_order_release);
     struct RunGuard {
