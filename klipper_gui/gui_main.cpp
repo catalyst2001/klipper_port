@@ -22,6 +22,8 @@
 #include "../klipper_host/gcode.h"
 #include "../klipper_host/klipper_config.h"
 #include "../klipper_host/tmc5160.h"
+#include "../klipper_host/reactor.h"
+#include "../klipper_host/trapq.h"
 
 #include <wx/filedlg.h>
 #include <wx/filename.h>
@@ -200,6 +202,14 @@ private:
     std::atomic<size_t> m_printCurrentLine{0};
     size_t m_printLastHighlightLine = 0;  // for UI highlighting
     std::atomic<size_t> m_printErrorCount{0};
+    std::string m_printCurrentGcode;          // current gcode line text (for log display)
+    std::mutex m_printGcodeMutex;
+    size_t m_gcodeViewStart = 0;              // first line index loaded in gcode view
+    size_t m_gcodeViewEnd = 0;                // last+1 line index loaded in gcode view
+    static constexpr size_t GCODE_VIEW_BLOCK = 500;  // lines per block in preview
+
+    // Speed factor
+    wxTextCtrl* m_speedFactorCtrl = nullptr;
 
     // Driver error ignore
     wxCheckBox* m_cbIgnoreTmcErrors = nullptr;
@@ -656,6 +666,11 @@ void KlipperFrame::CreateUI() {
     printCtrlSizer->Add(m_btnPrintStart, 0, wxALL, 3);
     printCtrlSizer->Add(m_btnPrintPause, 0, wxALL, 3);
     printCtrlSizer->Add(m_btnPrintStop, 0, wxALL, 3);
+    printCtrlSizer->AddSpacer(20);
+    printCtrlSizer->Add(new wxStaticText(printPanel, wxID_ANY, "Speed:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_speedFactorCtrl = new wxTextCtrl(printPanel, wxID_ANY, "1.0", wxDefaultPosition, wxSize(50, -1));
+    printCtrlSizer->Add(m_speedFactorCtrl, 0, wxALL, 3);
+    printCtrlSizer->Add(new wxStaticText(printPanel, wxID_ANY, "x"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
     printSizer->Add(printCtrlSizer, 0, wxEXPAND);
 
     // Progress bar
@@ -1120,8 +1135,8 @@ void KlipperFrame::OnUITimer(wxTimerEvent&) {
         }
     }
 
-    // TMC5160 status polling (~every 2 seconds at 10Hz timer)
-    if (m_connected && m_mcu.isConfigFinalized() && !m_tmcDrivers.empty()) {
+    // TMC5160 status polling (~every 2 seconds at 10Hz timer) — skip during printing
+    if (m_connected && m_mcu.isConfigFinalized() && !m_tmcDrivers.empty() && !m_printing) {
         m_tmcPollCounter++;
         if (m_tmcPollCounter >= 20) {
             m_tmcPollCounter = 0;
@@ -1145,8 +1160,8 @@ void KlipperFrame::OnUITimer(wxTimerEvent&) {
         }
     }
 
-    // Endstop polling (~every 500ms at 10Hz timer)
-    if (m_connected && m_mcu.isConfigFinalized() && !m_endstopObjs.empty()) {
+    // Endstop polling (~every 500ms at 10Hz timer) — skip during printing (reactor owns MCU)
+    if (m_connected && m_mcu.isConfigFinalized() && !m_endstopObjs.empty() && !m_printing) {
         m_endstopPollCounter++;
         if (m_endstopPollCounter >= 5) {
             m_endstopPollCounter = 0;
@@ -1171,7 +1186,7 @@ void KlipperFrame::OnUITimer(wxTimerEvent&) {
         }
     }
 
-    // Print progress update + line highlighting
+    // Print progress update + block-loading gcode view + line highlighting
     if (m_printing) {
         size_t current = m_printCurrentLine;
         size_t total = m_printLines.size();
@@ -1179,28 +1194,57 @@ void KlipperFrame::OnUITimer(wxTimerEvent&) {
             int pct = static_cast<int>((current * 100) / total);
             m_printProgress->SetValue(pct);
 
+            // Build status text with current gcode command
             size_t errorCount = m_printErrorCount;
+            wxString currentGcode;
+            {
+                std::lock_guard<std::mutex> lg(m_printGcodeMutex);
+                currentGcode = m_printCurrentGcode;
+            }
             wxString statusText = wxString::Format("Print: line %zu / %zu (%d%%)", current, total, pct);
             if (errorCount > 0)
                 statusText += wxString::Format(" [%zu errors]", errorCount);
             if (m_printPaused.load())
                 statusText += " [PAUSED]";
+            if (!currentGcode.empty())
+                statusText += "  |  " + currentGcode;
             m_printStatus->SetLabel(statusText);
             m_printStatus->SetForegroundColour(
                 m_printPaused.load() ? wxColour(200, 100, 0) : wxColour(0, 128, 0));
 
-            // Highlight current line yellow, clear previous
-            if (m_printGcodeView && current != m_printLastHighlightLine && current > 0) {
+            // Block-load gcode view: reload when current line goes outside loaded range
+            if (current > 0 && (current - 1 < m_gcodeViewStart || current - 1 >= m_gcodeViewEnd)) {
+                // Center the block around current line
+                size_t halfBlock = GCODE_VIEW_BLOCK / 2;
+                size_t newStart = (current - 1 > halfBlock) ? (current - 1 - halfBlock) : 0;
+                size_t newEnd = std::min(m_printLines.size(), newStart + GCODE_VIEW_BLOCK);
+                m_printGcodeView->Freeze();
+                m_printGcodeView->Clear();
+                for (size_t i = newStart; i < newEnd; ++i) {
+                    m_printGcodeView->AppendText(wxString::Format("%6zu: %s\n", i + 1, m_printLines[i]));
+                }
+                m_gcodeViewStart = newStart;
+                m_gcodeViewEnd = newEnd;
+                m_printLastHighlightLine = 0;  // force re-highlight
+                m_printGcodeView->Thaw();
+            }
+
+            // Highlight current line yellow within loaded block
+            if (m_printGcodeView && current != m_printLastHighlightLine && current > 0
+                && current - 1 >= m_gcodeViewStart && current - 1 < m_gcodeViewEnd) {
                 // Clear previous highlight
-                if (m_printLastHighlightLine > 0) {
-                    long prevStart = m_printGcodeView->XYToPosition(0, static_cast<long>(m_printLastHighlightLine - 1));
-                    long prevEnd = m_printGcodeView->GetLineLength(static_cast<long>(m_printLastHighlightLine - 1)) + prevStart;
+                if (m_printLastHighlightLine > 0
+                    && m_printLastHighlightLine - 1 >= m_gcodeViewStart
+                    && m_printLastHighlightLine - 1 < m_gcodeViewEnd) {
+                    long viewLine = static_cast<long>(m_printLastHighlightLine - 1 - m_gcodeViewStart);
+                    long prevStart = m_printGcodeView->XYToPosition(0, viewLine);
+                    long prevEnd = m_printGcodeView->GetLineLength(viewLine) + prevStart;
                     m_printGcodeView->SetStyle(prevStart, prevEnd, wxTextAttr(*wxBLACK, *wxWHITE));
                 }
                 // Set new highlight
-                long lineIdx = static_cast<long>(current - 1);
-                long startPos = m_printGcodeView->XYToPosition(0, lineIdx);
-                long endPos = m_printGcodeView->GetLineLength(lineIdx) + startPos;
+                long viewLine = static_cast<long>(current - 1 - m_gcodeViewStart);
+                long startPos = m_printGcodeView->XYToPosition(0, viewLine);
+                long endPos = m_printGcodeView->GetLineLength(viewLine) + startPos;
                 m_printGcodeView->SetStyle(startPos, endPos, wxTextAttr(*wxBLACK, wxColour(255, 255, 150)));
                 m_printGcodeView->ShowPosition(startPos);
                 m_printLastHighlightLine = current;
@@ -1211,6 +1255,15 @@ void KlipperFrame::OnUITimer(wxTimerEvent&) {
 
 void KlipperFrame::OnConnect(wxCommandEvent&) {
     if (m_connected) {
+        // Stop any active print first (PrintThread stops SQ and restarts legacy threads)
+        if (m_printing) {
+            m_printStop = true;
+            m_printPaused = false;
+            if (m_printThread.joinable()) m_printThread.join();
+            m_printing = false;
+            m_printStop = false;
+        }
+        m_mcu.stopSerialQueue();
         StopClockSync();
         StopPolling();
         m_mcu.disconnect();
@@ -1259,13 +1312,6 @@ void KlipperFrame::OnConnect(wxCommandEvent&) {
         m_gcode.reset();
         m_configResult.reset();
         m_configPathLabel->SetLabel("Config: (none)");
-        // Stop any active print
-        if (m_printing) {
-            m_printStop = true;
-            if (m_printThread.joinable()) m_printThread.join();
-            m_printing = false;
-            m_printStop = false;
-        }
         m_printLines.clear();
         m_printFilePath.clear();
         m_printCurrentLine = 0;
@@ -2313,16 +2359,19 @@ void KlipperFrame::OnPrintLoad(wxCommandEvent&) {
     m_printStatus->SetLabel(wxString::Format("Print: loaded %zu lines, ready to start", m_printLines.size()));
     m_printStatus->SetForegroundColour(wxColour(0, 0, 160));
 
-    // Show preview (first 200 lines)
+    // Show first block of gcode in preview
+    m_printGcodeView->Freeze();
     m_printGcodeView->Clear();
-    size_t previewLines = std::min(m_printLines.size(), size_t(200));
-    for (size_t i = 0; i < previewLines; ++i) {
-        m_printGcodeView->AppendText(wxString::Format("%5zu: %s\n", i + 1, m_printLines[i]));
+    m_gcodeViewStart = 0;
+    m_gcodeViewEnd = std::min(m_printLines.size(), GCODE_VIEW_BLOCK);
+    for (size_t i = m_gcodeViewStart; i < m_gcodeViewEnd; ++i) {
+        m_printGcodeView->AppendText(wxString::Format("%6zu: %s\n", i + 1, m_printLines[i]));
     }
-    if (m_printLines.size() > 200) {
+    if (m_gcodeViewEnd < m_printLines.size()) {
         m_printGcodeView->AppendText(wxString::Format("... (%zu more lines)\n",
-            m_printLines.size() - 200));
+            m_printLines.size() - m_gcodeViewEnd));
     }
+    m_printGcodeView->Thaw();
 
     m_btnPrintStart->Enable(true);
     m_btnPrintPause->Enable(false);
@@ -2350,12 +2399,24 @@ void KlipperFrame::OnPrintStart(wxCommandEvent&) {
     m_printLastHighlightLine = 0;
     m_printErrorCount = 0;
 
+    // Read speed factor from UI
+    double speedFactor = 1.0;
+    if (m_speedFactorCtrl) {
+        wxString sf = m_speedFactorCtrl->GetValue();
+        sf.ToDouble(&speedFactor);
+        if (speedFactor <= 0.0) speedFactor = 1.0;
+    }
+    m_gcode->setSpeedFactor(speedFactor);
+
     m_btnPrintStart->Enable(false);
     m_btnPrintPause->Enable(true);
     m_btnPrintStop->Enable(true);
     m_btnPrintLoad->Enable(false);
+    m_speedFactorCtrl->Enable(false);
 
-    Log(wxString::Format("Starting print: %s (%zu lines)", m_printFilePath, m_printLines.size()),
+    wxString speedStr = (speedFactor != 1.0)
+        ? wxString::Format(" (speed %.1fx)", speedFactor) : wxString("");
+    Log(wxString::Format("Starting print: %s (%zu lines)%s", m_printFilePath, m_printLines.size(), speedStr),
         wxColour(0, 128, 0));
 
     // Start print thread
@@ -2381,148 +2442,220 @@ void KlipperFrame::OnPrintStop(wxCommandEvent&) {
 }
 
 void KlipperFrame::PrintThread() {
-    // Klipper-style flow control with hysteresis:
-    // Fill buffer up to BUFFER_TIME_HIGH, then wait until it drains to BUFFER_TIME_LOW.
-    // This gives the MCU a healthy scheduling window and prevents "stepper too far in past".
-    constexpr double BUFFER_TIME_START = 4.0;  // initial print_time ahead of MCU
-    constexpr double BUFFER_TIME_HIGH  = 4.0;  // pause scheduling when this far ahead
-    constexpr double BUFFER_TIME_LOW   = 1.0;  // resume scheduling when buffer drains to this
+    // Reactor-based printing — matches console klipper_host flow.
+    // The reactor runs gcode processing, step generation, and clock sync
+    // as cooperative coroutine timers, with checkPause() providing backpressure.
     constexpr size_t FLUSH_BATCH = 10;
-    size_t linesSinceFlush = 0;
     m_printErrorCount = 0;
 
-    // Set initial print_time well ahead of MCU time ONCE
+    // ---- Phase 0: transition serial I/O from legacy threads to SerialQueue ----
+    // PollThread and ClockSyncThread both call processIncoming() which reads
+    // directly from the serial port. SerialQueue also reads from the serial port
+    // in its own thread. They must not run concurrently.
+    StopPolling();
+    StopClockSync();
+    LogFromThread("Legacy threads stopped, starting SerialQueue...", wxColour(80, 80, 80));
+
+    if (!m_mcu.startSerialQueue()) {
+        LogFromThread(wxString::Format("Failed to start SerialQueue: %s",
+            m_mcu.getLastError()), *wxRED);
+        // Restart legacy threads and bail out
+        StartPolling();
+        StartClockSync();
+        m_printing = false;
+        CallAfter([this]() {
+            m_btnPrintStart->Enable(false);
+            m_btnPrintPause->Enable(false);
+            m_btnPrintStop->Enable(false);
+            m_btnPrintLoad->Enable(true);
+            m_speedFactorCtrl->Enable(true);
+            m_printStatus->SetLabel("Print: SQ start failed");
+            m_printStatus->SetForegroundColour(*wxRED);
+        });
+        return;
+    }
+    LogFromThread("SerialQueue started", wxColour(0, 128, 0));
+
+    Reactor reactor;
+    auto startTime = std::chrono::steady_clock::now();
+
+    // Set reactor on toolhead for checkPause() coroutine support
     {
         std::lock_guard<std::mutex> lock(m_mcuMutex);
-        m_toolhead->resetSyncState(); // start from idle — first lookaheadFlush will call syncPrintTime
+        m_toolhead->setReactor(&reactor);
+        m_toolhead->resetSyncState();
         double initialTime = m_mcu.getClockSync().estimatedPrintTime() + BUFFER_TIME_START;
         m_toolhead->setNextPrintTime(initialTime);
     }
 
-    // Step generation thread: decouples gcode processing from serial I/O.
-    // The main print thread builds moves (trapq); this thread sends them to MCU.
-    // generateSteps self-paces via clock-gating (waits until MCU clock is
-    // close enough before sending each step batch).
-    std::atomic<bool> stepGenDone{false};
-    std::thread stepGenThread([this, &stepGenDone]() {
-        while (m_mcu.isConnected() && !m_mcu.isShutdown()) {
-            bool ok = m_toolhead->generateSteps();
-            if (!ok) break;
-            if (stepGenDone.load(std::memory_order_acquire)) {
-                m_toolhead->generateSteps(); // Final drain
-                break;
-            }
+    size_t gcodeIdx = 0;
+    size_t contentLines = 0;
+    size_t flushCount = 0;
+    size_t linesSinceFlush = 0;
+
+    LogFromThread("Print started (reactor-based)", wxColour(0, 128, 0));
+
+    // ---- Reactor timer: clock sync (every ~984ms) ----
+    auto clockSyncTimer = reactor.registerTimer([this](double eventtime) -> double {
+        if (m_printStop) return REACTOR_NEVER;
+        if (m_mcu.isSerialQueueActive()) {
+            m_mcu.clockSyncPollAsync();
         }
-    });
+        return eventtime + 0.984;
+    }, reactor.monotonic() + 0.984);
 
-    for (size_t i = 0; i < m_printLines.size(); ++i) {
-        // --- Check stop/pause (no mutex needed, these are atomics) ---
-        if (m_printStop) break;
-        while (m_printPaused && !m_printStop) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        if (m_printStop) break;
-
-        // --- Health check: connection and shutdown (quick lock) ---
-        {
-            std::lock_guard<std::mutex> lock(m_mcuMutex);
-            if (!m_mcu.isConnected()) {
-                LogFromThread("Print aborted: MCU disconnected!", *wxRED);
-                break;
-            }
-            if (m_mcu.isShutdown()) {
-                LogFromThread(wxString::Format("Print aborted: MCU shutdown - %s",
-                    m_mcu.getShutdownMsg()), *wxRED);
-                break;
-            }
-        }
-
-        const auto& line = m_printLines[i];
-        m_printCurrentLine = i + 1;
-
-        // Skip empty lines and comments
-        if (line.empty() || line[0] == ';' || line[0] == '(') continue;
-        auto commentPos = line.find(';');
-        std::string cmd = (commentPos != std::string::npos) ? line.substr(0, commentPos) : line;
-        while (!cmd.empty() && (cmd.back() == ' ' || cmd.back() == '\t'))
-            cmd.pop_back();
-        if (cmd.empty()) continue;
-
-        // --- Execute G-code line (short lock) ---
-        bool execOk = false;
-        {
-            std::lock_guard<std::mutex> lock(m_mcuMutex);
-
-            // Safety net: only bump print_time if it has fallen behind MCU time
-            // (can happen after a long pause or many non-move commands).
-            // Normal flow: print_time advances naturally via move durations.
-            double minTime = m_mcu.getClockSync().estimatedPrintTime() + 0.25;
-            if (minTime > m_toolhead->getNextPrintTime())
-                m_toolhead->setNextPrintTime(minTime);
-
-            execOk = m_gcode->executeLine(cmd);
-        }
-
-        if (!execOk) {
-            m_printErrorCount++;
-            // Only log first 10 errors to avoid flooding
-            if (m_printErrorCount <= 10) {
-                LogFromThread(wxString::Format("Print error at line %zu: %s",
-                    i + 1, m_gcode->getLastMessage()), *wxRED);
-            } else if (m_printErrorCount == 11) {
-                LogFromThread("(suppressing further print errors...)", wxColour(180, 0, 0));
-            }
-            continue;
-        }
-
-        linesSinceFlush++;
-
-        // --- Flush periodically to push moves into TrapQ for the step gen thread ---
-        if (linesSinceFlush >= FLUSH_BATCH || i == m_printLines.size() - 1) {
-            linesSinceFlush = 0;
-            {
-                std::lock_guard<std::mutex> lock(m_mcuMutex);
-                m_toolhead->flush();
-            }
-
-            // --- Flow control with hysteresis ---
-            // Wait until buffer drains below BUFFER_TIME_HIGH before sending more.
-            // The step gen thread drains the trapq in parallel, so the MCU clock
-            // advances while we wait here.
-            for (;;) {
-                if (m_printStop) break;
-
-                double ahead;
-                {
-                    std::lock_guard<std::mutex> lock(m_mcuMutex);
-                    if (!m_mcu.isConnected() || m_mcu.isShutdown()) break;
-                    ahead = m_toolhead->getNextPrintTime()
-                          - m_mcu.getClockSync().estimatedPrintTime();
-                }
-
-                if (ahead < BUFFER_TIME_HIGH) break;
-
-                // Buffer is full — wait for MCU to catch up.
-                double waitSec = ahead - BUFFER_TIME_LOW;
-                int waitMs = std::max(10, std::min(500, static_cast<int>(waitSec * 1000)));
-                std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
-            }
-        }
-    }
-
-    // Final flush + stop step generation thread
-    {
-        std::lock_guard<std::mutex> lock(m_mcuMutex);
+    // ---- Reactor timer: step generation (every 25ms) ----
+    auto stepGenTimer = reactor.registerTimer([this, &reactor](double eventtime) -> double {
+        if (m_printStop) return REACTOR_NEVER;
         if (m_mcu.isConnected() && !m_mcu.isShutdown()) {
-            m_toolhead->flush();
+            m_toolhead->generateSteps();
         }
-    }
-    stepGenDone.store(true, std::memory_order_release);
-    stepGenThread.join();
+        return eventtime + 0.025;
+    }, reactor.monotonic() + 0.025);
+
+    // ---- Reactor timer: gcode processing ----
+    auto gcodeTimer = reactor.registerTimer([&](double eventtime) -> double {
+        // Shutdown check
+        if (m_mcu.isShutdown()) {
+            std::string shutMsg = m_mcu.getShutdownMsg();
+            double ahead = m_toolhead->getNextPrintTime()
+                         - m_mcu.getClockSync().estimatedPrintTime();
+            LogFromThread(wxString::Format("MCU SHUTDOWN at line %zu: %s (ahead=%.3fs)",
+                gcodeIdx + 1, shutMsg, ahead), *wxRED);
+            reactor.end();
+            return REACTOR_NEVER;
+        }
+
+        // Stop/finished check
+        if (m_printStop || gcodeIdx >= m_printLines.size()) {
+            if (m_mcu.isConnected() && !m_mcu.isShutdown()) {
+                m_toolhead->flush();
+                m_toolhead->generateSteps();
+            }
+            reactor.end();
+            return REACTOR_NEVER;
+        }
+
+        if (!m_mcu.isConnected()) {
+            LogFromThread("MCU disconnected!", *wxRED);
+            reactor.end();
+            return REACTOR_NEVER;
+        }
+
+        // Pause support
+        if (m_printPaused) {
+            return eventtime + 0.1;
+        }
+
+        // Process a batch of gcode lines
+        for (size_t batch = 0; batch < FLUSH_BATCH && gcodeIdx < m_printLines.size() && !m_printStop;
+             ++gcodeIdx) {
+            const std::string& line = m_printLines[gcodeIdx];
+            m_printCurrentLine = gcodeIdx + 1;
+
+            // Skip empty/comment lines
+            std::string trimmed = line;
+            while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
+                trimmed.erase(trimmed.begin());
+            if (trimmed.empty() || trimmed[0] == ';' || trimmed[0] == '%' || trimmed[0] == '(')
+                continue;
+
+            // Strip inline comments
+            auto commentPos = trimmed.find(';');
+            std::string cmd = (commentPos != std::string::npos) ? trimmed.substr(0, commentPos) : trimmed;
+            while (!cmd.empty() && (cmd.back() == ' ' || cmd.back() == '\t'))
+                cmd.pop_back();
+            if (cmd.empty()) continue;
+
+            // Store current gcode for UI display
+            {
+                std::lock_guard<std::mutex> lg(m_printGcodeMutex);
+                m_printCurrentGcode = cmd;
+            }
+
+            bool execOk = m_gcode->executeLine(cmd);
+            if (!execOk) {
+                m_printErrorCount++;
+                if (m_printErrorCount <= 10) {
+                    LogFromThread(wxString::Format("Line %zu: %s [%s]",
+                        gcodeIdx + 1, m_gcode->getLastMessage(), cmd), *wxRED);
+                }
+                continue;
+            }
+
+            contentLines++;
+            batch++;
+
+            // Periodic logging: every 100 content lines
+            if (contentLines <= 5 || contentLines % 100 == 0) {
+                auto p = m_toolhead->getPosition();
+                auto elapsed = std::chrono::steady_clock::now() - startTime;
+                double sec = std::chrono::duration<double>(elapsed).count();
+                double ahead = m_toolhead->getNextPrintTime()
+                             - m_mcu.getClockSync().estimatedPrintTime();
+                LogFromThread(wxString::Format("L%zu/%zu #%zu pos=(%.2f,%.2f,%.2f) ahead=%.3fs t=%.1fs [%s]",
+                    gcodeIdx + 1, m_printLines.size(), contentLines,
+                    p.x, p.y, p.z, ahead, sec, cmd), wxColour(0, 0, 128));
+            }
+        }
+
+        // Flush after each batch
+        m_toolhead->flush();
+        flushCount++;
+
+        // Backpressure: pause gcode coroutine if too far ahead of MCU
+        m_toolhead->checkPause();
+
+        // Log flush diagnostics periodically
+        if (flushCount <= 5 || flushCount % 10 == 0) {
+            auto elapsed = std::chrono::steady_clock::now() - startTime;
+            double sec = std::chrono::duration<double>(elapsed).count();
+            double printTime = m_toolhead->getNextPrintTime();
+            double ahead = printTime - m_mcu.getClockSync().estimatedPrintTime();
+            LogFromThread(wxString::Format("Flush #%zu line %zu/%zu elapsed=%.1fs ahead=%.3fs steps=%llu gated=%llu",
+                flushCount, gcodeIdx, m_printLines.size(), sec, ahead,
+                m_mcu.getStepSyncTotal(), m_mcu.getStepSyncGated()),
+                wxColour(80, 80, 80));
+        }
+
+        return REACTOR_NOW;  // process next batch immediately (checkPause limits rate)
+    }, REACTOR_NOW);
+
+    // ---- Run reactor event loop ----
+    reactor.run();
+
+    // Cleanup
+    reactor.unregisterTimer(clockSyncTimer);
+    reactor.unregisterTimer(stepGenTimer);
+    reactor.unregisterTimer(gcodeTimer);
+
     {
         std::lock_guard<std::mutex> lock(m_mcuMutex);
-        m_toolhead->resetSyncState(); // back to idle
+        m_toolhead->setReactor(nullptr);
+        m_toolhead->resetSyncState();
     }
+
+    // Wait for MCU to finish executing remaining queued steps
+    for (int w = 0; w < 300 && !m_printStop; ++w) {
+        if (!m_mcu.isConnected() || m_mcu.isShutdown()) break;
+        double ahead = m_toolhead->getNextPrintTime()
+                     - m_mcu.getClockSync().estimatedPrintTime();
+        if (ahead <= 0.2) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // Transition back from SerialQueue to legacy threads
+    m_mcu.stopSerialQueue();
+    LogFromThread("SerialQueue stopped", wxColour(80, 80, 80));
+
+    if (m_mcu.isConnected() && !m_mcu.isShutdown()) {
+        StartPolling();
+        StartClockSync();
+        LogFromThread("Legacy threads restarted", wxColour(80, 80, 80));
+    }
+
+    auto elapsed = std::chrono::steady_clock::now() - startTime;
+    double totalSec = std::chrono::duration<double>(elapsed).count();
 
     bool stopped = m_printStop.load();
     size_t errorCount = m_printErrorCount.load();
@@ -2532,10 +2665,8 @@ void KlipperFrame::PrintThread() {
     if (stopped) {
         LogFromThread("Print stopped by user", *wxRED);
     } else {
-        wxString msg = wxString::Format("Print complete! %zu lines", m_printLines.size());
-        if (errorCount > 0)
-            msg += wxString::Format(" (%zu errors skipped)", errorCount);
-        LogFromThread(msg, wxColour(0, 128, 0));
+        LogFromThread(wxString::Format("Print complete! %zu lines, %.1fs, %zu errors",
+            m_printLines.size(), totalSec, errorCount), wxColour(0, 128, 0));
     }
 
     CallAfter([this, stopped]() {
@@ -2543,6 +2674,7 @@ void KlipperFrame::PrintThread() {
         m_btnPrintPause->Enable(false);
         m_btnPrintStop->Enable(false);
         m_btnPrintLoad->Enable(true);
+        m_speedFactorCtrl->Enable(true);
         m_btnPrintPause->SetLabel("Pause");
         m_printProgress->SetValue(stopped ? m_printProgress->GetValue() : 100);
         m_printStatus->SetLabel(stopped ? "Print: stopped" : "Print: complete");
@@ -2557,6 +2689,7 @@ void KlipperFrame::OnClose(wxCloseEvent& evt) {
         m_printPaused = false;
         if (m_printThread.joinable()) m_printThread.join();
     }
+    m_mcu.stopSerialQueue();
     StopClockSync();
     StopPolling();
     m_mcu.disconnect();

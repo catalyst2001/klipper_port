@@ -306,7 +306,7 @@ double Reactor::checkTimers(double eventtime, bool busy)
                     t->m_coro = nullptr;
                 }
 
-                mco_desc desc = mco_desc_init(coroEntry, 0);
+                mco_desc desc = mco_desc_init(coroEntry, 256 * 1024);
                 desc.user_data = t.get();
                 t->m_coroEventtime  = eventtime;
                 t->m_coroReturnWake = REACTOR_NEVER;

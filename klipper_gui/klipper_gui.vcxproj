@@ -82,6 +82,7 @@
   <ItemGroup>
     <ClCompile Include="gui_main.cpp" />
     <ClCompile Include="..\klipper_host\serial_port.cpp" />
+    <ClCompile Include="..\klipper_host\serial_queue.cpp" />
     <ClCompile Include="..\klipper_host\klipper_proto.cpp" />
     <ClCompile Include="..\klipper_host\klipper_mcu.cpp" />
     <ClCompile Include="..\klipper_host\clock_sync.cpp" />
@@ -94,6 +95,7 @@
     <ClCompile Include="..\klipper_host\klipper_config.cpp" />
     <ClCompile Include="..\klipper_host\tmc5160.cpp" />
     <ClCompile Include="..\klipper_host\input_shaper.cpp" />
+    <ClCompile Include="..\klipper_host\reactor.cpp" />
     <ClCompile Include="..\klipper_host\miniz_impl.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -109,6 +111,8 @@
     <ClInclude Include="..\klipper_host\gcode.h" />
     <ClInclude Include="..\klipper_host\klipper_config.h" />
     <ClInclude Include="..\klipper_host\tmc5160.h" />
+    <ClInclude Include="..\klipper_host\reactor.h" />
+    <ClInclude Include="..\klipper_host\input_shaper.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

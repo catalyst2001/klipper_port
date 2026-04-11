@@ -7,6 +7,8 @@
 #include <thread>
 #include <chrono>
 #include <climits>
+#include <mutex>
+#include <condition_variable>
 
 static constexpr int64_t MAX_SCHEDULE_TICKS = (1LL << 31) - 1;
 
@@ -250,6 +252,20 @@ bool MCU_endstop::home(int64_t homeClock, double sampleTime, int sampleCount,
     int64_t sampleTicks = m_mcu.secondsToClock(sampleTime);
     int64_t restTicks = m_mcu.secondsToClock(restTime);
 
+    // Choose between raw serial (pre-SerialQueue) and SQ-based command path
+    const bool useSQ = m_mcu.isSerialQueueActive();
+
+    // Helper: send an immediate command (via SQ or raw serial)
+    auto sendImmediate = [&](const std::string& cmdName,
+                             const std::map<std::string, int64_t>& params) -> bool {
+        if (useSQ) {
+            m_mcu.sendTimed(cmdName, params, 0, 0, nullptr);
+            return true;
+        } else {
+            return m_mcu.sendCommand(cmdName, params);
+        }
+    };
+
     // 1. trsync_start: begin synchronized trigger monitoring
     double expireTimeout = 5.0;
     {
@@ -262,7 +278,7 @@ bool MCU_endstop::home(int64_t homeClock, double sampleTime, int sampleCount,
             {"report_ticks", reportTicks},
             {"expire_reason", 4}  // REASON_COMMS_TIMEOUT
         };
-        if (!m_mcu.sendCommand("trsync_start", params)) return false;
+        if (!sendImmediate("trsync_start", params)) return false;
     }
 
     // 2. stepper_stop_on_trigger: register each stepper to stop on trsync trigger
@@ -271,7 +287,7 @@ bool MCU_endstop::home(int64_t homeClock, double sampleTime, int sampleCount,
             {"oid", stepper->getOid()},
             {"trsync_oid", m_trsyncOid}
         };
-        if (!m_mcu.sendCommand("stepper_stop_on_trigger", params)) return false;
+        if (!sendImmediate("stepper_stop_on_trigger", params)) return false;
     }
 
     // 3. trsync_set_timeout: set expiration deadline
@@ -281,7 +297,7 @@ bool MCU_endstop::home(int64_t homeClock, double sampleTime, int sampleCount,
             {"oid", m_trsyncOid},
             {"clock", static_cast<int64_t>(static_cast<uint32_t>(expireClock))}
         };
-        if (!m_mcu.sendCommand("trsync_set_timeout", params)) return false;
+        if (!sendImmediate("trsync_set_timeout", params)) return false;
     }
 
     // 4. endstop_home: start endstop monitoring
@@ -296,33 +312,67 @@ bool MCU_endstop::home(int64_t homeClock, double sampleTime, int sampleCount,
             {"trsync_oid", m_trsyncOid},
             {"trigger_reason", 1}  // REASON_ENDSTOP_HIT
         };
-        if (!m_mcu.sendCommand("endstop_home", params)) return false;
+        if (!sendImmediate("endstop_home", params)) return false;
     }
 
-    // Wait for trsync completion (poll for trsync_state response)
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    // Wait for trsync completion
     bool triggered = false;
-    while (std::chrono::steady_clock::now() < deadline) {
-        auto responses = m_mcu.processIncoming(100);
-        for (auto& resp : responses) {
-            if (resp.name == "trsync_state") {
-                // Filter by OID — ignore stale reports from other trsync instances
-                auto oidIt = resp.intParams.find("oid");
-                if (oidIt == resp.intParams.end() || oidIt->second != m_trsyncOid)
-                    continue;
+
+    if (useSQ) {
+        // SerialQueue mode: register OID handler and wait via condition variable.
+        // The SQ receive callback (running on the SQ thread) will dispatch
+        // trsync_state to our handler, which signals the CV.
+        std::mutex waitMutex;
+        std::condition_variable waitCV;
+        bool done = false;
+        int triggerReason = 0;
+
+        m_mcu.registerOidResponse("trsync_state", m_trsyncOid,
+            [&](const KlipperMCU::ParsedResponse& resp) {
                 auto canIt = resp.intParams.find("can_trigger");
                 auto trIt = resp.intParams.find("trigger_reason");
                 if (canIt != resp.intParams.end() && canIt->second == 0) {
-                    // Trigger completed
-                    if (trIt != resp.intParams.end() && trIt->second == 1) {
-                        triggered = true;
+                    std::lock_guard<std::mutex> lk(waitMutex);
+                    if (trIt != resp.intParams.end())
+                        triggerReason = static_cast<int>(trIt->second);
+                    done = true;
+                    waitCV.notify_one();
+                }
+            });
+
+        {
+            std::unique_lock<std::mutex> lk(waitMutex);
+            waitCV.wait_for(lk, std::chrono::seconds(6), [&] { return done; });
+        }
+
+        // Unregister handler
+        m_mcu.registerOidResponse("trsync_state", m_trsyncOid, nullptr);
+
+        triggered = (triggerReason == 1);  // REASON_ENDSTOP_HIT
+    } else {
+        // Raw serial mode: poll for trsync_state via processIncoming
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto responses = m_mcu.processIncoming(100);
+            for (auto& resp : responses) {
+                if (resp.name == "trsync_state") {
+                    auto oidIt = resp.intParams.find("oid");
+                    if (oidIt == resp.intParams.end() || oidIt->second != m_trsyncOid)
+                        continue;
+                    auto canIt = resp.intParams.find("can_trigger");
+                    auto trIt = resp.intParams.find("trigger_reason");
+                    if (canIt != resp.intParams.end() && canIt->second == 0) {
+                        if (trIt != resp.intParams.end() && trIt->second == 1) {
+                            triggered = true;
+                        }
+                        goto done;
                     }
-                    goto done;
                 }
             }
         }
+    done:;
     }
-done:
+
     return triggered;
 }
 

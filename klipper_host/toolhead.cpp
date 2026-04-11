@@ -995,12 +995,15 @@ bool ToolHead::generateSteps() {
                       * ((int64_t)move.count * (move.count - 1) / 2);
 
                 // Submit with clock-gating:
-                // min_clock = steppersync avail (0 when slots free).  Do NOT use
-                // lastStepClock — see generateAxisSteps for rationale.
-                // req_clock = first step clock (priority ordering)
+                // min_clock = steppersync avail (0 when slots free).
+                // req_clock = first step clock (priority ordering).
+                // Push endCk (end time) into the heap so the slot is
+                // not reused until this command's last step executes.
+                // Python Klipper pushes sc->last_step_clock (≈ end of
+                // previous group) via heap_replace in steppersync_flush.
                 uint64_t minCk = 0;
-                uint64_t endCk = static_cast<uint64_t>(lastStepClock + totalTicks);
                 uint64_t reqCk = static_cast<uint64_t>(batchClocks[idx]);
+                uint64_t endCk = static_cast<uint64_t>(lastStepClock + totalTicks);
                 minCk = m_mcu.stepSyncAdjustMinClock(minCk, endCk);
                 stepper->queueStepTimed(move.interval, move.count, move.add,
                                          minCk, reqCk);

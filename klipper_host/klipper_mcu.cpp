@@ -657,7 +657,11 @@ double KlipperMCU::getConstantFloat(const std::string& name, double defaultVal) 
 
 void KlipperMCU::registerOidResponse(const std::string& responseName, int oid, OidResponseHandler handler) {
     std::string key = responseName + ":" + std::to_string(oid);
-    m_oidHandlers[key] = std::move(handler);
+    if (handler) {
+        m_oidHandlers[key] = std::move(handler);
+    } else {
+        m_oidHandlers.erase(key);
+    }
 }
 
 void KlipperMCU::requestMoveQueueSlot() {
@@ -1403,13 +1407,16 @@ uint64_t KlipperMCU::stepSyncAdjustMinClock(uint64_t minClock, uint64_t endClock
 void KlipperMCU::stepSyncReset() {
     std::lock_guard<std::mutex> lk(m_stepSyncMutex);
     while (!m_stepSyncHeap.empty()) m_stepSyncHeap.pop();
-    // Reserve a large margin of move slots.
-    // Python Klipper's steppersync_flush uses a move_clock parameter to limit
-    // how many commands are submitted per cycle, preventing MCU queue overflow.
-    // Our code submits all commands at once, so endClocks age out and the
-    // heap-based gating becomes ineffective at high speeds.
-    // Using move_count/2 leaves ample free slots on the MCU for timing
-    // inaccuracies (USB vs UART bittime estimation mismatch).
+    // Use move_count/2 for heap slots.  The MCU has move_count total
+    // move_alloc slots shared across ALL steppers.  Unlike Python Klipper
+    // (which has an additional flush_clock gate limiting how far ahead
+    // commands are flushed), our code submits all generated step commands
+    // to SerialQueue at once.  The first heap_size commands pass ungated
+    // (min_clock=0) and can arrive at the MCU before it executes any —
+    // filling the move pool.  Using move_count/2 (=512) keeps a safety
+    // margin for the MCU to begin freeing slots before the pool exhausts.
+    // With dense arc gcode (snegir.gcode: 2164 arcs), move_count (=1024)
+    // ungated commands overflow the MCU pool before execution starts.
     int usable = m_mcuMoveCount / 2;
     if (usable < 64) usable = 64;
     m_stepSyncTotal.store(0, std::memory_order_relaxed);
