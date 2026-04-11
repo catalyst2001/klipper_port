@@ -749,9 +749,14 @@ void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& mo
             batchEnd++;
         }
 
-        // Set direction for this batch
-        uint64_t dirMinClock = static_cast<uint64_t>(stepEvents[batchStart].clock);
-        stepper->setNextStepDirTimed(batchDir, 0, dirMinClock);
+        // Compress and send via SerialQueue
+        int64_t lastStepClock = stepper->getLastStepClock();
+
+        // Set direction for this batch.  Match Python Klipper by ordering
+        // the direction command at the previous lastStepClock, so it lands
+        // before the first queue_step of the new direction run.
+        uint64_t dirReqClock = static_cast<uint64_t>(lastStepClock);
+        stepper->setNextStepDirTimed(batchDir, 0, dirReqClock);
 
         // Extract step clocks for this batch
         int numSteps = static_cast<int>(batchEnd - batchStart);
@@ -759,9 +764,6 @@ void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& mo
         for (int i = 0; i < numSteps; i++) {
             batchClocks[i] = stepEvents[batchStart + i].clock;
         }
-
-        // Compress and send via SerialQueue
-        int64_t lastStepClock = stepper->getLastStepClock();
         int pos = 0;
         while (pos < numSteps) {
             int64_t clockDiff = batchClocks[pos] - lastStepClock;
@@ -782,14 +784,18 @@ void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& mo
             int64_t totalTicks = (int64_t)move.interval * move.count
                 + (int64_t)move.add * ((int64_t)move.count * (move.count - 1) / 2);
 
-            // min_clock = steppersync avail (0 when slots free, future clock
-            // when full).  Do NOT use lastStepClock — that blocks the command
-            // until the MCU finishes the previous batch, causing stepper starvation.
-            // The MIN_REQTIME_DELTA gate in the SQ handles actual send timing.
+            // Match Python Klipper's add_move()/steppersync_flush():
+            // - req_clock is sc->last_step_clock (previous move's last step)
+            // - the steppersync heap also tracks that same release time
+            // A far-future single-step move keeps req_clock at the actual step.
             uint64_t minCk = 0;
-            uint64_t endCk = static_cast<uint64_t>(lastStepClock + totalTicks);
-            uint64_t reqCk = static_cast<uint64_t>(batchClocks[pos]);
-            minCk = m_mcu.stepSyncAdjustMinClock(minCk, endCk);
+            uint64_t releaseCk = static_cast<uint64_t>(lastStepClock);
+            uint64_t reqCk = releaseCk;
+            if (move.count == 1
+                && static_cast<uint64_t>(batchClocks[pos]) >= releaseCk + CLOCK_DIFF_MAX) {
+                reqCk = static_cast<uint64_t>(batchClocks[pos]);
+            }
+            minCk = m_mcu.stepSyncAdjustMinClock(minCk, releaseCk);
             stepper->queueStepTimed(move.interval, move.count, move.add,
                                      minCk, reqCk);
 
@@ -1001,10 +1007,12 @@ bool ToolHead::generateSteps(bool flushAll) {
             while (runEnd < ad.steps.size() && ad.steps[runEnd].forward == dir)
                 runEnd++;
 
-            // Set direction if changed
+            // Set direction if changed.  Match Python Klipper by scheduling
+            // set_next_step_dir at the previous lastStepClock so it precedes
+            // the queue_step batch that uses the new direction.
             if (curDir != (int)dir) {
-                uint64_t dirMinClock = static_cast<uint64_t>(ad.steps[pos].clock);
-                stepper->setNextStepDirTimed(dir, 0, dirMinClock);
+                uint64_t dirReqClock = static_cast<uint64_t>(lastStepClock);
+                stepper->setNextStepDirTimed(dir, 0, dirReqClock);
                 curDir = (int)dir;
             }
 
@@ -1046,17 +1054,19 @@ bool ToolHead::generateSteps(bool flushAll) {
                     + (int64_t)move.add
                       * ((int64_t)move.count * (move.count - 1) / 2);
 
-                // Submit with clock-gating:
-                // min_clock = steppersync avail (0 when slots free).
-                // req_clock = first step clock (priority ordering).
-                // Push endCk (end time) into the heap so the slot is
-                // not reused until this command's last step executes.
-                // Python Klipper pushes sc->last_step_clock (≈ end of
-                // previous group) via heap_replace in steppersync_flush.
+                // Match Python Klipper's add_move()/steppersync_flush():
+                // req_clock and the move-queue release time come from the
+                // previous lastStepClock, not the current command's end time.
+                // This orders commands by when they become runnable and keeps
+                // heap semantics aligned with Python's sc->last_step_clock.
                 uint64_t minCk = 0;
-                uint64_t reqCk = static_cast<uint64_t>(batchClocks[idx]);
-                uint64_t endCk = static_cast<uint64_t>(lastStepClock + totalTicks);
-                minCk = m_mcu.stepSyncAdjustMinClock(minCk, endCk);
+                uint64_t releaseCk = static_cast<uint64_t>(lastStepClock);
+                uint64_t reqCk = releaseCk;
+                if (move.count == 1
+                    && static_cast<uint64_t>(batchClocks[idx]) >= releaseCk + CLOCK_DIFF_MAX) {
+                    reqCk = static_cast<uint64_t>(batchClocks[idx]);
+                }
+                minCk = m_mcu.stepSyncAdjustMinClock(minCk, releaseCk);
                 stepper->queueStepTimed(move.interval, move.count, move.add,
                                          minCk, reqCk);
 

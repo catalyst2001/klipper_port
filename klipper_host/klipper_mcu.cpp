@@ -1385,16 +1385,19 @@ void KlipperMCU::sendTimedRaw(const uint8_t* payload, int len,
 // StepperSync: move queue flow control
 // ======================================================================
 
-uint64_t KlipperMCU::stepSyncAdjustMinClock(uint64_t minClock, uint64_t endClock) {
+uint64_t KlipperMCU::stepSyncAdjustMinClock(uint64_t minClock, uint64_t releaseClock) {
     std::lock_guard<std::mutex> lk(m_stepSyncMutex);
     if (m_stepSyncHeap.empty()) return minClock;
 
-    // Pop the earliest-available slot
+    // Pop the earliest-available slot.
     uint64_t avail = m_stepSyncHeap.top();
     m_stepSyncHeap.pop();
 
-    // Push when this new command's slot becomes free
-    m_stepSyncHeap.push(endClock);
+    // Python Klipper's steppersync_flush() pushes qm->min_clock, which is
+    // initialized from sc->last_step_clock before updating it for the current
+    // command.  So the heap tracks when the previously queued move finishes
+    // and the slot becomes available for the next command.
+    m_stepSyncHeap.push(releaseClock);
 
     m_stepSyncTotal.fetch_add(1, std::memory_order_relaxed);
     if (avail > 0)

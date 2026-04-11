@@ -231,7 +231,7 @@ public:
     // Adjusts min_clock for queue_step commands so we never exceed the MCU's
     // move queue capacity. Call for each queue_step; pass the clock at which
     // the step command's last step will finish (endClock).
-    uint64_t stepSyncAdjustMinClock(uint64_t minClock, uint64_t endClock);
+    uint64_t stepSyncAdjustMinClock(uint64_t minClock, uint64_t releaseClock);
     void stepSyncReset();
     uint64_t getStepSyncTotal() const { return m_stepSyncTotal.load(std::memory_order_relaxed); }
     uint64_t getStepSyncGated() const { return m_stepSyncGated.load(std::memory_order_relaxed); }
