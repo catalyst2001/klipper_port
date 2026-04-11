@@ -793,17 +793,41 @@ void ToolHead::resumeStepGen() {
     m_stepGenPaused.store(false, std::memory_order_release);
 }
 
-bool ToolHead::generateSteps() {
+bool ToolHead::generateSteps(bool flushAll) {
     // If paused (e.g. during homing), return immediately
     if (m_stepGenPaused.load(std::memory_order_acquire))
         return true;
 
-    auto allTrapMoves = m_trapq.getAndClear();
-    if (allTrapMoves.empty()) return true;
+    // Port of Python Klipper's motion_queuing._advance_flush_time():
+    // only generate steps for a near-future window and keep later TrapMoves
+    // queued for subsequent timer ticks.  This prevents a huge initial burst
+    // of queue_step commands from overwhelming the MCU move queue.
+    double estPrintTime = m_mcu.getClockSync().estimatedPrintTime();
+    double lastFlushTime = m_lastFlushTime.load(std::memory_order_acquire);
+    double lastStepGenTime = m_stepGenPrintTime.load(std::memory_order_acquire);
 
-    // With reactor-based pacing (BUFFER_TIME_HIGH ≈ 1.0s), the print_time
-    // span is naturally limited to ~1–1.5s, well within the 32-bit clock
-    // safe range (~7.16s at 300MHz).  No artificial batching needed.
+    double wantStepGenTime = flushAll
+        ? m_nextPrintTime
+        : (std::min)(m_nextPrintTime, estPrintTime + BGFLUSH_SG_HIGH_TIME);
+    double wantFlushTime = flushAll
+        ? m_nextPrintTime + BGFLUSH_EXTRA_TIME
+        : (std::min)(m_nextPrintTime + BGFLUSH_EXTRA_TIME,
+                     estPrintTime + BGFLUSH_HIGH_TIME);
+
+    double flushTime = (std::max)({wantFlushTime, lastFlushTime,
+                                   wantStepGenTime - STEPCOMPRESS_FLUSH_TIME});
+    double stepGenTime = (std::max)({wantStepGenTime, lastStepGenTime, flushTime});
+
+    auto allTrapMoves = flushAll ? m_trapq.getAndClear()
+                                 : m_trapq.extractUpTo(stepGenTime);
+    if (allTrapMoves.empty()) {
+        if (flushTime > lastFlushTime)
+            m_lastFlushTime.store(flushTime, std::memory_order_release);
+        return true;
+    }
+
+    // With reactor-based pacing and a bounded step-generation horizon, the
+    // print_time span stays well within the 32-bit MCU clock safe range.
 
     m_stepGenRunning.store(true, std::memory_order_release);
     struct RunGuard {
@@ -911,13 +935,14 @@ bool ToolHead::generateSteps() {
         // Still update progress even if no steps (e.g., travel moves with no axis motion)
         const auto& lastTM = trapMoves.back();
         double batchEndTime = lastTM.print_time + lastTM.move_t;
+        m_lastFlushTime.store(flushTime, std::memory_order_release);
         m_stepGenPrintTime.store(batchEndTime, std::memory_order_release);
         return true;
     }
 
     // ---- Phase 2: compress steps and submit to SerialQueue ----
-    // No windowing, no SKIP, no throttle — SerialQueue clock-gates
-    // commands via min_clock and handles flow control internally.
+    // This batch is already limited to the current Python-style flush window.
+    // SerialQueue still applies per-command clock-gating via min_clock/req_clock.
 
     uint32_t maxError = static_cast<uint32_t>(0.000025 * mcuFreqNom);
     static constexpr uint32_t CLOCK_DIFF_MAX = 3U << 28;
@@ -1018,10 +1043,11 @@ bool ToolHead::generateSteps() {
         stepper->setLastStepClock(lastStepClock);
     }
 
-    // Update stepGen progress for backpressure tracking
+    // Update Python-style flush tracking / backpressure progress
     {
         const auto& lastTM = trapMoves.back();
         double batchEndTime = lastTM.print_time + lastTM.move_t;
+        m_lastFlushTime.store(flushTime, std::memory_order_release);
         m_stepGenPrintTime.store(batchEndTime, std::memory_order_release);
     }
 

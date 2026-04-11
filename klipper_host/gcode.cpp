@@ -162,7 +162,7 @@ int GCodeParser::executeBlock(const std::string& gcode) {
     }
     // Flush remaining moves
     m_toolhead.flush();
-    m_toolhead.generateSteps();
+    m_toolhead.generateSteps(true);
     return count;
 }
 
@@ -432,7 +432,7 @@ bool GCodeParser::cmdM112(const std::map<char, double>&) {
 // M400: Wait for moves to finish
 bool GCodeParser::cmdM400(const std::map<char, double>&) {
     m_toolhead.flush();
-    m_toolhead.generateSteps();
+    m_toolhead.generateSteps(true);
     m_lastMsg = "ok";
     return true;
 }

@@ -451,7 +451,7 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
             // Final flush + step gen
             if (ctx.mcu.isConnected() && !ctx.mcu.isShutdown()) {
                 ctx.toolhead->flush();
-                ctx.toolhead->generateSteps();
+                ctx.toolhead->generateSteps(true);
             }
             ctx.reactor.end();
             return REACTOR_NEVER;

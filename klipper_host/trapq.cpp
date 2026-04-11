@@ -177,6 +177,50 @@ std::vector<TrapMove> TrapQ::getAndClear() {
     return result;
 }
 
+std::vector<TrapMove> TrapQ::extractUpTo(double cutoffTime) {
+    std::lock_guard<std::mutex> lk(m_mutex);
+    std::vector<TrapMove> result;
+    if (m_moves.empty())
+        return result;
+
+    size_t takeCount = 0;
+    while (takeCount < m_moves.size()) {
+        const auto& tm = m_moves[takeCount];
+        double endTime = tm.print_time + tm.move_t;
+        if (endTime <= cutoffTime + 1e-12) {
+            takeCount++;
+            continue;
+        }
+        if (tm.print_time >= cutoffTime - 1e-12)
+            break;
+
+        // Split a partially covered TrapMove at the cutoff boundary.
+        double dt = cutoffTime - tm.print_time;
+        if (dt > 1e-12 && dt < tm.move_t - 1e-12) {
+            TrapMove first = tm;
+            first.move_t = dt;
+            result.insert(result.end(), m_moves.begin(), m_moves.begin() + takeCount);
+            result.push_back(first);
+
+            TrapMove second = tm;
+            second.print_time = cutoffTime;
+            second.move_t = tm.move_t - dt;
+            second.start_pos = tm.getPos(dt);
+            second.start_v = tm.getVelocity(dt);
+            m_moves.erase(m_moves.begin(), m_moves.begin() + takeCount + 1);
+            m_moves.insert(m_moves.begin(), second);
+            return result;
+        }
+        break;
+    }
+
+    if (takeCount == 0)
+        return result;
+    result.insert(result.end(), m_moves.begin(), m_moves.begin() + takeCount);
+    m_moves.erase(m_moves.begin(), m_moves.begin() + takeCount);
+    return result;
+}
+
 void TrapQ::purge(double cutoffTime) {
     std::lock_guard<std::mutex> lk(m_mutex);
     m_moves.erase(

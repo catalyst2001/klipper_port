@@ -57,8 +57,9 @@ public:
     // Stats
     size_t getQueueSize() const { return m_queue.size(); }
 
-    // Generate and send queue_step commands for all steppers from flushed TrapMoves
-    bool generateSteps();
+    // Generate and send queue_step commands for all steppers from flushed TrapMoves.
+    // By default, only process a near-future time window (Python-style flush).
+    bool generateSteps(bool flushAll = false);
 
     // Pause/resume step generation (for homing coordination)
     void pauseStepGen();
@@ -69,6 +70,7 @@ public:
         m_needStartSync = true;
         m_needCheckPause = -1.0;
         m_stepClockSnapValid = false;
+        m_lastFlushTime.store(0.0, std::memory_order_release);
         m_stepGenPrintTime.store(0.0, std::memory_order_release);
         for (int i = 0; i < 3; i++)
             if (m_steppers[i]) m_steppers[i]->resetClockInitialized();
@@ -135,8 +137,11 @@ private:
     std::atomic<bool> m_stepGenPaused{false};
     std::atomic<bool> m_stepGenRunning{false};
 
+    // Python-style flush tracking.
+    std::atomic<double> m_lastFlushTime{0.0};
+
     // Backpressure: last print_time that stepGen has actually sent to MCU.
-    // The gcode thread must not get too far ahead of this value.
+    // Equivalent to Python's last_step_gen_time.
     std::atomic<double> m_stepGenPrintTime{0.0};
 
     // Lookahead: reverse + forward pass, then flush

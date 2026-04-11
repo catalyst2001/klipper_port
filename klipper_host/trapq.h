@@ -108,12 +108,14 @@ public:
     std::vector<TrapMove> toTrapMoves() const;
 };
 
-// Lookahead constants (from Klipper's toolhead.py)
+// Lookahead / flushing constants (from Klipper's Python host)
 constexpr double LOOKAHEAD_FLUSH_TIME = 0.150; // seconds
-
-// Buffer time constants for print-time backpressure (from Klipper's toolhead.py)
-constexpr double BUFFER_TIME_HIGH = 1.0;    // max seconds host can be ahead of MCU
-constexpr double BUFFER_TIME_START = 0.250;  // initial buffer when starting from idle
+constexpr double BUFFER_TIME_HIGH = 1.0;       // max seconds host can be ahead of MCU
+constexpr double BUFFER_TIME_START = 0.250;    // initial buffer when starting from idle
+constexpr double BGFLUSH_HIGH_TIME = 0.400;    // relaxed flush horizon
+constexpr double BGFLUSH_SG_HIGH_TIME = 0.700; // active step-gen horizon
+constexpr double BGFLUSH_EXTRA_TIME = 0.250;   // extra margin when flushing all
+constexpr double STEPCOMPRESS_FLUSH_TIME = 0.050; // keep send horizon behind step-gen horizon
 
 // TrapQ: queue of TrapMoves for step generation.
 // Steppers consume TrapMoves to generate step times.
@@ -129,6 +131,10 @@ public:
 
     // Get all pending trap moves (for step generation)
     std::vector<TrapMove> getAndClear();
+
+    // Extract trap moves whose execution begins before cutoffTime.
+    // If a move straddles cutoffTime, split it and keep the remainder queued.
+    std::vector<TrapMove> extractUpTo(double cutoffTime);
 
     // Peek at moves without clearing
     const std::vector<TrapMove>& peek() const { return m_moves; }
