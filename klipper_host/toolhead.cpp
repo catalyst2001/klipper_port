@@ -352,6 +352,10 @@ void ToolHead::lookaheadFlush(bool lazy) {
         allTrapMoves.insert(allTrapMoves.end(), trapMoves.begin(), trapMoves.end());
     }
     m_trapq.append(allTrapMoves);
+    if (!allTrapMoves.empty()) {
+        const auto& lastTM = allTrapMoves.back();
+        noteMcuMovequeueActivity(lastTM.print_time + lastTM.move_t, true);
+    }
 
     // NOTE: Step generation happens externally via explicit generateSteps()
     // calls from the print loop's flow-control code.  Generating steps here
@@ -372,6 +376,24 @@ void ToolHead::syncPrintTime() {
     if (minPrintTime > m_nextPrintTime) {
         m_nextPrintTime = minPrintTime;
     }
+}
+
+void ToolHead::noteMcuMovequeueActivity(double mqTime, bool isStepGen) {
+    if (isStepGen) {
+        mqTime += SDS_CHECK_TIME;
+        double cur = m_needStepGenTime.load(std::memory_order_acquire);
+        if (mqTime > cur)
+            m_needStepGenTime.store(mqTime, std::memory_order_release);
+    }
+    double cur = m_needFlushTime.load(std::memory_order_acquire);
+    if (mqTime > cur)
+        m_needFlushTime.store(mqTime, std::memory_order_release);
+}
+
+double ToolHead::calcStepGenRestart(double estPrintTime) const {
+    double kinTime = (std::max)(estPrintTime + MIN_KIN_TIME,
+                                m_stepGenPrintTime.load(std::memory_order_acquire));
+    return kinTime + SDS_CHECK_TIME;
 }
 
 // Backpressure: pause if host is too far ahead of MCU.
@@ -803,16 +825,21 @@ bool ToolHead::generateSteps(bool flushAll) {
     // queued for subsequent timer ticks.  This prevents a huge initial burst
     // of queue_step commands from overwhelming the MCU move queue.
     double estPrintTime = m_mcu.getClockSync().estimatedPrintTime();
+    double needFlushTime = m_needFlushTime.load(std::memory_order_acquire);
+    double needStepGenTime = m_needStepGenTime.load(std::memory_order_acquire);
     double lastFlushTime = m_lastFlushTime.load(std::memory_order_acquire);
     double lastStepGenTime = m_stepGenPrintTime.load(std::memory_order_acquire);
 
+    if (!flushAll && needFlushTime <= lastFlushTime && needStepGenTime <= lastStepGenTime)
+        return true;
+
+    double maxFlushTime = needFlushTime + BGFLUSH_EXTRA_TIME;
     double wantStepGenTime = flushAll
-        ? m_nextPrintTime
-        : (std::min)(m_nextPrintTime, estPrintTime + BGFLUSH_SG_HIGH_TIME);
+        ? (std::max)(needStepGenTime, lastStepGenTime)
+        : (std::min)(needStepGenTime, estPrintTime + BGFLUSH_SG_HIGH_TIME);
     double wantFlushTime = flushAll
-        ? m_nextPrintTime + BGFLUSH_EXTRA_TIME
-        : (std::min)(m_nextPrintTime + BGFLUSH_EXTRA_TIME,
-                     estPrintTime + BGFLUSH_HIGH_TIME);
+        ? maxFlushTime
+        : (std::min)(estPrintTime + BGFLUSH_HIGH_TIME, maxFlushTime);
 
     double flushTime = (std::max)({wantFlushTime, lastFlushTime,
                                    wantStepGenTime - STEPCOMPRESS_FLUSH_TIME});

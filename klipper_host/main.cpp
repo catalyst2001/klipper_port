@@ -420,14 +420,39 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
         return eventtime + 0.984;
     }, ctx.reactor.monotonic() + 0.984);
 
-    // ---- Reactor timer: step generation (every 25ms) ----
-    auto stepGenTimer = ctx.reactor.registerTimer([&](double eventtime) -> double {
+    // ---- Reactor timer: step generation / flush handler ----
+    ReactorTimerPtr stepGenTimer;
+    stepGenTimer = ctx.reactor.registerTimer([&](double eventtime) -> double {
         if (!g_running) return REACTOR_NEVER;
-        if (ctx.mcu.isConnected() && !ctx.mcu.isShutdown()) {
-            ctx.toolhead->generateSteps();
+        if (!ctx.mcu.isConnected() || ctx.mcu.isShutdown())
+            return eventtime + 0.050;
+
+        ctx.toolhead->generateSteps(false);
+
+        // Port of Python Klipper's motion_queuing._flush_handler():
+        // while actively stepping, wake earlier and flush a tighter window;
+        // when idle / draining remnants, fall back to the relaxed horizon.
+        double estPrintTime = ctx.mcu.getClockSync().estimatedPrintTime();
+        double needStepGenTime = ctx.toolhead->getNeedStepGenTime();
+        double needFlushTime = ctx.toolhead->getNeedFlushTime();
+        double lastStepGenTime = ctx.toolhead->getStepGenPrintTime();
+        double lastFlushTime = ctx.toolhead->getLastFlushTime();
+        double aggrSgTime = needStepGenTime - 2.0 * SDS_CHECK_TIME;
+
+        if (lastStepGenTime < aggrSgTime) {
+            double waketime = lastStepGenTime - BGFLUSH_SG_LOW_TIME;
+            double delay = waketime - estPrintTime;
+            return eventtime + (std::max)(0.001, delay);
         }
-        return eventtime + 0.025;
-    }, ctx.reactor.monotonic() + 0.025);
+
+        double maxFlushTime = needFlushTime + BGFLUSH_EXTRA_TIME;
+        if (lastFlushTime >= maxFlushTime)
+            return REACTOR_NEVER;
+
+        double waketime = lastFlushTime - BGFLUSH_LOW_TIME;
+        double delay = waketime - estPrintTime;
+        return eventtime + (std::max)(0.001, delay);
+    }, REACTOR_NOW);
 
     // ---- Reactor timer: gcode processing ----
     auto gcodeTimer = ctx.reactor.registerTimer([&](double eventtime) -> double {
@@ -512,6 +537,7 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
 
         // Flush after each batch
         ctx.toolhead->flush();
+        ctx.reactor.updateTimer(stepGenTimer, REACTOR_NOW);
         flushCount++;
 
         // Backpressure: pause gcode coroutine if too far ahead of MCU.

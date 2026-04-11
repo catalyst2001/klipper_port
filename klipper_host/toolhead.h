@@ -61,6 +61,19 @@ public:
     // By default, only process a near-future time window (Python-style flush).
     bool generateSteps(bool flushAll = false);
 
+    // Python motion_queuing-style tracking of pending MCU move queue activity.
+    void noteMcuMovequeueActivity(double mqTime, bool isStepGen = true);
+    double getLastFlushTime() const {
+        return m_lastFlushTime.load(std::memory_order_acquire);
+    }
+    double getNeedFlushTime() const {
+        return m_needFlushTime.load(std::memory_order_acquire);
+    }
+    double getNeedStepGenTime() const {
+        return m_needStepGenTime.load(std::memory_order_acquire);
+    }
+    double calcStepGenRestart(double estPrintTime) const;
+
     // Pause/resume step generation (for homing coordination)
     void pauseStepGen();
     void resumeStepGen();
@@ -70,6 +83,8 @@ public:
         m_needStartSync = true;
         m_needCheckPause = -1.0;
         m_stepClockSnapValid = false;
+        m_needFlushTime.store(0.0, std::memory_order_release);
+        m_needStepGenTime.store(0.0, std::memory_order_release);
         m_lastFlushTime.store(0.0, std::memory_order_release);
         m_stepGenPrintTime.store(0.0, std::memory_order_release);
         for (int i = 0; i < 3; i++)
@@ -138,6 +153,8 @@ private:
     std::atomic<bool> m_stepGenRunning{false};
 
     // Python-style flush tracking.
+    std::atomic<double> m_needFlushTime{0.0};
+    std::atomic<double> m_needStepGenTime{0.0};
     std::atomic<double> m_lastFlushTime{0.0};
 
     // Backpressure: last print_time that stepGen has actually sent to MCU.

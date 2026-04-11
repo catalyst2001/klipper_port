@@ -112,9 +112,13 @@ public:
 constexpr double LOOKAHEAD_FLUSH_TIME = 0.150; // seconds
 constexpr double BUFFER_TIME_HIGH = 1.0;       // max seconds host can be ahead of MCU
 constexpr double BUFFER_TIME_START = 0.250;    // initial buffer when starting from idle
+constexpr double BGFLUSH_LOW_TIME = 0.200;     // relaxed flush wake threshold
 constexpr double BGFLUSH_HIGH_TIME = 0.400;    // relaxed flush horizon
+constexpr double BGFLUSH_SG_LOW_TIME = 0.450;  // active step-gen wake threshold
 constexpr double BGFLUSH_SG_HIGH_TIME = 0.700; // active step-gen horizon
 constexpr double BGFLUSH_EXTRA_TIME = 0.250;   // extra margin when flushing all
+constexpr double MIN_KIN_TIME = 0.100;         // restart delay after idle
+constexpr double SDS_CHECK_TIME = 0.001;       // step+dir+step scan delay
 constexpr double STEPCOMPRESS_FLUSH_TIME = 0.050; // keep send horizon behind step-gen horizon
 
 // TrapQ: queue of TrapMoves for step generation.
