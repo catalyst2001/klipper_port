@@ -388,12 +388,24 @@ void ToolHead::noteMcuMovequeueActivity(double mqTime, bool isStepGen) {
     double cur = m_needFlushTime.load(std::memory_order_acquire);
     if (mqTime > cur)
         m_needFlushTime.store(mqTime, std::memory_order_release);
+
+    if (m_doKickFlushTimer) {
+        m_doKickFlushTimer = false;
+        m_flushKickRequested = true;
+    }
 }
 
 double ToolHead::calcStepGenRestart(double estPrintTime) const {
     double kinTime = (std::max)(estPrintTime + MIN_KIN_TIME,
                                 m_stepGenPrintTime.load(std::memory_order_acquire));
     return kinTime + SDS_CHECK_TIME;
+}
+
+bool ToolHead::consumeFlushKickRequest() {
+    if (!m_flushKickRequested)
+        return false;
+    m_flushKickRequested = false;
+    return true;
 }
 
 // Backpressure: pause if host is too far ahead of MCU.
@@ -826,36 +838,36 @@ bool ToolHead::generateSteps(bool flushAll) {
     if (m_stepGenPaused.load(std::memory_order_acquire))
         return true;
 
-    // Port of Python Klipper's motion_queuing._advance_flush_time():
-    // only generate steps for a near-future window and keep later TrapMoves
-    // queued for subsequent timer ticks.  This prevents a huge initial burst
-    // of queue_step commands from overwhelming the MCU move queue.
+    double needStepGenTime = m_needStepGenTime.load(std::memory_order_acquire);
+    if (flushAll)
+        return advanceFlushTime(needStepGenTime, needStepGenTime);
+
     double estPrintTime = m_mcu.getClockSync().estimatedPrintTime();
     double needFlushTime = m_needFlushTime.load(std::memory_order_acquire);
-    double needStepGenTime = m_needStepGenTime.load(std::memory_order_acquire);
-    double lastFlushTime = m_lastFlushTime.load(std::memory_order_acquire);
-    double lastStepGenTime = m_stepGenPrintTime.load(std::memory_order_acquire);
-
-    if (!flushAll && needFlushTime <= lastFlushTime && needStepGenTime <= lastStepGenTime)
+    double maxFlushTime = needFlushTime + BGFLUSH_EXTRA_TIME;
+    double wantFlushTime = (std::min)(estPrintTime + BGFLUSH_HIGH_TIME, maxFlushTime);
+    if (wantFlushTime <= m_lastFlushTime.load(std::memory_order_acquire)
+        && needStepGenTime <= m_stepGenPrintTime.load(std::memory_order_acquire))
         return true;
 
-    double maxFlushTime = needFlushTime + BGFLUSH_EXTRA_TIME;
-    double wantStepGenTime = flushAll
-        ? (std::max)(needStepGenTime, lastStepGenTime)
-        : (std::min)(needStepGenTime, estPrintTime + BGFLUSH_SG_HIGH_TIME);
-    double wantFlushTime = flushAll
-        ? maxFlushTime
-        : (std::min)(estPrintTime + BGFLUSH_HIGH_TIME, maxFlushTime);
+    return advanceFlushTime(wantFlushTime, 0.0);
+}
 
-    double flushTime = (std::max)({wantFlushTime, lastFlushTime,
-                                   wantStepGenTime - STEPCOMPRESS_FLUSH_TIME});
-    double stepGenTime = (std::max)({wantStepGenTime, lastStepGenTime, flushTime});
+bool ToolHead::advanceFlushTime(double wantFlushTime, double wantStepGenTime) {
+    double lastFlushTime = m_lastFlushTime.load(std::memory_order_acquire);
+    double lastStepGenTime = m_stepGenPrintTime.load(std::memory_order_acquire);
+    double flushTime = (std::max)(wantFlushTime, lastFlushTime);
+    flushTime = (std::max)(flushTime, wantStepGenTime - STEPCOMPRESS_FLUSH_TIME);
+    double stepGenTime = (std::max)((std::max)(wantStepGenTime, lastStepGenTime), flushTime);
 
-    auto allTrapMoves = flushAll ? m_trapq.getAndClear()
-                                 : m_trapq.extractUpTo(stepGenTime);
+    auto allTrapMoves = m_trapq.extractUpTo(stepGenTime);
+
+    // Python updates both last_flush_time and last_step_gen_time on every
+    // _advance_flush_time() call, even if there are no new generated steps.
+    m_lastFlushTime.store(flushTime, std::memory_order_release);
+    m_stepGenPrintTime.store(stepGenTime, std::memory_order_release);
+
     if (allTrapMoves.empty()) {
-        if (flushTime > lastFlushTime)
-            m_lastFlushTime.store(flushTime, std::memory_order_release);
         return true;
     }
 
@@ -1080,13 +1092,7 @@ bool ToolHead::generateSteps(bool flushAll) {
         stepper->setLastStepClock(lastStepClock);
     }
 
-    // Update Python-style flush tracking / backpressure progress
-    {
-        const auto& lastTM = trapMoves.back();
-        double batchEndTime = lastTM.print_time + lastTM.move_t;
-        m_lastFlushTime.store(flushTime, std::memory_order_release);
-        m_stepGenPrintTime.store(batchEndTime, std::memory_order_release);
-    }
+    // step_gen_time was already committed above to mirror Python behavior.
 
     return true;
 }

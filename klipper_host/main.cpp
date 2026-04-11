@@ -427,8 +427,6 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
         if (!ctx.mcu.isConnected() || ctx.mcu.isShutdown())
             return eventtime + 0.050;
 
-        ctx.toolhead->generateSteps(false);
-
         // Port of Python Klipper's motion_queuing._flush_handler():
         // while actively stepping, wake earlier and flush a tighter window;
         // when idle / draining remnants, fall back to the relaxed horizon.
@@ -440,14 +438,38 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
         double aggrSgTime = needStepGenTime - 2.0 * SDS_CHECK_TIME;
 
         if (lastStepGenTime < aggrSgTime) {
+            // Actively stepping - aggressive batching (Python _flush_handler).
+            double wantSgTime = estPrintTime + BGFLUSH_SG_HIGH_TIME;
+            double batchTime = BGFLUSH_SG_HIGH_TIME - BGFLUSH_SG_LOW_TIME;
+            double nextBatchTime = lastStepGenTime + batchTime;
+            if (nextBatchTime > estPrintTime) {
+                if (nextBatchTime > wantSgTime + 0.005)
+                    nextBatchTime = lastStepGenTime;
+                wantSgTime = nextBatchTime;
+            }
+            wantSgTime = (std::min)(wantSgTime, aggrSgTime);
+            if (wantSgTime > lastStepGenTime)
+                ctx.toolhead->advanceFlushTime(0.0, wantSgTime);
+
+            // Re-schedule timer
+            lastStepGenTime = ctx.toolhead->getStepGenPrintTime();
             double waketime = lastStepGenTime - BGFLUSH_SG_LOW_TIME;
             double delay = waketime - estPrintTime;
             return eventtime + (std::max)(0.001, delay);
         }
 
+        // Not stepping (or only remnants) - relaxed flush horizon.
         double maxFlushTime = needFlushTime + BGFLUSH_EXTRA_TIME;
-        if (lastFlushTime >= maxFlushTime)
+        double wantFlushTime = (std::min)(estPrintTime + BGFLUSH_HIGH_TIME, maxFlushTime);
+        if (wantFlushTime > lastFlushTime)
+            ctx.toolhead->advanceFlushTime(wantFlushTime, 0.0);
+
+        lastFlushTime = ctx.toolhead->getLastFlushTime();
+        if (lastFlushTime >= maxFlushTime) {
+            // Python: do_kick_flush_timer = True before sleeping forever.
+            ctx.toolhead->armFlushKickTimer();
             return REACTOR_NEVER;
+        }
 
         double waketime = lastFlushTime - BGFLUSH_LOW_TIME;
         double delay = waketime - estPrintTime;
@@ -537,7 +559,8 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
 
         // Flush after each batch
         ctx.toolhead->flush();
-        ctx.reactor.updateTimer(stepGenTimer, REACTOR_NOW);
+        if (ctx.toolhead->consumeFlushKickRequest())
+            ctx.reactor.updateTimer(stepGenTimer, REACTOR_NOW);
         flushCount++;
 
         // Backpressure: pause gcode coroutine if too far ahead of MCU.
