@@ -263,6 +263,11 @@ ConfigResult KlipperConfig::buildObjects(KlipperMCU& mcu,
         }
         // Extruder: has stepper + heater + sensor
         else if (type == "extruder" || type.substr(0, 9) == "extruder_") {
+            if (type == "extruder") {
+                result.pressureAdvance = section.getFloat("pressure_advance", result.pressureAdvance);
+                result.pressureAdvanceSmoothTime = section.getFloat(
+                    "pressure_advance_smooth_time", result.pressureAdvanceSmoothTime);
+            }
             // Stepper part
             if (section.has("step_pin")) {
                 auto info = buildStepper(mcu, section, result.warnings);

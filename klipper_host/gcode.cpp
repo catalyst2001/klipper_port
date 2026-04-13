@@ -8,6 +8,7 @@
 #include <cmath>
 #include <regex>
 #include <thread>
+#include <unordered_map>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -111,6 +112,10 @@ GCodeParser::ParsedLine GCodeParser::parseLine(const std::string& line) {
 }
 
 bool GCodeParser::executeLine(const std::string& line) {
+    if (tryExecuteExtendedCommand(line)) {
+        return true;
+    }
+
     auto parsed = parseLine(line);
     if (parsed.command.empty()) return true; // empty line is OK
 
@@ -135,6 +140,14 @@ bool GCodeParser::executeLine(const std::string& line) {
         return cmdG92(parsed.params);
     } else if (parsed.command == "M114") {
         return cmdM114(parsed.params);
+    } else if (parsed.command == "M82") {
+        return cmdM82(parsed.params);
+    } else if (parsed.command == "M83") {
+        return cmdM83(parsed.params);
+    } else if (parsed.command == "M204") {
+        return cmdM204(parsed.params);
+    } else if (parsed.command == "M205") {
+        return cmdM205(parsed.params);
     } else if (parsed.command == "M84") {
         return cmdM84(parsed.params);
     } else if (parsed.command == "M112") {
@@ -149,6 +162,137 @@ bool GCodeParser::executeLine(const std::string& line) {
     }
 
     m_lastMsg = "Unknown command: " + parsed.command;
+    return false;
+}
+
+bool GCodeParser::tryExecuteExtendedCommand(const std::string& line) {
+    std::string cleaned = line;
+    auto commentPos = cleaned.find(';');
+    if (commentPos != std::string::npos)
+        cleaned = cleaned.substr(0, commentPos);
+
+    while (!cleaned.empty() && std::isspace(static_cast<unsigned char>(cleaned.front())))
+        cleaned.erase(cleaned.begin());
+    while (!cleaned.empty() && std::isspace(static_cast<unsigned char>(cleaned.back())))
+        cleaned.pop_back();
+    if (cleaned.empty())
+        return false;
+
+    std::istringstream ss(cleaned);
+    std::string cmd;
+    ss >> cmd;
+    if (cmd.empty())
+        return false;
+
+    std::transform(cmd.begin(), cmd.end(), cmd.begin(),
+        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+
+    std::unordered_map<std::string, std::string> kv;
+    std::string token;
+    while (ss >> token) {
+        auto eq = token.find('=');
+        if (eq == std::string::npos)
+            continue;
+        std::string key = token.substr(0, eq);
+        std::string val = token.substr(eq + 1);
+        if (key.empty() || val.empty())
+            continue;
+        std::transform(key.begin(), key.end(), key.begin(),
+            [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        kv[key] = val;
+    }
+
+    auto getFloat = [&](const char* key, double& out) -> bool {
+        auto it = kv.find(key);
+        if (it == kv.end())
+            return false;
+        try {
+            out = std::stod(it->second);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    if (cmd == "SET_VELOCITY_LIMIT") {
+        double v;
+        if (getFloat("VELOCITY", v) || getFloat("MAX_VELOCITY", v))
+            m_toolhead.setMaxVelocity(v);
+
+        double a;
+        if (getFloat("ACCEL", a) || getFloat("MAX_ACCEL", a))
+            m_toolhead.setMaxAccel(a);
+
+        double scv;
+        if (getFloat("SQUARE_CORNER_VELOCITY", scv))
+            m_toolhead.setSquareCornerVelocity(scv);
+
+        m_lastMsg = "ok";
+        return true;
+    }
+
+    if (cmd == "SET_INPUT_SHAPER") {
+        auto& shaper = m_toolhead.getInputShaper();
+
+        auto setAxis = [&](int axis, const char* typeKey, const char* freqKey, const char* dampingKey) {
+            ShaperType curType = shaper.getAxisType(axis);
+            double curFreq = shaper.getAxisFrequency(axis);
+            double curDamping = shaper.getAxisDampingRatio(axis);
+
+            auto typeIt = kv.find(typeKey);
+            if (typeIt != kv.end()) {
+                curType = InputShaper::parseType(typeIt->second);
+            } else {
+                typeIt = kv.find("SHAPER_TYPE");
+                if (typeIt != kv.end())
+                    curType = InputShaper::parseType(typeIt->second);
+            }
+
+            double val;
+            if (getFloat(freqKey, val))
+                curFreq = val;
+            else if (getFloat("SHAPER_FREQ", val))
+                curFreq = val;
+
+            if (getFloat(dampingKey, val))
+                curDamping = val;
+            else if (getFloat("DAMPING_RATIO", val))
+                curDamping = val;
+
+            shaper.setAxisShaper(axis, curType, curFreq, curDamping);
+        };
+
+        setAxis(0, "SHAPER_TYPE_X", "SHAPER_FREQ_X", "DAMPING_RATIO_X");
+        setAxis(1, "SHAPER_TYPE_Y", "SHAPER_FREQ_Y", "DAMPING_RATIO_Y");
+
+        m_lastMsg = "ok";
+        return true;
+    }
+
+    if (cmd == "SET_PRESSURE_ADVANCE") {
+        double advance;
+        if (getFloat("ADVANCE", advance)) {
+            m_pressureAdvance = (std::max)(0.0, advance);
+        }
+
+        double smoothTime;
+        if (getFloat("SMOOTH_TIME", smoothTime)) {
+            m_pressureAdvanceSmoothTime = (std::max)(0.0, smoothTime);
+        }
+
+        m_toolhead.setPressureAdvance(m_pressureAdvance, m_pressureAdvanceSmoothTime);
+
+        if (!m_pressureAdvanceWarned) {
+            std::cout << "[GCode] Pressure advance updated: advance="
+                      << m_pressureAdvance << " smooth_time="
+                      << m_pressureAdvanceSmoothTime << std::endl;
+            m_pressureAdvanceWarned = true;
+        }
+
+        m_lastMsg = "ok";
+        return true;
+    }
+
     return false;
 }
 
@@ -177,6 +321,8 @@ bool GCodeParser::cmdG0G1(const std::map<char, double>& params) {
 
     Vec3 curPos = m_toolhead.getPosition();
     Vec3 target = curPos;
+    double curE = m_toolhead.getExtruderPosition();
+    double targetE = curE;
 
     if (m_absoluteMode) {
         auto xIt = params.find('X');
@@ -194,7 +340,15 @@ bool GCodeParser::cmdG0G1(const std::map<char, double>& params) {
         if (zIt != params.end()) target.z += zIt->second;
     }
 
-    m_toolhead.moveAbsolute(target, m_feedrate * m_speedFactor);
+    auto eIt = params.find('E');
+    if (eIt != params.end()) {
+        if (m_absoluteExtruderMode)
+            targetE = eIt->second + m_baseEPos;
+        else
+            targetE += eIt->second;
+    }
+
+    m_toolhead.moveAbsolute(target, m_feedrate * m_speedFactor, targetE);
     return true;
 }
 
@@ -209,12 +363,14 @@ bool GCodeParser::cmdG2G3(bool clockwise, const std::map<char, double>& params) 
     }
 
     Vec3 curPos = m_toolhead.getPosition();
+    double curE = m_toolhead.getExtruderPosition();
     double startX = curPos.x;
     double startY = curPos.y;
 
     // Target position
     double endX = startX, endY = startY;
     double endZ = curPos.z;
+    double endE = curE;
 
     if (m_absoluteMode) {
         auto xIt = params.find('X');
@@ -230,6 +386,14 @@ bool GCodeParser::cmdG2G3(bool clockwise, const std::map<char, double>& params) 
         if (yIt != params.end()) endY += yIt->second;
         auto zIt = params.find('Z');
         if (zIt != params.end()) endZ += zIt->second;
+    }
+
+    auto eIt = params.find('E');
+    if (eIt != params.end()) {
+        if (m_absoluteExtruderMode)
+            endE = eIt->second + m_baseEPos;
+        else
+            endE += eIt->second;
     }
 
     // I, J are always relative offsets from current position to arc center
@@ -272,6 +436,7 @@ bool GCodeParser::cmdG2G3(bool clockwise, const std::map<char, double>& params) 
     if (segments > 360) segments = 360;
 
     double zStep = (endZ - curPos.z) / segments;
+    double eStep = (endE - curE) / segments;
 
     for (int s = 1; s <= segments; s++) {
         double frac = static_cast<double>(s) / segments;
@@ -280,12 +445,13 @@ bool GCodeParser::cmdG2G3(bool clockwise, const std::map<char, double>& params) 
         pt.x = centerX + radius * std::cos(angle);
         pt.y = centerY + radius * std::sin(angle);
         pt.z = curPos.z + zStep * s;
-        m_toolhead.moveAbsolute(pt, m_feedrate * m_speedFactor);
+        double pe = curE + eStep * s;
+        m_toolhead.moveAbsolute(pt, m_feedrate * m_speedFactor, pe);
     }
 
     // Ensure we end exactly at the target
     Vec3 finalPt{endX, endY, endZ};
-    m_toolhead.moveAbsolute(finalPt, m_feedrate * m_speedFactor);
+    m_toolhead.moveAbsolute(finalPt, m_feedrate * m_speedFactor, endE);
     return true;
 }
 
@@ -400,6 +566,7 @@ bool GCodeParser::cmdG91(const std::map<char, double>&) {
 // G92: Set position (coordinate offset)
 bool GCodeParser::cmdG92(const std::map<char, double>& params) {
     Vec3 curPos = m_toolhead.getPosition();
+    double curE = m_toolhead.getExtruderPosition();
 
     auto xIt = params.find('X');
     if (xIt != params.end()) m_basePos.x = curPos.x - xIt->second;
@@ -407,6 +574,8 @@ bool GCodeParser::cmdG92(const std::map<char, double>& params) {
     if (yIt != params.end()) m_basePos.y = curPos.y - yIt->second;
     auto zIt = params.find('Z');
     if (zIt != params.end()) m_basePos.z = curPos.z - zIt->second;
+    auto eIt = params.find('E');
+    if (eIt != params.end()) m_baseEPos = curE - eIt->second;
 
     m_lastMsg = "ok";
     return true;
@@ -415,12 +584,60 @@ bool GCodeParser::cmdG92(const std::map<char, double>& params) {
 // M114: Report position
 bool GCodeParser::cmdM114(const std::map<char, double>&) {
     Vec3 pos = m_toolhead.getPosition();
+    double ePos = m_toolhead.getExtruderPosition();
     Vec3 gpos = {pos.x - m_basePos.x, pos.y - m_basePos.y, pos.z - m_basePos.z};
+    double ge = ePos - m_baseEPos;
 
     std::ostringstream ss;
-    ss << "X:" << gpos.x << " Y:" << gpos.y << " Z:" << gpos.z;
+    ss << "X:" << gpos.x << " Y:" << gpos.y << " Z:" << gpos.z << " E:" << ge;
     m_lastMsg = ss.str();
     std::cout << "[GCode] " << m_lastMsg << std::endl;
+    return true;
+}
+
+bool GCodeParser::cmdM82(const std::map<char, double>&) {
+    m_absoluteExtruderMode = true;
+    m_lastMsg = "ok";
+    return true;
+}
+
+bool GCodeParser::cmdM83(const std::map<char, double>&) {
+    m_absoluteExtruderMode = false;
+    m_lastMsg = "ok";
+    return true;
+}
+
+// M204: Set acceleration (supports S, P, T with Klipper-like behavior)
+bool GCodeParser::cmdM204(const std::map<char, double>& params) {
+    auto sIt = params.find('S');
+    auto pIt = params.find('P');
+    auto tIt = params.find('T');
+
+    if (sIt != params.end()) {
+        m_toolhead.setMaxAccel((std::max)(1.0, sIt->second));
+    } else {
+        double accel = 0.0;
+        if (pIt != params.end()) accel = (std::max)(accel, pIt->second);
+        if (tIt != params.end()) accel = (std::max)(accel, tIt->second);
+        if (accel > 0.0)
+            m_toolhead.setMaxAccel(accel);
+    }
+
+    m_lastMsg = "ok";
+    return true;
+}
+
+// M205: Set advanced motion parameters; currently maps X/Y to SCV.
+bool GCodeParser::cmdM205(const std::map<char, double>& params) {
+    auto xIt = params.find('X');
+    auto yIt = params.find('Y');
+    double scv = -1.0;
+    if (xIt != params.end()) scv = xIt->second;
+    if (yIt != params.end()) scv = (std::max)(scv, yIt->second);
+    if (scv > 0.0)
+        m_toolhead.setSquareCornerVelocity(scv);
+
+    m_lastMsg = "ok";
     return true;
 }
 

@@ -8,6 +8,7 @@
 #include <vector>
 #include <deque>
 #include <functional>
+#include <algorithm>
 #include <mutex>
 #include <atomic>
 
@@ -30,7 +31,10 @@ public:
     void addStepper(int axis, MCU_stepper* stepper);
 
     // Absolute position move
-    void moveAbsolute(const Vec3& pos, double speed);
+    void moveAbsolute(const Vec3& pos, double speed, double extruderPos);
+    void moveAbsolute(const Vec3& pos, double speed) {
+        moveAbsolute(pos, speed, m_ePos);
+    }
 
     // Relative move
     void moveRelative(const Vec3& delta, double speed);
@@ -41,6 +45,8 @@ public:
     // Get current position (after all moves)
     Vec3 getPosition() const { return m_pos; }
     void setPosition(const Vec3& pos) { m_pos = pos; }
+    double getExtruderPosition() const { return m_ePos; }
+    void setExtruderPosition(double e) { m_ePos = e; }
 
     // Get the trapezoid queue (for external step generation)
     TrapQ& getTrapQ() { return m_trapq; }
@@ -81,6 +87,13 @@ public:
         m_doKickFlushTimer = true;
     }
 
+    void setPressureAdvance(double advance, double smoothTime = 0.04) {
+        m_pressureAdvance = (std::max)(0.0, advance);
+        m_pressureAdvanceSmoothTime = (std::max)(0.0, smoothTime);
+    }
+    double getPressureAdvance() const { return m_pressureAdvance; }
+    double getPressureAdvanceSmoothTime() const { return m_pressureAdvanceSmoothTime; }
+
     // Pause/resume step generation (for homing coordination)
     void pauseStepGen();
     void resumeStepGen();
@@ -94,7 +107,7 @@ public:
         m_needStepGenTime.store(0.0, std::memory_order_release);
         m_lastFlushTime.store(0.0, std::memory_order_release);
         m_stepGenPrintTime.store(0.0, std::memory_order_release);
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < 4; i++)
             if (m_steppers[i]) m_steppers[i]->resetClockInitialized();
     }
 
@@ -127,6 +140,7 @@ private:
 
     // Current position
     Vec3 m_pos;
+    double m_ePos = 0.0;
 
     // Print time tracking
     double m_nextPrintTime = 0.0;
@@ -139,8 +153,12 @@ private:
     std::deque<Move> m_queue;
     double m_junctionFlush = LOOKAHEAD_FLUSH_TIME; // countdown (seconds)
 
-    // Axis steppers [X, Y, Z]
-    MCU_stepper* m_steppers[3] = {nullptr, nullptr, nullptr};
+    // Axis steppers [X, Y, Z, E]
+    MCU_stepper* m_steppers[4] = {nullptr, nullptr, nullptr, nullptr};
+
+    // Pressure advance settings.
+    double m_pressureAdvance = 0.0;
+    double m_pressureAdvanceSmoothTime = 0.04;
 
     // Trapezoid move queue
     TrapQ m_trapq;

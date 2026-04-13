@@ -29,6 +29,10 @@ struct TrapMove {
     double half_accel = 0;     // 0.5 * acceleration
     Vec3 start_pos;            // position at t=0
     Vec3 axes_r;               // unit direction (axes_d / move_d)
+    double extruder_start = 0; // E position at t=0
+    double extruder_r = 0;     // extruder ratio per scalar path distance
+    bool apply_pressure_advance = false;
+    double pressure_advance = 0.0;
 
     // Get position at time offset dt from print_time
     Vec3 getPos(double dt) const {
@@ -57,15 +61,27 @@ public:
     Move() = default;
     Move(const Vec3& startPos, const Vec3& endPos,
          double speed, double accel, double junctionDev = 0.0,
-         double mcrPseudoAccel = 0.0);
+         double mcrPseudoAccel = 0.0,
+         double extruderStart = 0.0,
+         double extruderEnd = 0.0,
+         double pressureAdvance = 0.0);
 
     Vec3 start_pos;
     Vec3 end_pos;
     Vec3 axes_d;               // end_pos - start_pos
     double move_d = 0;         // total distance
+    double kinematic_move_d = 0; // XYZ-only distance
     double speed = 0;          // cruise speed (mm/s)
     double accel = 0;          // acceleration (mm/s^2)
     double junction_deviation = 0; // per-move junction deviation
+    double extruder_start = 0;
+    double extruder_end = 0;
+    double extruder_d = 0;
+    double extruder_r = 0;
+    bool has_xyz_motion = false;
+    bool has_extrusion = false;
+    bool apply_pressure_advance = false;
+    double pressure_advance = 0.0;
 
     // Velocity squared tracking (Klipper convention)
     double max_start_v2 = 0;   // max allowed start velocity^2

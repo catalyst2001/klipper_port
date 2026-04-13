@@ -51,6 +51,10 @@ public:
     void setSpeedFactor(double f) { m_speedFactor = f; }
     double getSpeedFactor() const { return m_speedFactor; }
 
+    // Pressure advance settings (compatibility state).
+    double getPressureAdvance() const { return m_pressureAdvance; }
+    double getPressureAdvanceSmoothTime() const { return m_pressureAdvanceSmoothTime; }
+
     // Register custom command handler
     using CommandHandler = std::function<bool(const std::map<char, double>& params)>;
     void registerCommand(const std::string& cmd, CommandHandler handler);
@@ -61,9 +65,14 @@ private:
 
     // Coordinate system
     Vec3 m_basePos;         // G92 offset
+    double m_baseEPos = 0.0; // G92 offset for extruder
     bool m_absoluteMode = true;
+    bool m_absoluteExtruderMode = true;
     double m_feedrate = 25.0;  // mm/s (default)
     double m_speedFactor = 1.0;  // speed multiplier (M220 equivalent)
+    double m_pressureAdvance = 0.0;
+    double m_pressureAdvanceSmoothTime = 0.04;
+    bool m_pressureAdvanceWarned = false;
     bool m_homed[3] = {false, false, false};
 
     // Axis rails for homing
@@ -89,8 +98,15 @@ private:
     bool cmdG91(const std::map<char, double>& params);
     bool cmdG92(const std::map<char, double>& params);
     bool cmdM114(const std::map<char, double>& params);
+    bool cmdM82(const std::map<char, double>& params);
+    bool cmdM83(const std::map<char, double>& params);
+    bool cmdM204(const std::map<char, double>& params);
+    bool cmdM205(const std::map<char, double>& params);
     bool cmdM84(const std::map<char, double>& params);
     bool cmdM112(const std::map<char, double>& params);
     bool cmdM400(const std::map<char, double>& params);
+
+    // Extended Klipper-style tuning commands (e.g. SET_VELOCITY_LIMIT).
+    bool tryExecuteExtendedCommand(const std::string& line);
     bool cmdG2G3(bool clockwise, const std::map<char, double>& params);
 };

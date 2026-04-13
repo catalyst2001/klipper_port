@@ -69,6 +69,8 @@ struct ConfigResult {
     double maxVelocity = 300;
     double maxAccel = 3000;
     double squareCornerVelocity = 5.0;
+    double pressureAdvance = 0.0;
+    double pressureAdvanceSmoothTime = 0.04;
 
     // TMC5160 driver configurations
     struct TMC5160Config {

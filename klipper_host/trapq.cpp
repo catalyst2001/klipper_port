@@ -6,12 +6,33 @@
 // ========== Move ==========
 
 Move::Move(const Vec3& startPos, const Vec3& endPos,
-           double spd, double acc, double junctionDev, double mcrPseudoAccel)
+           double spd, double acc, double junctionDev, double mcrPseudoAccel,
+           double extruderStart, double extruderEnd, double pressureAdvance)
     : start_pos(startPos), end_pos(endPos), speed(spd), accel(acc),
-      junction_deviation(junctionDev)
+      junction_deviation(junctionDev), extruder_start(extruderStart),
+      extruder_end(extruderEnd), pressure_advance(pressureAdvance)
 {
     axes_d = end_pos - start_pos;
-    move_d = axes_d.length();
+    kinematic_move_d = axes_d.length();
+    extruder_d = extruder_end - extruder_start;
+
+    has_xyz_motion = (kinematic_move_d > 0.000000001);
+    has_extrusion = (std::abs(extruder_d) > 0.000000001);
+
+    if (has_xyz_motion) {
+        move_d = kinematic_move_d;
+        extruder_r = extruder_d / move_d;
+    } else if (has_extrusion) {
+        // Pure extruder move uses virtual scalar distance to preserve timing pipeline.
+        move_d = std::abs(extruder_d);
+        extruder_r = (extruder_d >= 0.0) ? 1.0 : -1.0;
+    } else {
+        move_d = 0.0;
+        extruder_r = 0.0;
+    }
+
+    // Match Klipper behavior: pressure advance applies on extrusion during XYZ motion.
+    apply_pressure_advance = has_xyz_motion && (extruder_r > 0.0) && pressure_advance > 0.0;
 
     max_cruise_v2 = speed * speed;
     delta_v2 = 2.0 * move_d * accel;
@@ -28,6 +49,14 @@ Move::Move(const Vec3& startPos, const Vec3& endPos,
 // Computes max_start_v2 using junction deviation + centripetal velocity model
 void Move::calcJunction(const Move* prevMove) {
     if (!prevMove || !prevMove->is_kinematic_move || !is_kinematic_move) {
+        max_start_v2 = 0.0;
+        max_mcr_start_v2 = 0.0;
+        return;
+    }
+
+    // Junction angle math is defined for XYZ vectors; keep pure-extruder
+    // moves isolated so they start/stop cleanly.
+    if (!prevMove->has_xyz_motion || !has_xyz_motion) {
         max_start_v2 = 0.0;
         max_mcr_start_v2 = 0.0;
         return;
@@ -105,7 +134,9 @@ std::vector<TrapMove> Move::toTrapMoves() const {
     std::vector<TrapMove> result;
     if (move_d < 0.000000001) return result;
 
-    Vec3 axes_r = axes_d * (1.0 / move_d);
+    Vec3 axes_r{};
+    if (kinematic_move_d > 0.000000001)
+        axes_r = axes_d * (1.0 / kinematic_move_d);
     double t = print_time;
     double dist = 0.0;
 
@@ -120,6 +151,10 @@ std::vector<TrapMove> Move::toTrapMoves() const {
                         start_pos.y + axes_r.y * dist,
                         start_pos.z + axes_r.z * dist};
         tm.axes_r = axes_r;
+        tm.extruder_start = extruder_start + extruder_r * dist;
+        tm.extruder_r = extruder_r;
+        tm.apply_pressure_advance = apply_pressure_advance;
+        tm.pressure_advance = pressure_advance;
         result.push_back(tm);
         t += accel_t;
         dist += accel_d;
@@ -136,6 +171,10 @@ std::vector<TrapMove> Move::toTrapMoves() const {
                         start_pos.y + axes_r.y * dist,
                         start_pos.z + axes_r.z * dist};
         tm.axes_r = axes_r;
+        tm.extruder_start = extruder_start + extruder_r * dist;
+        tm.extruder_r = extruder_r;
+        tm.apply_pressure_advance = apply_pressure_advance;
+        tm.pressure_advance = pressure_advance;
         result.push_back(tm);
         t += cruise_t;
         dist += cruise_d;
@@ -152,6 +191,10 @@ std::vector<TrapMove> Move::toTrapMoves() const {
                         start_pos.y + axes_r.y * dist,
                         start_pos.z + axes_r.z * dist};
         tm.axes_r = axes_r;
+        tm.extruder_start = extruder_start + extruder_r * dist;
+        tm.extruder_r = extruder_r;
+        tm.apply_pressure_advance = apply_pressure_advance;
+        tm.pressure_advance = pressure_advance;
         result.push_back(tm);
     }
 

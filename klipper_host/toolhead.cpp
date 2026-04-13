@@ -188,16 +188,17 @@ void ToolHead::setSquareCornerVelocity(double scv) {
 }
 
 void ToolHead::addStepper(int axis, MCU_stepper* stepper) {
-    if (axis >= 0 && axis < 3) {
+    if (axis >= 0 && axis < 4) {
         m_steppers[axis] = stepper;
     }
 }
 
-void ToolHead::moveAbsolute(const Vec3& pos, double speed) {
+void ToolHead::moveAbsolute(const Vec3& pos, double speed, double extruderPos) {
     speed = std::min(speed, m_maxVel);
     if (speed <= 0) speed = m_maxVel;
 
-    Move move(m_pos, pos, speed, m_maxAccel, m_junctionDeviation, m_mcrPseudoAccel);
+    Move move(m_pos, pos, speed, m_maxAccel, m_junctionDeviation,
+              m_mcrPseudoAccel, m_ePos, extruderPos, m_pressureAdvance);
 
     if (!move.is_kinematic_move) return;
 
@@ -207,6 +208,7 @@ void ToolHead::moveAbsolute(const Vec3& pos, double speed) {
 
     m_queue.push_back(std::move(move));
     m_pos = pos;
+    m_ePos = extruderPos;
 
     // Time-based flush trigger (like Klipper's junction_flush countdown)
     m_junctionFlush -= m_queue.back().min_move_t;
@@ -226,7 +228,7 @@ void ToolHead::moveAbsolute(const Vec3& pos, double speed) {
 
 void ToolHead::moveRelative(const Vec3& delta, double speed) {
     Vec3 target = m_pos + delta;
-    moveAbsolute(target, speed);
+    moveAbsolute(target, speed, m_ePos);
 }
 
 void ToolHead::flush() {
@@ -889,14 +891,15 @@ bool ToolHead::advanceFlushTime(double wantFlushTime, double wantStepGenTime) {
     double mcuFreqNom = m_mcu.getClockSync().getMcuFreq();
 
     // Check which axes use input shaping
-    bool shaped[3] = {false, false, false};
+    bool shaped[4] = {false, false, false, false};
     for (int axis = 0; axis < 3; ++axis)
         shaped[axis] = m_inputShaper.isAxisShaped(axis);
 
-    // For shaped axes: use iterative solver (TODO: not yet implemented)
+    // For shaped axes: use iterative solver with one stable clock snapshot.
+    auto snap = m_mcu.getClockSync().getClockSnapshot();
     for (int axis = 0; axis < 3; ++axis) {
         if (shaped[axis] && m_steppers[axis]) {
-            // generateShapedAxisSteps(axis, trapMoves, snap);
+            generateShapedAxisSteps(axis, trapMoves, snap);
         }
     }
 
@@ -908,9 +911,9 @@ bool ToolHead::advanceFlushTime(double wantFlushTime, double wantStepGenTime) {
         int64_t firstTmStartClock = -1;
         bool initialized = false;
     };
-    AxisData axisData[3];
+    AxisData axisData[4];
 
-    for (int axis = 0; axis < 3; ++axis) {
+    for (int axis = 0; axis < 4; ++axis) {
         if (shaped[axis]) continue;
         MCU_stepper* stepper = m_steppers[axis];
         if (!stepper) continue;
@@ -926,11 +929,17 @@ bool ToolHead::advanceFlushTime(double wantFlushTime, double wantStepGenTime) {
                 case 0: axisR = tm.axes_r.x; break;
                 case 1: axisR = tm.axes_r.y; break;
                 case 2: axisR = tm.axes_r.z; break;
+                case 3: axisR = tm.extruder_r; break;
             }
             if (std::abs(axisR) < 0.000000001) continue;
 
             double v0 = std::abs(axisR) * tm.start_v;
             double accel = std::abs(axisR) * 2.0 * tm.half_accel;
+            if (axis == 3 && tm.apply_pressure_advance && tm.pressure_advance > 0.0) {
+                double nominalAccel = 2.0 * tm.half_accel;
+                v0 += tm.pressure_advance * nominalAccel;
+            }
+            if (v0 < 0.0) v0 = 0.0;
             double totalDist = v0 * tm.move_t + 0.5 * accel * tm.move_t * tm.move_t;
             if (totalDist < stepDist * 0.5) continue;
 
@@ -974,7 +983,7 @@ bool ToolHead::advanceFlushTime(double wantFlushTime, double wantStepGenTime) {
 
     // Check if any steps were generated
     bool anySteps = false;
-    for (int axis = 0; axis < 3; ++axis)
+    for (int axis = 0; axis < 4; ++axis)
         if (axisData[axis].initialized) { anySteps = true; break; }
     if (!anySteps) {
         // Keep Python semantics: last_step_gen_time remains stepGenTime
@@ -991,7 +1000,7 @@ bool ToolHead::advanceFlushTime(double wantFlushTime, double wantStepGenTime) {
     uint32_t maxError = static_cast<uint32_t>(0.000025 * mcuFreqNom);
     static constexpr uint32_t CLOCK_DIFF_MAX = 3U << 28;
 
-    for (int axis = 0; axis < 3; ++axis) {
+    for (int axis = 0; axis < 4; ++axis) {
         auto& ad = axisData[axis];
         MCU_stepper* stepper = m_steppers[axis];
         if (!ad.initialized || !stepper) continue;

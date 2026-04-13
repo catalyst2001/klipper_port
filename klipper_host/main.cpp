@@ -287,16 +287,34 @@ struct TestContext {
             toolhead->setMaxVelocity(config->maxVelocity);
             toolhead->setMaxAccel(config->maxAccel);
             toolhead->setSquareCornerVelocity(config->squareCornerVelocity);
-            for (size_t i = 0; i < config->steppers.size() && i < 3; ++i)
-                toolhead->addStepper(static_cast<int>(i), config->steppers[i].stepper.get());
+            toolhead->setPressureAdvance(config->pressureAdvance,
+                                         config->pressureAdvanceSmoothTime);
+
+            auto findStepperByName = [&](const std::string& exact,
+                                         const std::string& prefix = "") -> MCU_stepper* {
+                for (auto& s : config->steppers) {
+                    if (s.name == exact)
+                        return s.stepper.get();
+                    if (!prefix.empty() && s.name.rfind(prefix, 0) == 0)
+                        return s.stepper.get();
+                }
+                return nullptr;
+            };
+
+            if (auto* sx = findStepperByName("stepper_x")) toolhead->addStepper(0, sx);
+            if (auto* sy = findStepperByName("stepper_y")) toolhead->addStepper(1, sy);
+            if (auto* sz = findStepperByName("stepper_z")) toolhead->addStepper(2, sz);
+            if (auto* se = findStepperByName("extruder", "extruder")) toolhead->addStepper(3, se);
         }
         Log("Toolhead initialized");
 
         // 9. Create G-code parser
         gcode = std::make_unique<GCodeParser>(*toolhead, mcu);
-        for (size_t i = 0; i < config->steppers.size() && i < 3; ++i) {
-            if (config->steppers[i].rail)
-                gcode->addRail(static_cast<int>(i), config->steppers[i].rail.get());
+        for (auto& s : config->steppers) {
+            if (!s.rail) continue;
+            if (s.name == "stepper_x") gcode->addRail(0, s.rail.get());
+            else if (s.name == "stepper_y") gcode->addRail(1, s.rail.get());
+            else if (s.name == "stepper_z") gcode->addRail(2, s.rail.get());
         }
         Log("G-code parser initialized");
 

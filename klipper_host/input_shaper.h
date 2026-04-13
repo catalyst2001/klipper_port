@@ -38,6 +38,17 @@ public:
     // Number of pulses for an axis
     int getNumPulses(int axis) const;
 
+    // Get current axis shaper configuration values.
+    ShaperType getAxisType(int axis) const {
+        return (axis >= 0 && axis <= 2) ? m_axes[axis].type : ShaperType::None;
+    }
+    double getAxisFrequency(int axis) const {
+        return (axis >= 0 && axis <= 2) ? m_axes[axis].freq : 0.0;
+    }
+    double getAxisDampingRatio(int axis) const {
+        return (axis >= 0 && axis <= 2) ? m_axes[axis].dampingRatio : 0.1;
+    }
+
     // Get the time window the shaper needs to look into the past (positive value)
     double getPreActiveTime(int axis) const;
 
