@@ -430,11 +430,13 @@ bool PrinterRail::homeAxis(KlipperMCU& mcu) {
     if (stepDist <= 0.0) return false;
 
     auto& clockSync = mcu.getClockSync();
+    const int64_t settleTicks = static_cast<int64_t>(0.1 * clockSync.getMcuFreq());
 
     // Phase 1: Fast home
     {
-        double printTime = clockSync.estimatedPrintTime() + 0.1;
-        int64_t homeClock = clockSync.printTimeToClock(printTime);
+        // During direct-path homing, schedule relative to the current MCU clock.
+        // This avoids print_time -> clock ambiguity across 32-bit wrap windows.
+        int64_t homeClock = clockSync.getClock() + settleTicks;
 
         // Set direction toward endstop
         bool dir = (m_posEndstop <= m_posMin);  // toward min = forward
@@ -463,8 +465,7 @@ bool PrinterRail::homeAxis(KlipperMCU& mcu) {
     // Round-trip to MCU confirms all prior state changes are settled.
     m_stepper.syncPosition();
     {
-        double printTime = clockSync.estimatedPrintTime() + 0.1;
-        int64_t startClock = clockSync.printTimeToClock(printTime);
+        int64_t startClock = clockSync.getClock() + settleTicks;
 
         // Reverse direction
         bool dir = (m_posEndstop > m_posMin);
@@ -489,8 +490,7 @@ bool PrinterRail::homeAxis(KlipperMCU& mcu) {
     // Sync barrier: confirm MCU finished executing retract steps.
     m_stepper.syncPosition();
     {
-        double printTime = clockSync.estimatedPrintTime() + 0.1;
-        int64_t homeClock = clockSync.printTimeToClock(printTime);
+        int64_t homeClock = clockSync.getClock() + settleTicks;
 
         bool dir = (m_posEndstop <= m_posMin);
         m_stepper.setNextStepDir(dir);

@@ -1410,11 +1410,9 @@ uint64_t KlipperMCU::stepSyncAdjustMinClock(uint64_t minClock, uint64_t releaseC
 void KlipperMCU::stepSyncReset() {
     std::lock_guard<std::mutex> lk(m_stepSyncMutex);
     while (!m_stepSyncHeap.empty()) m_stepSyncHeap.pop();
-    // Use the full move_count, matching Python Klipper's steppersync setup.
-    // This is now safe because ToolHead::generateSteps() only emits a bounded
-    // near-future window of TrapMoves (Python-style flush_time/step_gen_time)
-    // instead of submitting the entire queued motion range at once.
-    int usable = m_mcuMoveCount;
+    // Keep a safety margin in the host-side slot tracker to avoid transient
+    // overcommit during bursty startup segments (eg. post-homing priming).
+    int usable = m_mcuMoveCount / 2;
     if (usable < 64) usable = 64;
     m_stepSyncTotal.store(0, std::memory_order_relaxed);
     m_stepSyncGated.store(0, std::memory_order_relaxed);

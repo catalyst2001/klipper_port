@@ -361,6 +361,15 @@ bool GCodeParser::cmdG28(const std::map<char, double>& params) {
     m_toolhead.resetSyncState();
     m_mcu.stepSyncReset();
 
+    // Re-sync clocks after long direct-path homing while SerialQueue is still
+    // stopped (safe sendWithResponse path). This reduces stale estPrintTime
+    // risk before scheduling the first post-homing print moves.
+    if (!m_mcu.initClockSync()) {
+        m_lastMsg = "Clock sync re-init failed after homing";
+        m_toolhead.resumeStepGen();
+        return false;
+    }
+
     // Restart SerialQueue for clock-gated step delivery.
     // Must happen after resetSyncState (which resets stepper clock tracking)
     // and before resumeStepGen (which begins submitting commands to SQ).

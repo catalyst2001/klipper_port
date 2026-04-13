@@ -3,10 +3,32 @@
 # Results are logged to test_all_x8_results.log
 # =============================================================================
 
+param(
+    [double]$SpeedFactor = 8.0,
+    [string]$Configuration = "Debug",
+    [string]$LogFile = "test_all_x8_results.log",
+    [string]$IncludePattern = "*.gcode",
+    [int]$MaxFiles = 0,
+    [switch]$PauseAtEnd
+)
+
 $ErrorActionPreference = "Continue"
-$exe = ".\klipper_host\x64\Release\klipper_host.exe"
-$logFile = "test_all_x8_results.log"
-$speedFactor = 8.0
+
+$exeCandidates = @(
+    ".\klipper_host\x64\$Configuration\klipper_host.exe",
+    ".\klipper_host\x64\Debug\klipper_host.exe",
+    ".\klipper_host\x64\Release\klipper_host.exe"
+)
+$exe = $null
+foreach ($c in $exeCandidates) {
+    if (Test-Path $c) {
+        $exe = $c
+        break
+    }
+}
+if (-not $exe) {
+    throw "klipper_host.exe not found. Build first (Debug or Release)."
+}
 
 Write-Host "Scanning gcode files..." -ForegroundColor Cyan
 
@@ -23,13 +45,18 @@ function Count-Lines([string]$path) {
 
 # Collect all gcode files, count lines quickly, sort smallest first
 $files = @()
-Get-ChildItem -LiteralPath "gcode" -Filter "*.gcode" | ForEach-Object {
-    Write-Host "  Counting: $($_.Name) ... " -NoNewline
-    $lc = Count-Lines $_.FullName
-    Write-Host "$lc lines" -ForegroundColor Gray
-    $files += [PSCustomObject]@{ Name = $_.Name; Path = $_.FullName; Lines = $lc }
+Get-ChildItem -LiteralPath "gcode" -Filter "*.gcode" |
+    Where-Object { $_.Name -like $IncludePattern } |
+    ForEach-Object {
+        Write-Host "  Counting: $($_.Name) ... " -NoNewline
+        $lc = Count-Lines $_.FullName
+        Write-Host "$lc lines" -ForegroundColor Gray
+        $files += [PSCustomObject]@{ Name = $_.Name; Path = $_.FullName; Lines = $lc }
+    }
+$files = @($files | Sort-Object Lines)
+if ($MaxFiles -gt 0) {
+    $files = @($files | Select-Object -First $MaxFiles)
 }
-$files = $files | Sort-Object Lines
 
 $total = $files.Count
 $passed = 0
@@ -42,7 +69,8 @@ $header = @"
 ==============================================================================
   Klipper Host C++ - Sequential x8 Speed Test
   Date : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-  Speed: x$speedFactor
+    Speed: x$SpeedFactor
+    Exe  : $exe
   Files: $total
 ==============================================================================
 "@
@@ -72,47 +100,26 @@ foreach ($f in $files) {
 
     Write-Host "  Start: $(Get-Date -Format 'HH:mm:ss')  Log: $outFile" -ForegroundColor Gray
 
-    # Run test: redirect all output to file, stream to console line by line
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo.FileName = (Resolve-Path $exe).Path
-    $process.StartInfo.Arguments = "gcode `"$($f.Path)`" --speed-factor $speedFactor"
-    $process.StartInfo.WorkingDirectory = (Get-Location).Path
-    $process.StartInfo.UseShellExecute = $false
-    $process.StartInfo.RedirectStandardOutput = $true
-    $process.StartInfo.RedirectStandardError = $true
-    $process.StartInfo.CreateNoWindow = $true
-
-    # Clear output file
+    # Run test: stream merged stdout/stderr in real time and save to file
     "" | Out-File -FilePath $outFile -Encoding utf8
 
-    $process.Start() | Out-Null
-
-    # Read stdout line-by-line for real-time display
     $lastFlush = ""
-    while (-not $process.StandardOutput.EndOfStream) {
-        $line = $process.StandardOutput.ReadLine()
-        $line | Out-File -FilePath $outFile -Append -Encoding utf8
-        # Show every 10th flush and all non-flush lines to keep console readable
-        if ($line -match "^$") { continue }
-        if ($line -match "Flush #(\d+)") {
-            $flushNum = [int]$Matches[1]
-            if ($flushNum % 100 -eq 0) {
-                Write-Host "  $line" -ForegroundColor DarkCyan
+    & (Resolve-Path $exe).Path gcode "$($f.Path)" --speed-factor $SpeedFactor 2>&1 |
+        ForEach-Object {
+            $line = "$_"
+            $line | Out-File -FilePath $outFile -Append -Encoding utf8
+            if ($line -match "^$") { return }
+            if ($line -match "Flush #(\d+)") {
+                $flushNum = [int]$Matches[1]
+                if ($flushNum % 100 -eq 0) {
+                    Write-Host "  $line" -ForegroundColor DarkCyan
+                }
+                $lastFlush = $line
+            } else {
+                Write-Host "  $line"
             }
-            $lastFlush = $line
-        } else {
-            Write-Host "  $line"
         }
-    }
-    # Drain stderr
-    $stderr = $process.StandardError.ReadToEnd()
-    if ($stderr) {
-        $stderr | Out-File -FilePath $outFile -Append -Encoding utf8
-        Write-Host "  $stderr" -ForegroundColor Red
-    }
-
-    $process.WaitForExit()
-    $exitCode = $process.ExitCode
+    $exitCode = $LASTEXITCODE
 
     $endTime = Get-Date
     $duration = $endTime - $startTime
@@ -122,7 +129,8 @@ foreach ($f in $files) {
     $hasShutdown = $false
     $shutdownMsg = ""
     if (Test-Path $outFile) {
-        $shutdownLine = Select-String -LiteralPath $outFile -Pattern "SHUTDOWN" -SimpleMatch | Select-Object -First 1
+        # Avoid false positives from identify JSON/static strings containing "shutdown".
+        $shutdownLine = Select-String -LiteralPath $outFile -Pattern "!!! MCU SHUTDOWN|ERROR: MCU SHUTDOWN" | Select-Object -First 1
         if ($shutdownLine) {
             $hasShutdown = $true
             $shutdownMsg = $shutdownLine.Line
@@ -174,5 +182,7 @@ Write-Host $finalSummary -ForegroundColor Cyan
 $finalSummary | Out-File -FilePath $logFile -Append -Encoding utf8
 
 Write-Host "`nResults saved to: $logFile" -ForegroundColor White
-Write-Host "Press any key to close..." -ForegroundColor DarkGray
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+if ($PauseAtEnd) {
+    Write-Host "Press any key to close..." -ForegroundColor DarkGray
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}

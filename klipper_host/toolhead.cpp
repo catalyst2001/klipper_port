@@ -977,11 +977,10 @@ bool ToolHead::advanceFlushTime(double wantFlushTime, double wantStepGenTime) {
     for (int axis = 0; axis < 3; ++axis)
         if (axisData[axis].initialized) { anySteps = true; break; }
     if (!anySteps) {
-        // Still update progress even if no steps (e.g., travel moves with no axis motion)
-        const auto& lastTM = trapMoves.back();
-        double batchEndTime = lastTM.print_time + lastTM.move_t;
+        // Keep Python semantics: last_step_gen_time remains stepGenTime
+        // from advanceFlushTime(), even if this batch produced no queue_step.
         m_lastFlushTime.store(flushTime, std::memory_order_release);
-        m_stepGenPrintTime.store(batchEndTime, std::memory_order_release);
+        m_stepGenPrintTime.store(stepGenTime, std::memory_order_release);
         return true;
     }
 
