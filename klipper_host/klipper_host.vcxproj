@@ -146,6 +146,7 @@
     <ClCompile Include="miniz_impl.cpp" />
     <ClCompile Include="serial_queue.cpp" />
     <ClCompile Include="reactor.cpp" />
+    <ClCompile Include="moonraker_api.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="serial_port.h" />
@@ -164,6 +165,7 @@
     <ClInclude Include="tmc5160.h" />
     <ClInclude Include="input_shaper.h" />
     <ClInclude Include="reactor.h" />
+    <ClInclude Include="moonraker_api.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\.editorconfig" />

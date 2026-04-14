@@ -22,6 +22,7 @@ public:
     // Set absolute/relative mode
     void setAbsoluteMode(bool absolute) { m_absoluteMode = absolute; }
     bool isAbsoluteMode() const { return m_absoluteMode; }
+    bool isAbsoluteExtruderMode() const { return m_absoluteExtruderMode; }
 
     // Parse and execute a single line of G-code
     // Returns true if the command was recognized and executed

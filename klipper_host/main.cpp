@@ -34,6 +34,7 @@
 #include "tmc5160.h"
 #include "input_shaper.h"
 #include "reactor.h"
+#include "moonraker_api.h"
 
 // ---- Global state ----
 static std::mutex g_mcuMutex;
@@ -732,18 +733,229 @@ static int runInfo(TestContext& ctx) {
     return 0;
 }
 
+static int runApiServer(TestContext& ctx, int httpPort) {
+    ctx.startLegacyThreads();
+    using json = nlohmann::json;
+
+    auto defaultObjects = []() {
+        return std::vector<std::string>{
+            "webhooks", "toolhead", "gcode_move", "motion_report",
+            "print_stats", "extruder", "heater_bed", "virtual_sdcard", "configfile"
+        };
+    };
+
+    auto parseRequestedObjects = [&](const std::string& query) {
+        std::vector<std::string> objects;
+        std::istringstream ss(query);
+        std::string token;
+        while (std::getline(ss, token, '&')) {
+            if (token.empty())
+                continue;
+            auto eq = token.find('=');
+            std::string name = (eq == std::string::npos) ? token : token.substr(0, eq);
+            if (!name.empty())
+                objects.push_back(name);
+        }
+        if (objects.empty())
+            objects = defaultObjects();
+        return objects;
+    };
+
+    auto getHostName = []() -> std::string {
+        char* buf = nullptr;
+        size_t len = 0;
+        std::string host = "localhost";
+        if (_dupenv_s(&buf, &len, "COMPUTERNAME") == 0 && buf) {
+            host = buf;
+            free(buf);
+        }
+        return host;
+    };
+
+    MoonrakerApiCallbacks callbacks;
+    callbacks.getServerInfo = [&]() -> json {
+        bool connected = ctx.mcu.isConnected() && !ctx.mcu.isShutdown();
+        return {
+            {"klippy_connected", connected},
+            {"klippy_state", connected ? "ready" : (ctx.mcu.isShutdown() ? "shutdown" : "disconnected")},
+            {"components", {"application", "klippy_connection", "machine"}},
+            {"failed_components", json::array()},
+            {"registered_directories", {"gcodes"}},
+            {"warnings", json::array()},
+            {"websocket_count", 0},
+            {"moonraker_version", "klipper_host_cpp-dev"},
+            {"api_version", {1, 0, 0}}
+        };
+    };
+
+    callbacks.getPrinterInfo = [&]() -> json {
+        bool shutdown = ctx.mcu.isShutdown();
+        return {
+            {"state", shutdown ? "error" : "ready"},
+            {"state_message", shutdown ? ctx.mcu.getShutdownMsg() : "Printer is ready"},
+            {"hostname", getHostName()},
+            {"software_version", "klipper_host_cpp"}
+        };
+    };
+
+    callbacks.getSystemInfo = [&]() -> json {
+        return {
+            {"system_info", {
+                {"platform", "windows"},
+                {"hostname", getHostName()},
+                {"cpu_info", {{"cpu_count", std::thread::hardware_concurrency()}}}
+            }}
+        };
+    };
+
+    callbacks.queryObjects = [&](const std::string& query) -> json {
+        Vec3 pos = ctx.toolhead->getPosition();
+        double epos = ctx.toolhead->getExtruderPosition();
+        double eventtime = ctx.mcu.getClockSync().estimatedPrintTime();
+        auto requested = parseRequestedObjects(query);
+        auto hasObj = [&](const std::string& name) {
+            return std::find(requested.begin(), requested.end(), name) != requested.end();
+        };
+
+        json status = json::object();
+        if (hasObj("webhooks")) {
+            status["webhooks"] = {
+                {"state", ctx.mcu.isShutdown() ? "shutdown" : "ready"},
+                {"state_message", ctx.mcu.isShutdown() ? ctx.mcu.getShutdownMsg() : "ready"}
+            };
+        }
+        if (hasObj("toolhead")) {
+            status["toolhead"] = {
+                {"position", {pos.x, pos.y, pos.z, epos}},
+                {"max_velocity", ctx.toolhead->getMaxVelocity()},
+                {"max_accel", ctx.toolhead->getMaxAccel()},
+                {"print_time", ctx.toolhead->getNextPrintTime()},
+                {"estimated_print_time", eventtime},
+                {"stalls", 0}
+            };
+        }
+        if (hasObj("gcode_move")) {
+            status["gcode_move"] = {
+                {"gcode_position", {pos.x, pos.y, pos.z, epos}},
+                {"position", {pos.x, pos.y, pos.z, epos}},
+                {"speed", ctx.gcode->getFeedrate()},
+                {"speed_factor", ctx.gcode->getSpeedFactor()},
+                {"extrude_factor", 1.0},
+                {"absolute_coordinates", ctx.gcode->isAbsoluteMode()},
+                {"absolute_extrude", ctx.gcode->isAbsoluteExtruderMode()},
+                {"homing_origin", {0.0, 0.0, 0.0, 0.0}}
+            };
+        }
+        if (hasObj("motion_report")) {
+            status["motion_report"] = {
+                {"live_position", {pos.x, pos.y, pos.z, epos}},
+                {"live_velocity", 0.0},
+                {"live_extruder_velocity", 0.0}
+            };
+        }
+        if (hasObj("print_stats")) {
+            status["print_stats"] = {
+                {"state", "standby"},
+                {"filename", ""},
+                {"message", ""},
+                {"info", {{"total_layer", nullptr}, {"current_layer", nullptr}}},
+                {"print_duration", 0.0},
+                {"total_duration", 0.0}
+            };
+        }
+        if (hasObj("extruder")) {
+            status["extruder"] = {
+                {"temperature", 0.0},
+                {"target", 0.0},
+                {"power", 0.0},
+                {"can_extrude", true},
+                {"pressure_advance", ctx.toolhead->getPressureAdvance()},
+                {"smooth_time", ctx.toolhead->getPressureAdvanceSmoothTime()}
+            };
+        }
+        if (hasObj("heater_bed")) {
+            status["heater_bed"] = {
+                {"temperature", 0.0},
+                {"target", 0.0},
+                {"power", 0.0}
+            };
+        }
+        if (hasObj("virtual_sdcard")) {
+            status["virtual_sdcard"] = {
+                {"is_active", false},
+                {"progress", 0.0},
+                {"file_position", 0},
+                {"file_size", 0}
+            };
+        }
+        if (hasObj("configfile")) {
+            status["configfile"] = {
+                {"save_config_pending", false},
+                {"warnings", json::array()},
+                {"config", {
+                    {"printer", {
+                        {"max_velocity", ctx.toolhead->getMaxVelocity()},
+                        {"max_accel", ctx.toolhead->getMaxAccel()}
+                    }}
+                }}
+            };
+        }
+
+        return {
+            {"eventtime", eventtime},
+            {"status", status}
+        };
+    };
+
+    callbacks.executeGcode = [&](const std::string& script, std::string& message) -> bool {
+        if (script.empty()) {
+            message = "Empty script";
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(g_mcuMutex);
+        int executed = ctx.gcode->executeBlock(script);
+        if (executed <= 0) {
+            message = ctx.gcode->getLastMessage();
+            if (message.empty())
+                message = "No commands executed";
+            return false;
+        }
+        message = "ok";
+        return true;
+    };
+
+    MoonrakerApiServer server(std::move(callbacks));
+    std::string error;
+    if (!server.start(static_cast<uint16_t>(httpPort), error)) {
+        LogError("Moonraker API start failed: " + error);
+        return 1;
+    }
+
+    Log("Moonraker-compatible API listening on http://0.0.0.0:" + std::to_string(httpPort));
+    Log("Press Ctrl-C to stop the API server");
+
+    while (g_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+
+    server.stop();
+    return 0;
+}
+
 // ---- Usage ----
 static void printUsage(const char* exe) {
     std::cerr << "Usage:\n"
               << "  " << exe << " gcode <file.gcode>    - run gcode file\n"
               << "  " << exe << " move \"<gcode>\"        - execute gcode block\n"
               << "  " << exe << " monitor [seconds]      - monitor MCU stats\n"
-              << "  " << exe << " info                   - show MCU info\n\n"
+              << "  " << exe << " info                   - show MCU info\n"
+              << "  " << exe << " api [http_port]        - run Moonraker-style HTTP API\n\n"
               << "Options:\n"
-              << "  --port <COMx>     - serial port (default COM3)\n"
-              << "  --config <file>   - config file (default configs/generic-duet3-6hc.cfg)\n"
-              << "  --start-line <N>  - skip to line N (skip non-move lines before it)\n"
-              << "  --speed-factor <X> - speed multiplier (e.g. 2.0 for 2x speed)\n";
+              << "  --port <COMx>       - serial port (default COM3)\n"
+              << "  --config <file>     - config file (default configs/generic-duet3-6hc.cfg)\n"
+              << "  --start-line <N>    - skip to line N (skip non-move lines before it)\n"
+              << "  --speed-factor <X>  - speed multiplier (e.g. 2.0 for 2x speed)\n"
+              << "  --http-port <N>     - HTTP API port for api mode (default 7125)\n";
 }
 
 // ---- Main ----
@@ -758,6 +970,7 @@ int main(int argc, char* argv[]) {
     std::string configPath = "configs/generic-duet3-6hc.cfg";
     size_t g_startLine = 0;
     double g_speedFactor = 1.0;
+    int httpPort = 7125;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -769,6 +982,8 @@ int main(int argc, char* argv[]) {
             g_startLine = std::stoull(argv[++i]);
         } else if (arg == "--speed-factor" && i + 1 < argc) {
             g_speedFactor = std::stod(argv[++i]);
+        } else if (arg == "--http-port" && i + 1 < argc) {
+            httpPort = std::stoi(argv[++i]);
         } else if (mode.empty()) {
             mode = arg;
         } else if (modeArg.empty()) {
@@ -817,6 +1032,10 @@ int main(int argc, char* argv[]) {
     } else if (mode == "info") {
         ctx.startLegacyThreads();
         result = runInfo(ctx);
+    } else if (mode == "api") {
+        if (!modeArg.empty())
+            httpPort = std::stoi(modeArg);
+        result = runApiServer(ctx, httpPort);
     } else {
         LogError("Unknown mode: " + mode);
         printUsage(argv[0]);
