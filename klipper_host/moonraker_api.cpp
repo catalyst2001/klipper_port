@@ -1,7 +1,9 @@
 #include "moonraker_api.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <sstream>
@@ -182,6 +184,203 @@ static std::string recvRequest(SOCKET client) {
     }
     return data;
 }
+
+static bool sendAll(SOCKET client, const void* data, size_t len) {
+    const char* ptr = static_cast<const char*>(data);
+    while (len > 0) {
+        int sent = send(client, ptr, static_cast<int>(len), 0);
+        if (sent <= 0)
+            return false;
+        ptr += sent;
+        len -= static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+static uint32_t rol32(uint32_t value, int bits) {
+    return (value << bits) | (value >> (32 - bits));
+}
+
+static std::array<uint8_t, 20> sha1Digest(const std::string& input) {
+    std::vector<uint8_t> data(input.begin(), input.end());
+    const uint64_t bitLen = static_cast<uint64_t>(data.size()) * 8ULL;
+    data.push_back(0x80);
+    while ((data.size() % 64) != 56)
+        data.push_back(0x00);
+    for (int i = 7; i >= 0; --i)
+        data.push_back(static_cast<uint8_t>((bitLen >> (i * 8)) & 0xFF));
+
+    uint32_t h0 = 0x67452301;
+    uint32_t h1 = 0xEFCDAB89;
+    uint32_t h2 = 0x98BADCFE;
+    uint32_t h3 = 0x10325476;
+    uint32_t h4 = 0xC3D2E1F0;
+
+    for (size_t chunk = 0; chunk < data.size(); chunk += 64) {
+        uint32_t w[80] = {};
+        for (int i = 0; i < 16; ++i) {
+            size_t off = chunk + i * 4;
+            w[i] = (static_cast<uint32_t>(data[off]) << 24)
+                 | (static_cast<uint32_t>(data[off + 1]) << 16)
+                 | (static_cast<uint32_t>(data[off + 2]) << 8)
+                 | static_cast<uint32_t>(data[off + 3]);
+        }
+        for (int i = 16; i < 80; ++i)
+            w[i] = rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+
+        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
+        for (int i = 0; i < 80; ++i) {
+            uint32_t f = 0, k = 0;
+            if (i < 20) {
+                f = (b & c) | ((~b) & d);
+                k = 0x5A827999;
+            } else if (i < 40) {
+                f = b ^ c ^ d;
+                k = 0x6ED9EBA1;
+            } else if (i < 60) {
+                f = (b & c) | (b & d) | (c & d);
+                k = 0x8F1BBCDC;
+            } else {
+                f = b ^ c ^ d;
+                k = 0xCA62C1D6;
+            }
+            uint32_t temp = rol32(a, 5) + f + e + k + w[i];
+            e = d;
+            d = c;
+            c = rol32(b, 30);
+            b = a;
+            a = temp;
+        }
+
+        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
+    }
+
+    std::array<uint8_t, 20> out{};
+    const uint32_t words[5] = { h0, h1, h2, h3, h4 };
+    for (int i = 0; i < 5; ++i) {
+        out[i * 4 + 0] = static_cast<uint8_t>((words[i] >> 24) & 0xFF);
+        out[i * 4 + 1] = static_cast<uint8_t>((words[i] >> 16) & 0xFF);
+        out[i * 4 + 2] = static_cast<uint8_t>((words[i] >> 8) & 0xFF);
+        out[i * 4 + 3] = static_cast<uint8_t>(words[i] & 0xFF);
+    }
+    return out;
+}
+
+static std::string base64Encode(const uint8_t* data, size_t len) {
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t triple = static_cast<uint32_t>(data[i]) << 16;
+        bool have2 = (i + 1 < len);
+        bool have3 = (i + 2 < len);
+        if (have2) triple |= static_cast<uint32_t>(data[i + 1]) << 8;
+        if (have3) triple |= static_cast<uint32_t>(data[i + 2]);
+        out.push_back(alphabet[(triple >> 18) & 0x3F]);
+        out.push_back(alphabet[(triple >> 12) & 0x3F]);
+        out.push_back(have2 ? alphabet[(triple >> 6) & 0x3F] : '=');
+        out.push_back(have3 ? alphabet[triple & 0x3F] : '=');
+    }
+    return out;
+}
+
+static std::string websocketAcceptKey(const std::string& clientKey) {
+    const std::string magic = clientKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    auto digest = sha1Digest(magic);
+    return base64Encode(digest.data(), digest.size());
+}
+
+static bool sendWsFrame(SOCKET client, uint8_t opcode, const std::string& payload) {
+    std::vector<uint8_t> frame;
+    frame.reserve(payload.size() + 16);
+    frame.push_back(static_cast<uint8_t>(0x80 | (opcode & 0x0F)));
+    if (payload.size() < 126) {
+        frame.push_back(static_cast<uint8_t>(payload.size()));
+    } else if (payload.size() <= 0xFFFF) {
+        frame.push_back(126);
+        frame.push_back(static_cast<uint8_t>((payload.size() >> 8) & 0xFF));
+        frame.push_back(static_cast<uint8_t>(payload.size() & 0xFF));
+    } else {
+        frame.push_back(127);
+        uint64_t len64 = static_cast<uint64_t>(payload.size());
+        for (int i = 7; i >= 0; --i)
+            frame.push_back(static_cast<uint8_t>((len64 >> (i * 8)) & 0xFF));
+    }
+    frame.insert(frame.end(), payload.begin(), payload.end());
+    return sendAll(client, frame.data(), frame.size());
+}
+
+static bool recvExact(SOCKET client, void* buf, size_t len) {
+    char* ptr = static_cast<char*>(buf);
+    while (len > 0) {
+        int got = recv(client, ptr, static_cast<int>(len), 0);
+        if (got <= 0)
+            return false;
+        ptr += got;
+        len -= static_cast<size_t>(got);
+    }
+    return true;
+}
+
+static bool recvWsFrame(SOCKET client, uint8_t& opcode, std::string& payload) {
+    uint8_t hdr[2] = {};
+    if (!recvExact(client, hdr, sizeof(hdr)))
+        return false;
+
+    opcode = static_cast<uint8_t>(hdr[0] & 0x0F);
+    const bool masked = (hdr[1] & 0x80) != 0;
+    uint64_t len = hdr[1] & 0x7F;
+    if (len == 126) {
+        uint8_t ext[2] = {};
+        if (!recvExact(client, ext, sizeof(ext)))
+            return false;
+        len = (static_cast<uint64_t>(ext[0]) << 8) | static_cast<uint64_t>(ext[1]);
+    } else if (len == 127) {
+        uint8_t ext[8] = {};
+        if (!recvExact(client, ext, sizeof(ext)))
+            return false;
+        len = 0;
+        for (int i = 0; i < 8; ++i)
+            len = (len << 8) | static_cast<uint64_t>(ext[i]);
+    }
+
+    uint8_t maskKey[4] = {};
+    if (masked && !recvExact(client, maskKey, sizeof(maskKey)))
+        return false;
+
+    payload.assign(static_cast<size_t>(len), '\0');
+    if (len > 0 && !recvExact(client, payload.data(), static_cast<size_t>(len)))
+        return false;
+
+    if (masked) {
+        for (size_t i = 0; i < payload.size(); ++i)
+            payload[i] = static_cast<char>(payload[i] ^ maskKey[i % 4]);
+    }
+    return true;
+}
+
+static std::string objectsQueryStringFromJson(const json& objects) {
+    if (!objects.is_object())
+        return std::string();
+    std::ostringstream ss;
+    bool first = true;
+    for (auto it = objects.begin(); it != objects.end(); ++it) {
+        if (!first)
+            ss << '&';
+        ss << it.key();
+        first = false;
+    }
+    return ss.str();
+}
+
+static json makeJsonRpcResult(const json& id, const json& result) {
+    return json{{"jsonrpc", "2.0"}, {"result", result}, {"id", id}};
+}
+
+static json makeJsonRpcError(const json& id, int code, const std::string& message) {
+    return json{{"jsonrpc", "2.0"}, {"error", {{"code", code}, {"message", message}}}, {"id", id}};
+}
 } // namespace
 
 MoonrakerApiServer::MoonrakerApiServer(MoonrakerApiCallbacks callbacks)
@@ -268,8 +467,185 @@ void MoonrakerApiServer::acceptLoop() {
                 break;
             continue;
         }
-        handleClient(static_cast<uintptr_t>(client));
+        std::thread(&MoonrakerApiServer::handleClient, this,
+                    static_cast<uintptr_t>(client)).detach();
     }
+}
+
+json MoonrakerApiServer::dispatchJsonRpc(const json& message,
+                                         bool& sendStatusNotify,
+                                         json& notifyPayload) {
+    sendStatusNotify = false;
+    notifyPayload = json::array();
+
+    const json id = message.contains("id") ? message["id"] : json(nullptr);
+    const std::string method = message.value("method", "");
+    json params = message.contains("params") ? message["params"] : json::object();
+    if (!params.is_object())
+        params = json::object();
+
+    if (method.empty())
+        return makeJsonRpcError(id, -32600, "Missing method");
+
+    if (method == "server.connection.identify") {
+        return makeJsonRpcResult(id, {
+            {"connection_id", 1},
+            {"state", "ready"},
+            {"moonraker_version", "klipper_host_cpp-dev"}
+        });
+    }
+    if (method == "server.info") {
+        return makeJsonRpcResult(id,
+            m_callbacks.getServerInfo ? m_callbacks.getServerInfo() : json::object());
+    }
+    if (method == "printer.info") {
+        return makeJsonRpcResult(id,
+            m_callbacks.getPrinterInfo ? m_callbacks.getPrinterInfo() : json::object());
+    }
+    if (method == "machine.system_info") {
+        return makeJsonRpcResult(id,
+            m_callbacks.getSystemInfo ? m_callbacks.getSystemInfo() : json::object());
+    }
+    if (method == "printer.objects.list") {
+        return makeJsonRpcResult(id, {
+            {"objects", {"webhooks", "toolhead", "gcode_move", "motion_report",
+                           "print_stats", "extruder", "heater_bed", "virtual_sdcard", "configfile"}}
+        });
+    }
+    if (method == "printer.objects.query") {
+        std::string query = objectsQueryStringFromJson(params.value("objects", json::object()));
+        return makeJsonRpcResult(id,
+            m_callbacks.queryObjects ? m_callbacks.queryObjects(query) : json::object());
+    }
+    if (method == "printer.objects.subscribe") {
+        std::string query = objectsQueryStringFromJson(params.value("objects", json::object()));
+        json result = m_callbacks.queryObjects ? m_callbacks.queryObjects(query) : json::object();
+        if (result.contains("status") && result.contains("eventtime")) {
+            sendStatusNotify = true;
+            notifyPayload = json::array({result["status"], result["eventtime"]});
+        }
+        return makeJsonRpcResult(id, result);
+    }
+    if (method == "printer.gcode.script") {
+        std::string script = params.value("script", "");
+        std::string msg;
+        if (!m_callbacks.executeGcode || !m_callbacks.executeGcode(script, msg))
+            return makeJsonRpcError(id, -32000, msg.empty() ? "G-code execution failed" : msg);
+        return makeJsonRpcResult(id, "ok");
+    }
+    if (method == "access.oneshot_token") {
+        return makeJsonRpcResult(id, "dev-token");
+    }
+    if (method == "server.files.list") {
+        return makeJsonRpcResult(id, json::array());
+    }
+    if (method == "server.files.roots") {
+        return makeJsonRpcResult(id, {
+            {"roots", json::array({{{"name", "gcodes"}, {"path", "gcode"}, {"permissions", "rw"}}})}
+        });
+    }
+    if (method == "server.webcams.list") {
+        return makeJsonRpcResult(id, {{"webcams", json::array()}});
+    }
+    if (method == "server.extensions.list") {
+        return makeJsonRpcResult(id, {{"extensions", json::array()}});
+    }
+    if (method == "machine.device_power.devices") {
+        return makeJsonRpcResult(id, {{"devices", json::array()}});
+    }
+    if (method == "machine.proc_stats") {
+        return makeJsonRpcResult(id, {
+            {"system_cpu_usage", {{"cpu", 0.0}}},
+            {"system_memory", {{"total", 0}, {"used", 0}, {"available", 0}}}
+        });
+    }
+    if (method == "server.database.list") {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        json namespaces = json::array();
+        for (const auto& kv : m_database)
+            namespaces.push_back(kv.first);
+        return makeJsonRpcResult(id, {{"namespaces", namespaces}});
+    }
+    if (method == "server.database.get_item") {
+        std::string ns = params.value("namespace", "fluidd");
+        std::string key = params.value("key", "");
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        json value = json::object();
+        auto it = m_database.find(ns + ":" + key);
+        if (it != m_database.end())
+            value = it->second;
+        return makeJsonRpcResult(id, {{"namespace", ns}, {"key", key}, {"value", value}});
+    }
+    if (method == "server.database.post_item") {
+        std::string ns = params.value("namespace", "fluidd");
+        std::string key = params.value("key", "");
+        json value = params.contains("value") ? params["value"] : json::object();
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            m_database[ns + ":" + key] = value;
+        }
+        return makeJsonRpcResult(id, {{"namespace", ns}, {"key", key}, {"value", value}});
+    }
+
+    return makeJsonRpcError(id, -32601, "Method not found: " + method);
+}
+
+void MoonrakerApiServer::handleWebSocketClient(uintptr_t clientHandle) {
+    SOCKET client = static_cast<SOCKET>(clientHandle);
+
+    sendWsFrame(client, 0x1,
+        json{{"jsonrpc", "2.0"}, {"method", "notify_klippy_ready"}, {"params", json::array()}}.dump());
+
+    while (m_running.load(std::memory_order_acquire)) {
+        uint8_t opcode = 0;
+        std::string payload;
+        if (!recvWsFrame(client, opcode, payload))
+            break;
+
+        if (opcode == 0x8) {
+            sendWsFrame(client, 0x8, "");
+            break;
+        }
+        if (opcode == 0x9) {
+            sendWsFrame(client, 0xA, payload);
+            continue;
+        }
+        if (opcode != 0x1)
+            continue;
+
+        try {
+            json incoming = json::parse(payload);
+            if (incoming.is_array()) {
+                for (const auto& msg : incoming) {
+                    bool sendNotify = false;
+                    json notifyPayload;
+                    json response = dispatchJsonRpc(msg, sendNotify, notifyPayload);
+                    if (msg.contains("id"))
+                        sendWsFrame(client, 0x1, response.dump());
+                    if (sendNotify) {
+                        json notify = {{"jsonrpc", "2.0"}, {"method", "notify_status_update"}, {"params", notifyPayload}};
+                        sendWsFrame(client, 0x1, notify.dump());
+                    }
+                }
+            } else {
+                bool sendNotify = false;
+                json notifyPayload;
+                json response = dispatchJsonRpc(incoming, sendNotify, notifyPayload);
+                if (incoming.contains("id"))
+                    sendWsFrame(client, 0x1, response.dump());
+                if (sendNotify) {
+                    json notify = {{"jsonrpc", "2.0"}, {"method", "notify_status_update"}, {"params", notifyPayload}};
+                    sendWsFrame(client, 0x1, notify.dump());
+                }
+            }
+        } catch (...) {
+            sendWsFrame(client, 0x1,
+                makeJsonRpcError(nullptr, -32700, "Invalid JSON").dump());
+        }
+    }
+
+    shutdown(client, SD_BOTH);
+    closesocket(client);
 }
 
 void MoonrakerApiServer::handleClient(uintptr_t clientHandle) {
@@ -280,9 +656,34 @@ void MoonrakerApiServer::handleClient(uintptr_t clientHandle) {
 
     if (!parseRequest(raw, req)) {
         out = jsonResponse(400, makeError(400, "Malformed HTTP request"));
-        send(client, out.c_str(), static_cast<int>(out.size()), 0);
+        sendAll(client, out.data(), out.size());
         shutdown(client, SD_BOTH);
         closesocket(client);
+        return;
+    }
+
+    auto upgradeIt = req.headers.find("upgrade");
+    if (upgradeIt != req.headers.end() && toLower(upgradeIt->second) == "websocket") {
+        auto keyIt = req.headers.find("sec-websocket-key");
+        if (keyIt == req.headers.end()) {
+            out = jsonResponse(400, makeError(400, "Missing Sec-WebSocket-Key"));
+            sendAll(client, out.data(), out.size());
+            shutdown(client, SD_BOTH);
+            closesocket(client);
+            return;
+        }
+
+        std::ostringstream hs;
+        hs << "HTTP/1.1 101 Switching Protocols\r\n"
+           << "Upgrade: websocket\r\n"
+           << "Connection: Upgrade\r\n"
+           << "Sec-WebSocket-Accept: " << websocketAcceptKey(keyIt->second) << "\r\n\r\n";
+        if (!sendAll(client, hs.str().data(), hs.str().size())) {
+            shutdown(client, SD_BOTH);
+            closesocket(client);
+            return;
+        }
+        handleWebSocketClient(clientHandle);
         return;
     }
 
@@ -302,12 +703,66 @@ void MoonrakerApiServer::handleClient(uintptr_t clientHandle) {
         result = json{{"result", m_callbacks.getPrinterInfo ? m_callbacks.getPrinterInfo() : json::object()}};
     } else if (req.path == "/machine/system_info") {
         result = json{{"result", m_callbacks.getSystemInfo ? m_callbacks.getSystemInfo() : json::object()}};
+    } else if (req.path == "/machine/device_power/devices") {
+        result = json{{"result", {{"devices", json::array()}}}};
+    } else if (req.path == "/machine/proc_stats") {
+        result = json{{"result", {{"system_cpu_usage", {{"cpu", 0.0}}}, {"system_memory", {{"total", 0}, {"used", 0}, {"available", 0}}}}}};
     } else if (req.path == "/printer/objects/list") {
         result = json{{"result", {{"objects", {"webhooks", "toolhead", "gcode_move", "motion_report", "print_stats", "extruder", "heater_bed", "virtual_sdcard", "configfile"}}}}};
     } else if (req.path == "/printer/objects/query") {
-        result = json{{"result", m_callbacks.queryObjects ? m_callbacks.queryObjects(req.query) : json::object()}};
-    } else if (req.path == "/access/oneshot_token") {
+        if (req.body.empty()) {
+            result = json{{"result", m_callbacks.queryObjects ? m_callbacks.queryObjects(req.query) : json::object()}};
+        } else {
+            try {
+                auto j = json::parse(req.body);
+                std::string query = objectsQueryStringFromJson(j.value("objects", json::object()));
+                result = json{{"result", m_callbacks.queryObjects ? m_callbacks.queryObjects(query) : json::object()}};
+            } catch (...) {
+                code = 400;
+                result = makeError(400, "Invalid JSON body");
+            }
+        }
+    } else if (req.path == "/access/oneshot_token" || req.path == "/access/api_key") {
         result = json{{"result", "dev-token"}};
+    } else if (req.path == "/server/files/roots") {
+        result = json{{"result", {{"roots", json::array({{{"name", "gcodes"}, {"path", "gcode"}, {"permissions", "rw"}}})}}}};
+    } else if (req.path == "/server/files/list") {
+        result = json{{"result", json::array()}};
+    } else if (req.path == "/server/webcams/list") {
+        result = json{{"result", {{"webcams", json::array()}}}};
+    } else if (req.path == "/server/extensions/list") {
+        result = json{{"result", {{"extensions", json::array()}}}};
+    } else if (req.path == "/server/database/list") {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        json namespaces = json::array();
+        for (const auto& kv : m_database)
+            namespaces.push_back(kv.first);
+        result = json{{"result", {{"namespaces", namespaces}}}};
+    } else if (req.path == "/server/database/item") {
+        auto query = parseQuery(req.query);
+        std::string ns = query.count("namespace") ? query["namespace"] : "fluidd";
+        std::string key = query.count("key") ? query["key"] : "";
+        if (req.method == "GET") {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            json value = json::object();
+            auto it = m_database.find(ns + ":" + key);
+            if (it != m_database.end())
+                value = it->second;
+            result = json{{"result", {{"namespace", ns}, {"key", key}, {"value", value}}}};
+        } else {
+            try {
+                auto j = req.body.empty() ? json::object() : json::parse(req.body);
+                json value = j.contains("value") ? j["value"] : json::object();
+                {
+                    std::lock_guard<std::mutex> lock(m_stateMutex);
+                    m_database[ns + ":" + key] = value;
+                }
+                result = json{{"result", {{"namespace", ns}, {"key", key}, {"value", value}}}};
+            } catch (...) {
+                code = 400;
+                result = makeError(400, "Invalid JSON body");
+            }
+        }
     } else if (req.path == "/printer/gcode/script") {
         std::string script;
         auto query = parseQuery(req.query);
@@ -345,7 +800,7 @@ void MoonrakerApiServer::handleClient(uintptr_t clientHandle) {
     }
 
     out = jsonResponse(code, result);
-    send(client, out.c_str(), static_cast<int>(out.size()), 0);
+    sendAll(client, out.data(), out.size());
     shutdown(client, SD_BOTH);
     closesocket(client);
 }

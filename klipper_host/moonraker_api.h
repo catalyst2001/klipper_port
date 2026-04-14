@@ -5,6 +5,8 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <map>
 
 #include "nlohmann/json.hpp"
 
@@ -30,10 +32,16 @@ public:
 private:
     void acceptLoop();
     void handleClient(uintptr_t clientHandle);
+    void handleWebSocketClient(uintptr_t clientHandle);
+    nlohmann::json dispatchJsonRpc(const nlohmann::json& message,
+                                   bool& sendStatusNotify,
+                                   nlohmann::json& notifyPayload);
 
     MoonrakerApiCallbacks m_callbacks;
     std::atomic<bool> m_running{false};
     std::thread m_thread;
     uintptr_t m_listenSocket = 0;
     uint16_t m_port = 0;
+    std::mutex m_stateMutex;
+    std::map<std::string, nlohmann::json> m_database;
 };
