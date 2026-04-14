@@ -159,6 +159,25 @@ StepMove sc_compress_bisect_add(const int64_t* stepClocks, int startIdx, int end
              static_cast<int16_t>(bestadd) };
 }
 
+inline double pa_integrate(double base, double start_v, double half_accel,
+                           double start, double end) {
+    double half_v = 0.5 * start_v;
+    double sixth_a = (1.0 / 3.0) * half_accel;
+    double si = start * (base + start * (half_v + start * sixth_a));
+    double ei = end * (base + end * (half_v + end * sixth_a));
+    return ei - si;
+}
+
+inline double pa_integrate_time(double base, double start_v, double half_accel,
+                                double start, double end) {
+    double half_b = 0.5 * base;
+    double third_v = (1.0 / 3.0) * start_v;
+    double eighth_a = 0.25 * half_accel;
+    double si = start * start * (half_b + start * (third_v + start * eighth_a));
+    double ei = end * end * (half_b + end * (third_v + end * eighth_a));
+    return ei - si;
+}
+
 } // anonymous namespace
 
 // ========== ToolHead ==========
@@ -822,6 +841,277 @@ void ToolHead::generateShapedAxisSteps(int axis, const std::vector<TrapMove>& mo
     }
 }
 
+double ToolHead::calcExtruderPaPositionSmooth(const std::vector<TrapMove>& moves,
+                                              size_t moveIdx, double moveTime) const {
+    const auto& cur = moves[moveIdx];
+    const double startBase = cur.extruder_start;
+    const double hst = 0.5 * m_pressureAdvanceSmoothTime;
+
+    auto paMoveIntegrate = [&](size_t idx, double base, double start,
+                               double end, double timeOffset) -> double {
+        const auto& m = moves[idx];
+        if (start < 0.0) start = 0.0;
+        if (end > m.move_t) end = m.move_t;
+        if (end <= start) return 0.0;
+
+        double pa = (m.apply_pressure_advance && m.pressure_advance > 0.0)
+            ? m.pressure_advance : 0.0;
+
+        double b = base + pa * m.start_v;
+        double sv = m.extruder_r * m.start_v + pa * 2.0 * m.half_accel;
+        double ha = m.extruder_r * m.half_accel;
+
+        double iext = pa_integrate(b, sv, ha, start, end);
+        double wgtExt = pa_integrate_time(b, sv, ha, start, end);
+        return wgtExt - timeOffset * iext;
+    };
+
+    if (hst <= 0.0) {
+        double d = cur.start_v * moveTime + cur.half_accel * moveTime * moveTime;
+        double pos = cur.extruder_start + cur.extruder_r * d;
+        if (cur.apply_pressure_advance && cur.pressure_advance > 0.0) {
+            double nominalV = cur.start_v + 2.0 * cur.half_accel * moveTime;
+            pos += cur.pressure_advance * nominalV;
+        }
+        return pos;
+    }
+
+    double start = moveTime - hst;
+    double end = moveTime + hst;
+    double res = 0.0;
+
+    res += paMoveIntegrate(moveIdx, 0.0, start, moveTime, start);
+    res -= paMoveIntegrate(moveIdx, 0.0, moveTime, end, end);
+
+    size_t prev = moveIdx;
+    while (start < 0.0 && prev > 0) {
+        prev--;
+        start += moves[prev].move_t;
+        double base = moves[prev].extruder_start - startBase;
+        res += paMoveIntegrate(prev, base, start, moves[prev].move_t, start);
+    }
+
+    size_t curIdx = moveIdx;
+    while (end > moves[curIdx].move_t && curIdx + 1 < moves.size()) {
+        end -= moves[curIdx].move_t;
+        curIdx++;
+        double base = moves[curIdx].extruder_start - startBase;
+        res -= paMoveIntegrate(curIdx, base, 0.0, end, end);
+    }
+
+    return startBase + res / (hst * hst);
+}
+
+double ToolHead::calcExtruderPaPositionAtTime(const std::vector<TrapMove>& moves,
+                                              double printTime) const {
+    if (moves.empty())
+        return m_ePos;
+
+    size_t moveIdx = 0;
+    double moveTime = 0.0;
+
+    if (printTime <= moves.front().print_time) {
+        moveIdx = 0;
+        moveTime = 0.0;
+    } else {
+        moveIdx = moves.size() - 1;
+        const auto& last = moves.back();
+        if (printTime >= last.print_time + last.move_t) {
+            moveTime = last.move_t;
+        } else {
+            for (int i = static_cast<int>(moves.size()) - 1; i >= 0; --i) {
+                if (printTime >= moves[i].print_time) {
+                    moveIdx = static_cast<size_t>(i);
+                    moveTime = printTime - moves[moveIdx].print_time;
+                    break;
+                }
+            }
+        }
+    }
+
+    return calcExtruderPaPositionSmooth(moves, moveIdx, moveTime);
+}
+
+void ToolHead::generatePressureAdvanceExtruderSteps(const std::vector<TrapMove>& moves,
+                                                    const ClockSync::ClockSnapshot& snap) {
+    MCU_stepper* stepper = m_steppers[3];
+    if (!stepper || moves.empty())
+        return;
+
+    double stepDist = stepper->getStepDist();
+    if (stepDist <= 0.0)
+        return;
+
+    double halfStep = 0.5 * stepDist;
+    double moveStart = moves.front().print_time;
+    double moveEnd = moves.back().print_time + moves.back().move_t;
+
+    auto paPos = [&](double pt) -> double {
+        return calcExtruderPaPositionAtTime(moves, pt);
+    };
+
+    double commandedPos = paPos(moveStart);
+    double endPos = paPos(moveEnd);
+    if (std::abs(endPos - commandedPos) < halfStep * 0.5)
+        return;
+
+    static constexpr double SEEK_TIME_RESET = 0.000100;
+    bool sdir = (endPos > commandedPos);
+    double target = commandedPos + (sdir ? halfStep : -halfStep);
+
+    struct TimePos { double time, pos; };
+    TimePos oldGuess = {moveStart, commandedPos};
+    TimePos guess = oldGuess;
+
+    bool haveBracket = false, isDirChange = false, checkOscillate = false;
+    double lastTime = moveStart;
+    double lowTime = moveStart;
+    double highTime = (std::min)(moveStart + SEEK_TIME_RESET, moveEnd);
+
+    struct StepEvent {
+        int64_t clock;
+        bool forward;
+    };
+    std::vector<StepEvent> stepEvents;
+
+    for (;;) {
+        double guessDist = guess.pos - target;
+        double ogDist = oldGuess.pos - target;
+
+        double nextTime;
+        double denom = guessDist - ogDist;
+        if (std::abs(denom) > 1e-20)
+            nextTime = (oldGuess.time * guessDist - guess.time * ogDist) / denom;
+        else
+            nextTime = highTime;
+
+        if (!(nextTime > lowTime && nextTime < highTime)) {
+            if (haveBracket) {
+                nextTime = (lowTime + highTime) * 0.5;
+                checkOscillate = false;
+            } else if (guess.time >= moveEnd) {
+                break;
+            } else {
+                nextTime = highTime;
+                highTime = 2.0 * highTime - lastTime;
+                if (highTime > moveEnd) highTime = moveEnd;
+            }
+        }
+
+        oldGuess = guess;
+        guess.time = nextTime;
+        guess.pos = paPos(nextTime);
+        guessDist = guess.pos - target;
+
+        if (std::abs(guessDist) > 1e-9) {
+            double relDist = sdir ? guessDist : -guessDist;
+            if (relDist > 0.0) {
+                if (haveBracket && oldGuess.time <= lowTime) {
+                    if (checkOscillate)
+                        oldGuess = guess;
+                    checkOscillate = true;
+                }
+                highTime = guess.time;
+                haveBracket = true;
+            } else if (relDist < -(halfStep + halfStep + 1e-8)) {
+                sdir = !sdir;
+                target = sdir ? target + halfStep + halfStep
+                              : target - halfStep - halfStep;
+                lowTime = lastTime;
+                highTime = guess.time;
+                isDirChange = haveBracket = true;
+                checkOscillate = false;
+            } else {
+                lowTime = guess.time;
+            }
+
+            if (!haveBracket || highTime - lowTime > 1e-9)
+                continue;
+        }
+
+        int64_t stepClock = snap.printTimeToRealClock(guess.time);
+        stepEvents.push_back({stepClock, sdir});
+
+        target = sdir ? target + halfStep + halfStep
+                      : target - halfStep - halfStep;
+
+        double seekDelta = 1.5 * (guess.time - lastTime);
+        if (seekDelta < 1e-9) seekDelta = 1e-9;
+        if (isDirChange && seekDelta > SEEK_TIME_RESET)
+            seekDelta = SEEK_TIME_RESET;
+        lastTime = lowTime = guess.time;
+        highTime = guess.time + seekDelta;
+        if (highTime > moveEnd) highTime = moveEnd;
+        isDirChange = haveBracket = checkOscillate = false;
+    }
+
+    if (stepEvents.empty())
+        return;
+
+    int64_t tmStartClock = snap.printTimeToRealClock(moveStart);
+    if (!stepper->isClockInitialized()) {
+        stepper->resetStepClockTimed(tmStartClock, 0, static_cast<uint64_t>(tmStartClock));
+    }
+
+    uint32_t maxError = static_cast<uint32_t>(0.000025 * snap.estFreq);
+    static constexpr uint32_t CLOCK_DIFF_MAX = 3U << 28;
+
+    size_t batchStart = 0;
+    while (batchStart < stepEvents.size()) {
+        bool batchDir = stepEvents[batchStart].forward;
+        size_t batchEnd = batchStart + 1;
+        while (batchEnd < stepEvents.size() && stepEvents[batchEnd].forward == batchDir)
+            batchEnd++;
+
+        int64_t lastStepClock = stepper->getLastStepClock();
+        uint64_t dirReqClock = static_cast<uint64_t>(lastStepClock);
+        stepper->setNextStepDirTimed(batchDir, 0, dirReqClock);
+
+        int numSteps = static_cast<int>(batchEnd - batchStart);
+        std::vector<int64_t> batchClocks(numSteps);
+        for (int i = 0; i < numSteps; i++)
+            batchClocks[i] = stepEvents[batchStart + i].clock;
+
+        int pos = 0;
+        while (pos < numSteps) {
+            int64_t clockDiff = batchClocks[pos] - lastStepClock;
+            if (clockDiff <= 0) {
+                pos++;
+                continue;
+            }
+            if (static_cast<uint64_t>(clockDiff) >= CLOCK_DIFF_MAX) {
+                stepper->resetStepClockTimed(batchClocks[pos],
+                    0, static_cast<uint64_t>(batchClocks[pos]));
+                lastStepClock = batchClocks[pos];
+                continue;
+            }
+
+            StepMove move = sc_compress_bisect_add(batchClocks.data(), pos, numSteps,
+                                                   lastStepClock, maxError);
+            int64_t totalTicks = static_cast<int64_t>(move.interval) * move.count
+                + static_cast<int64_t>(move.add)
+                  * ((static_cast<int64_t>(move.count) * (move.count - 1)) / 2);
+
+            uint64_t minCk = 0;
+            uint64_t releaseCk = static_cast<uint64_t>(lastStepClock);
+            uint64_t reqCk = releaseCk;
+            if (move.count == 1
+                && static_cast<uint64_t>(batchClocks[pos]) >= releaseCk + CLOCK_DIFF_MAX) {
+                reqCk = static_cast<uint64_t>(batchClocks[pos]);
+            }
+            minCk = m_mcu.stepSyncAdjustMinClock(minCk, releaseCk);
+            stepper->queueStepTimed(move.interval, move.count, move.add,
+                                    minCk, reqCk);
+
+            lastStepClock += totalTicks;
+            pos += move.count;
+        }
+
+        stepper->setLastStepClock(lastStepClock);
+        batchStart = batchEnd;
+    }
+}
+
 void ToolHead::pauseStepGen() {
     m_stepGenPaused.store(true, std::memory_order_release);
     // Wait for any in-progress generateSteps() to finish
@@ -894,6 +1184,7 @@ bool ToolHead::advanceFlushTime(double wantFlushTime, double wantStepGenTime) {
     bool shaped[4] = {false, false, false, false};
     for (int axis = 0; axis < 3; ++axis)
         shaped[axis] = m_inputShaper.isAxisShaped(axis);
+    shaped[3] = m_steppers[3] && m_pressureAdvance > 0.0;
 
     // For shaped axes: use iterative solver with one stable clock snapshot.
     auto snap = m_mcu.getClockSync().getClockSnapshot();
@@ -901,6 +1192,9 @@ bool ToolHead::advanceFlushTime(double wantFlushTime, double wantStepGenTime) {
         if (shaped[axis] && m_steppers[axis]) {
             generateShapedAxisSteps(axis, trapMoves, snap);
         }
+    }
+    if (shaped[3]) {
+        generatePressureAdvanceExtruderSteps(trapMoves, snap);
     }
 
     // ---- Phase 1: collect all steps for each axis (fast, no I/O) ----

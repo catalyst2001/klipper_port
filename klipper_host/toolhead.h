@@ -205,6 +205,16 @@ private:
     void generateShapedAxisSteps(int axis, const std::vector<TrapMove>& moves,
                                   const ClockSync::ClockSnapshot& snap);
 
+    // Generate extruder steps with pressure-advance smoothing semantics.
+    void generatePressureAdvanceExtruderSteps(const std::vector<TrapMove>& moves,
+                                              const ClockSync::ClockSnapshot& snap);
+
+    // Pressure-advance position helpers (mirroring kin_extruder integration model).
+    double calcExtruderPaPositionAtTime(const std::vector<TrapMove>& moves,
+                                        double printTime) const;
+    double calcExtruderPaPositionSmooth(const std::vector<TrapMove>& moves,
+                                        size_t moveIdx, double moveTime) const;
+
     // Helper: get axis position at any absolute print time across TrapMoves
     static double getAxisPositionAtTime(int axis, const std::vector<TrapMove>& moves,
                                         double printTime);
