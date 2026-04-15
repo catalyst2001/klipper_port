@@ -647,6 +647,10 @@ json MoonrakerApiServer::dispatchJsonRpc(const json& message,
         return makeJsonRpcResult(id,
             m_callbacks.getServerInfo ? m_callbacks.getServerInfo() : json::object());
     }
+    if (method == "server.config") {
+        return makeJsonRpcResult(id,
+            m_callbacks.getServerConfig ? m_callbacks.getServerConfig() : json::object());
+    }
     if (method == "printer.info") {
         return makeJsonRpcResult(id,
             m_callbacks.getPrinterInfo ? m_callbacks.getPrinterInfo() : json::object());
@@ -708,23 +712,50 @@ json MoonrakerApiServer::dispatchJsonRpc(const json& message,
             return makeJsonRpcError(id, -32000, msg.empty() ? "Unable to cancel print" : msg);
         return makeJsonRpcResult(id, "ok");
     }
+    if (method == "access.info") {
+        return makeJsonRpcResult(id,
+            m_callbacks.getAccessInfo ? m_callbacks.getAccessInfo()
+                                      : json{{"default_source", "moonraker"}, {"available_sources", json::array({"moonraker"})}, {"login_required", false}, {"trusted", true}});
+    }
+    if (method == "access.get_user") {
+        return makeJsonRpcResult(id,
+            m_callbacks.getCurrentUser ? m_callbacks.getCurrentUser()
+                                       : json{{"username", nullptr}, {"source", nullptr}, {"created_on", nullptr}});
+    }
+    if (method == "access.users.list") {
+        return makeJsonRpcResult(id,
+            m_callbacks.listUsers ? m_callbacks.listUsers() : json{{"users", json::array()}});
+    }
+    if (method == "access.get_api_key") {
+        return makeJsonRpcResult(id,
+            m_callbacks.getApiKey ? json(m_callbacks.getApiKey()) : json("dev-token"));
+    }
     if (method == "access.oneshot_token") {
         return makeJsonRpcResult(id, "dev-token");
     }
     if (method == "server.files.list") {
-        return makeJsonRpcResult(id, m_callbacks.listFiles ? m_callbacks.listFiles() : json::array());
+        std::string root = params.value("root", "gcodes");
+        return makeJsonRpcResult(id, m_callbacks.listFiles ? m_callbacks.listFiles(root) : json::array());
     }
     if (method == "server.files.metadata") {
         std::string filename = params.value("filename", "");
         return makeJsonRpcResult(id, m_callbacks.getFileMetadata ? m_callbacks.getFileMetadata(filename) : json::object());
     }
     if (method == "server.files.roots") {
-        return makeJsonRpcResult(id, {
-            {"roots", json::array({{{"name", "gcodes"}, {"path", "gcode"}, {"permissions", "rw"}}})}
-        });
+        return makeJsonRpcResult(id,
+            m_callbacks.listFileRoots ? json{{"roots", m_callbacks.listFileRoots()}}
+                                      : json{{"roots", json::array({{{"name", "gcodes"}, {"path", "gcode"}, {"permissions", "rw"}}})}});
+    }
+    if (method == "server.gcode_store") {
+        return makeJsonRpcResult(id,
+            m_callbacks.getGcodeStore ? m_callbacks.getGcodeStore() : json{{"gcode_store", json::array()}});
     }
     if (method == "server.webcams.list") {
         return makeJsonRpcResult(id, {{"webcams", json::array()}});
+    }
+    if (method == "server.announcements.list") {
+        return makeJsonRpcResult(id,
+            m_callbacks.getAnnouncements ? m_callbacks.getAnnouncements() : json{{"entries", json::array()}, {"feeds", json::array()}});
     }
     if (method == "server.history.list") {
         return makeJsonRpcResult(id,
@@ -920,13 +951,19 @@ void MoonrakerApiServer::handleClient(const std::shared_ptr<ClientSession>& sess
     } else if (req.path == "/server/info") {
         result = json{{"result", m_callbacks.getServerInfo ? m_callbacks.getServerInfo() : json::object()}};
     } else if (req.path == "/server/config") {
-        result = json{{"result", {{"host", "0.0.0.0"}, {"port", m_port}}}};
+        result = json{{"result", m_callbacks.getServerConfig ? m_callbacks.getServerConfig() : json::object()}};
     } else if (req.path == "/server/version") {
         result = json{{"result", {{"moonraker_version", "cpp-host-dev"}, {"api_version", {1, 0, 0}}}}};
     } else if (req.path == "/printer/info") {
         result = json{{"result", m_callbacks.getPrinterInfo ? m_callbacks.getPrinterInfo() : json::object()}};
     } else if (req.path == "/machine/system_info") {
         result = json{{"result", m_callbacks.getSystemInfo ? m_callbacks.getSystemInfo() : json::object()}};
+    } else if (req.path == "/access/info") {
+        result = json{{"result", m_callbacks.getAccessInfo ? m_callbacks.getAccessInfo() : json{{"default_source", "moonraker"}, {"available_sources", json::array({"moonraker"})}, {"login_required", false}, {"trusted", true}}}};
+    } else if (req.path == "/access/user") {
+        result = json{{"result", m_callbacks.getCurrentUser ? m_callbacks.getCurrentUser() : json{{"username", nullptr}, {"source", nullptr}, {"created_on", nullptr}}}};
+    } else if (req.path == "/access/users/list") {
+        result = json{{"result", m_callbacks.listUsers ? m_callbacks.listUsers() : json{{"users", json::array()}}}};
     } else if (req.path == "/machine/device_power/devices") {
         result = json{{"result", {{"devices", json::array()}}}};
     } else if (req.path == "/machine/proc_stats") {
@@ -947,11 +984,17 @@ void MoonrakerApiServer::handleClient(const std::shared_ptr<ClientSession>& sess
             }
         }
     } else if (req.path == "/access/oneshot_token" || req.path == "/access/api_key") {
-        result = json{{"result", "dev-token"}};
+        result = json{{"result", m_callbacks.getApiKey ? json(m_callbacks.getApiKey()) : json("dev-token")}};
     } else if (req.path == "/server/files/roots") {
-        result = json{{"result", {{"roots", json::array({{{"name", "gcodes"}, {"path", "gcode"}, {"permissions", "rw"}}})}}}};
+        result = json{{"result", {{"roots", m_callbacks.listFileRoots ? m_callbacks.listFileRoots() : json::array({{{"name", "gcodes"}, {"path", "gcode"}, {"permissions", "rw"}}})}}}};
     } else if (req.path == "/server/files/list") {
-        result = json{{"result", m_callbacks.listFiles ? m_callbacks.listFiles() : json::array()}};
+        auto query = parseQuery(req.query);
+        std::string root = query.count("root") ? query["root"] : "gcodes";
+        result = json{{"result", m_callbacks.listFiles ? m_callbacks.listFiles(root) : json::array()}};
+    } else if (req.path == "/server/gcode_store") {
+        result = json{{"result", m_callbacks.getGcodeStore ? m_callbacks.getGcodeStore() : json{{"gcode_store", json::array()}}}};
+    } else if (req.path == "/server/announcements/list") {
+        result = json{{"result", m_callbacks.getAnnouncements ? m_callbacks.getAnnouncements() : json{{"entries", json::array()}, {"feeds", json::array()}}}};
     } else if (req.path == "/server/files/metadata") {
         auto query = parseQuery(req.query);
         std::string filename = query.count("filename") ? query["filename"] : "";

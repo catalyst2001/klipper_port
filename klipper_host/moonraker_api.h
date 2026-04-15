@@ -14,14 +14,22 @@
 
 struct MoonrakerApiCallbacks {
     std::function<nlohmann::json()> getServerInfo;
+    std::function<nlohmann::json()> getServerConfig;
     std::function<nlohmann::json()> getPrinterInfo;
     std::function<nlohmann::json()> getSystemInfo;
     std::function<nlohmann::json(const std::string& query)> queryObjects;
-    std::function<nlohmann::json()> listFiles;
+    std::function<nlohmann::json(const std::string& root)> listFiles;
+    std::function<nlohmann::json()> listFileRoots;
     std::function<nlohmann::json(const std::string& filename)> getFileMetadata;
     std::function<nlohmann::json()> getHistoryList;
     std::function<nlohmann::json()> getHistoryTotals;
     std::function<nlohmann::json()> getJobQueueStatus;
+    std::function<nlohmann::json()> getGcodeStore;
+    std::function<nlohmann::json()> getAnnouncements;
+    std::function<nlohmann::json()> getAccessInfo;
+    std::function<nlohmann::json()> getCurrentUser;
+    std::function<nlohmann::json()> listUsers;
+    std::function<std::string()> getApiKey;
     std::function<bool(const std::string& script, std::string& message)> executeGcode;
     std::function<bool(const std::string& filename, std::string& message)> startPrint;
     std::function<bool(std::string& message)> pausePrint;

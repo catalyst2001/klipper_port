@@ -892,6 +892,22 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         return fs::path("gcode");
     };
 
+    auto configRoot = []() -> fs::path {
+        return fs::path("configs");
+    };
+
+    auto logsRoot = []() -> fs::path {
+        return fs::path("logs");
+    };
+
+    auto resolveRootPath = [&](const std::string& root) -> fs::path {
+        if (root == "config")
+            return configRoot();
+        if (root == "logs")
+            return logsRoot();
+        return gcodeRoot();
+    };
+
     auto unixNow = []() -> double {
         using namespace std::chrono;
         return duration<double>(system_clock::now().time_since_epoch()).count();
@@ -1009,14 +1025,68 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         return {
             {"klippy_connected", connected},
             {"klippy_state", connected ? "ready" : (ctx.mcu.isShutdown() ? "shutdown" : "disconnected")},
-            {"components", {"application", "klippy_connection", "machine", "file_manager", "job_queue", "history"}},
+            {"components", {"application", "klippy_connection", "machine", "file_manager", "job_queue", "history", "authorization", "database", "announcements", "webcam"}},
             {"failed_components", json::array()},
-            {"registered_directories", {"gcodes"}},
+            {"registered_directories", {"config", "gcodes", "logs"}},
             {"warnings", json::array()},
             {"websocket_count", 0},
             {"moonraker_version", "klipper_host_cpp-dev"},
             {"api_version", {1, 0, 0}},
             {"api_version_string", "1.0.0"}
+        };
+    };
+
+    callbacks.getServerConfig = [&]() -> json {
+        return {
+            {"config", {
+                {"server", {
+                    {"host", "0.0.0.0"},
+                    {"port", httpPort},
+                    {"ssl_port", 7130},
+                    {"enable_debug_logging", false},
+                    {"enable_asyncio_debug", false},
+                    {"klippy_uds_address", nullptr},
+                    {"max_upload_size", 210},
+                    {"ssl_certificate_path", nullptr},
+                    {"ssl_key_path", nullptr}
+                }},
+                {"file_manager", {
+                    {"config_path", configRoot().generic_string()},
+                    {"log_path", logsRoot().generic_string()},
+                    {"enable_object_processing", false},
+                    {"queue_gcode_uploads", true}
+                }},
+                {"data_store", {
+                    {"temperature_store_size", 600},
+                    {"gcode_store_size", 1000}
+                }},
+                {"authorization", {
+                    {"force_logins", false},
+                    {"cors_domains", json::array({"*://localhost", "*://app.fluidd.xyz"})},
+                    {"trusted_clients", json::array({"127.0.0.0/8", "192.168.0.0/16"})}
+                }},
+                {"history", json::object()},
+                {"job_queue", {
+                    {"load_on_startup", true},
+                    {"automatic_transition", false},
+                    {"job_transition_delay", 2},
+                    {"job_transition_gcode", ""}
+                }},
+                {"announcements", {{"subscriptions", json::array({"fluidd"})}}},
+                {"octoprint_compat", json::object()},
+                {"template", json::object()}
+            }},
+            {"orig", {
+                {"server", {{"host", "0.0.0.0"}, {"port", std::to_string(httpPort)}}},
+                {"file_manager", {{"config_path", configRoot().generic_string()}, {"log_path", logsRoot().generic_string()}}},
+                {"authorization", {{"force_logins", "False"}}},
+                {"history", json::object()},
+                {"job_queue", json::object()},
+                {"announcements", {{"subscriptions", "fluidd"}}}
+            }},
+            {"files", json::array({
+                {{"filename", "moonraker.conf"}, {"sections", json::array({"server", "file_manager", "data_store", "authorization", "history", "job_queue", "announcements", "octoprint_compat"})}}
+            })}
         };
     };
 
@@ -1033,11 +1103,74 @@ static int runApiServer(TestContext& ctx, int httpPort) {
     callbacks.getSystemInfo = [&]() -> json {
         return {
             {"system_info", {
+                {"provider", "klipper_host_cpp"},
                 {"platform", "windows"},
                 {"hostname", getHostName()},
-                {"cpu_info", {{"cpu_count", std::thread::hardware_concurrency()}}}
+                {"cpu_info", {
+                    {"cpu_count", std::thread::hardware_concurrency()},
+                    {"bits", "64"},
+                    {"processor", "generic"},
+                    {"cpu_desc", "Host CPU"},
+                    {"serial_number", "unknown"},
+                    {"hardware_desc", "windows-pc"},
+                    {"model", "Generic"},
+                    {"total_memory", 0},
+                    {"memory_units", "kB"}
+                }},
+                {"sd_info", {
+                    {"manufacturer_id", "unknown"},
+                    {"manufacturer", "unknown"},
+                    {"oem_id", "unknown"},
+                    {"product_name", "hostfs"},
+                    {"product_revision", "1.0"},
+                    {"serial_number", "unknown"},
+                    {"manufacturer_date", "unknown"},
+                    {"capacity", "unknown"},
+                    {"total_bytes", 0}
+                }},
+                {"distribution", {
+                    {"name", "Windows"},
+                    {"id", "windows"},
+                    {"like", json::array()},
+                    {"version", "unknown"},
+                    {"version_parts", {{"major", 0}, {"minor", 0}, {"build_number", 0}}},
+                    {"codename", ""},
+                    {"release_info", {{"description", "Windows"}, {"release_id", "windows"}, {"version_id", "unknown"}, {"codename", ""}}}
+                }},
+                {"available_services", json::array({"klipper_host"})},
+                {"instance_ids", {{"moonraker", getHostName()}, {"klipper", "klipper_host_cpp"}}},
+                {"service_state", {{"klipper_host", {{"active_state", "active"}, {"sub_state", "running"}}}}},
+                {"python", {{"version_string", "n/a"}, {"version", json::array({0,0,0})}}},
+                {"network", json::object()},
+                {"canbus", json::object()},
+                {"virtualization", {{"virt_type", "none"}, {"virt_identifier", "host"}}}
             }}
         };
+    };
+
+    callbacks.getAccessInfo = [&]() -> json {
+        return {
+            {"default_source", "moonraker"},
+            {"available_sources", json::array({"moonraker"})},
+            {"login_required", false},
+            {"trusted", true}
+        };
+    };
+
+    callbacks.getCurrentUser = [&]() -> json {
+        return {
+            {"username", nullptr},
+            {"source", nullptr},
+            {"created_on", nullptr}
+        };
+    };
+
+    callbacks.listUsers = [&]() -> json {
+        return {{"users", json::array()}};
+    };
+
+    callbacks.getApiKey = [&]() -> std::string {
+        return "dev-token";
     };
 
     callbacks.queryObjects = [&](const std::string& query) -> json {
@@ -1141,22 +1274,22 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         };
     };
 
-    callbacks.listFiles = [&]() -> json {
+    callbacks.listFiles = [&](const std::string& root) -> json {
         json files = json::array();
-        fs::path root = gcodeRoot();
-        if (!fs::exists(root))
+        fs::path base = resolveRootPath(root);
+        if (!fs::exists(base))
             return files;
 
-        for (const auto& entry : fs::recursive_directory_iterator(root)) {
+        for (const auto& entry : fs::recursive_directory_iterator(base)) {
             if (!entry.is_regular_file())
                 continue;
-            std::string rel = fs::relative(entry.path(), root).generic_string();
+            std::string rel = fs::relative(entry.path(), base).generic_string();
             double modified = 0.0;
             try {
                 modified = fileTimeToUnixSeconds(entry.last_write_time());
             } catch (...) {
             }
-            std::string dirname = fs::relative(entry.path().parent_path(), root).generic_string();
+            std::string dirname = fs::relative(entry.path().parent_path(), base).generic_string();
             if (dirname == ".")
                 dirname.clear();
             files.push_back({
@@ -1169,6 +1302,14 @@ static int runApiServer(TestContext& ctx, int httpPort) {
             });
         }
         return files;
+    };
+
+    callbacks.listFileRoots = [&]() -> json {
+        return json::array({
+            {{"name", "config"}, {"path", configRoot().generic_string()}, {"permissions", "rw"}},
+            {{"name", "logs"}, {"path", logsRoot().generic_string()}, {"permissions", "rw"}},
+            {{"name", "gcodes"}, {"path", gcodeRoot().generic_string()}, {"permissions", "rw"}}
+        });
     };
 
     callbacks.getFileMetadata = [&](const std::string& filename) -> json {
@@ -1188,6 +1329,17 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         return {
             {"job_totals", history.totals},
             {"auxiliary_totals", json::array()}
+        };
+    };
+
+    callbacks.getGcodeStore = [&]() -> json {
+        return {{"gcode_store", json::array()}};
+    };
+
+    callbacks.getAnnouncements = [&]() -> json {
+        return {
+            {"entries", json::array()},
+            {"feeds", json::array()}
         };
     };
 
