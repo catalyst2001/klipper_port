@@ -15,7 +15,13 @@ struct MoonrakerApiCallbacks {
     std::function<nlohmann::json()> getPrinterInfo;
     std::function<nlohmann::json()> getSystemInfo;
     std::function<nlohmann::json(const std::string& query)> queryObjects;
+    std::function<nlohmann::json()> listFiles;
+    std::function<nlohmann::json(const std::string& filename)> getFileMetadata;
     std::function<bool(const std::string& script, std::string& message)> executeGcode;
+    std::function<bool(const std::string& filename, std::string& message)> startPrint;
+    std::function<bool(std::string& message)> pausePrint;
+    std::function<bool(std::string& message)> resumePrint;
+    std::function<bool(std::string& message)> cancelPrint;
 };
 
 class MoonrakerApiServer {

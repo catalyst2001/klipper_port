@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <csignal>
 #include <map>
+#include <filesystem>
+#include <cstdlib>
 
 #include "klipper_mcu.h"
 #include "klipper_config.h"
@@ -761,6 +763,30 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         return objects;
     };
 
+    namespace fs = std::filesystem;
+
+    struct PrintJobState {
+        std::mutex mutex;
+        std::thread worker;
+        std::atomic<bool> active{false};
+        std::atomic<bool> pauseRequested{false};
+        std::atomic<bool> cancelRequested{false};
+        std::string state = "standby";
+        std::string filename;
+        std::string message;
+        size_t filePosition = 0;
+        size_t fileSize = 0;
+        double progress = 0.0;
+        double printDuration = 0.0;
+        double totalDuration = 0.0;
+        std::chrono::steady_clock::time_point startedAt{};
+    } printJob;
+
+    auto joinFinishedWorker = [&]() {
+        if (printJob.worker.joinable() && !printJob.active.load(std::memory_order_acquire))
+            printJob.worker.join();
+    };
+
     auto getHostName = []() -> std::string {
         char* buf = nullptr;
         size_t len = 0;
@@ -770,6 +796,18 @@ static int runApiServer(TestContext& ctx, int httpPort) {
             free(buf);
         }
         return host;
+    };
+
+    auto normalizeFilename = [](std::string filename) {
+        std::replace(filename.begin(), filename.end(), '\\', '/');
+        const std::string prefix = "gcode/";
+        if (filename.rfind(prefix, 0) == 0)
+            filename = filename.substr(prefix.size());
+        return filename;
+    };
+
+    auto gcodeRoot = []() -> fs::path {
+        return fs::path("gcode");
     };
 
     MoonrakerApiCallbacks callbacks;
@@ -854,13 +892,14 @@ static int runApiServer(TestContext& ctx, int httpPort) {
             };
         }
         if (hasObj("print_stats")) {
+            std::lock_guard<std::mutex> lock(printJob.mutex);
             status["print_stats"] = {
-                {"state", "standby"},
-                {"filename", ""},
-                {"message", ""},
+                {"state", printJob.state},
+                {"filename", printJob.filename},
+                {"message", printJob.message},
                 {"info", {{"total_layer", nullptr}, {"current_layer", nullptr}}},
-                {"print_duration", 0.0},
-                {"total_duration", 0.0}
+                {"print_duration", printJob.printDuration},
+                {"total_duration", printJob.totalDuration}
             };
         }
         if (hasObj("extruder")) {
@@ -881,11 +920,12 @@ static int runApiServer(TestContext& ctx, int httpPort) {
             };
         }
         if (hasObj("virtual_sdcard")) {
+            std::lock_guard<std::mutex> lock(printJob.mutex);
             status["virtual_sdcard"] = {
-                {"is_active", false},
-                {"progress", 0.0},
-                {"file_position", 0},
-                {"file_size", 0}
+                {"is_active", printJob.active.load(std::memory_order_acquire)},
+                {"progress", printJob.progress},
+                {"file_position", static_cast<int64_t>(printJob.filePosition)},
+                {"file_size", static_cast<int64_t>(printJob.fileSize)}
             };
         }
         if (hasObj("configfile")) {
@@ -907,6 +947,49 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         };
     };
 
+    callbacks.listFiles = [&]() -> json {
+        json files = json::array();
+        fs::path root = gcodeRoot();
+        if (!fs::exists(root))
+            return files;
+
+        for (const auto& entry : fs::recursive_directory_iterator(root)) {
+            if (!entry.is_regular_file())
+                continue;
+            std::string rel = fs::relative(entry.path(), root).generic_string();
+            files.push_back({
+                {"path", rel},
+                {"filename", rel},
+                {"dirname", entry.path().parent_path().filename().string()},
+                {"modified", 0},
+                {"size", static_cast<int64_t>(entry.file_size())},
+                {"permissions", "rw"}
+            });
+        }
+        return files;
+    };
+
+    callbacks.getFileMetadata = [&](const std::string& filename) -> json {
+        std::string rel = normalizeFilename(filename);
+        fs::path path = gcodeRoot() / fs::path(rel);
+        json meta = {
+            {"filename", rel},
+            {"size", 0},
+            {"modified", 0},
+            {"uuid", rel},
+            {"slicer", "unknown"},
+            {"object_height", nullptr},
+            {"layer_height", nullptr},
+            {"first_layer_height", nullptr},
+            {"filament_total", nullptr},
+            {"estimated_time", nullptr}
+        };
+        if (fs::exists(path) && fs::is_regular_file(path)) {
+            meta["size"] = static_cast<int64_t>(fs::file_size(path));
+        }
+        return meta;
+    };
+
     callbacks.executeGcode = [&](const std::string& script, std::string& message) -> bool {
         if (script.empty()) {
             message = "Empty script";
@@ -919,6 +1002,179 @@ static int runApiServer(TestContext& ctx, int httpPort) {
             if (message.empty())
                 message = "No commands executed";
             return false;
+        }
+        message = "ok";
+        return true;
+    };
+
+    callbacks.startPrint = [&](const std::string& filename, std::string& message) -> bool {
+        joinFinishedWorker();
+        if (printJob.active.load(std::memory_order_acquire)) {
+            message = "A print is already running";
+            return false;
+        }
+
+        std::string rel = normalizeFilename(filename);
+        fs::path path = gcodeRoot() / fs::path(rel);
+        if (!fs::exists(path) || !fs::is_regular_file(path)) {
+            message = "File not found: " + rel;
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(printJob.mutex);
+            printJob.active.store(true, std::memory_order_release);
+            printJob.pauseRequested.store(false, std::memory_order_release);
+            printJob.cancelRequested.store(false, std::memory_order_release);
+            printJob.state = "printing";
+            printJob.filename = rel;
+            printJob.message.clear();
+            printJob.filePosition = 0;
+            printJob.fileSize = static_cast<size_t>(fs::file_size(path));
+            printJob.progress = 0.0;
+            printJob.printDuration = 0.0;
+            printJob.totalDuration = 0.0;
+            printJob.startedAt = std::chrono::steady_clock::now();
+        }
+
+        printJob.worker = std::thread([&, path, rel]() {
+            std::ifstream file(path);
+            if (!file.is_open()) {
+                std::lock_guard<std::mutex> lock(printJob.mutex);
+                printJob.state = "error";
+                printJob.message = "Cannot open file";
+                printJob.active.store(false, std::memory_order_release);
+                return;
+            }
+
+            ctx.toolhead->resetSyncState();
+            double initialTime = ctx.mcu.getClockSync().estimatedPrintTime() + BUFFER_TIME_START;
+            ctx.toolhead->setNextPrintTime(initialTime);
+
+            std::string line;
+            size_t linesSinceFlush = 0;
+            size_t lineCount = 0;
+            size_t errors = 0;
+
+            while (std::getline(file, line)) {
+                if (printJob.cancelRequested.load(std::memory_order_acquire))
+                    break;
+                while (printJob.pauseRequested.load(std::memory_order_acquire)
+                    && !printJob.cancelRequested.load(std::memory_order_acquire)) {
+                    {
+                        std::lock_guard<std::mutex> lock(printJob.mutex);
+                        printJob.state = "paused";
+                        auto elapsed = std::chrono::steady_clock::now() - printJob.startedAt;
+                        printJob.printDuration = std::chrono::duration<double>(elapsed).count();
+                        printJob.totalDuration = printJob.printDuration;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+
+                if (printJob.cancelRequested.load(std::memory_order_acquire))
+                    break;
+
+                bool ok = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_mcuMutex);
+                    ok = ctx.gcode->executeLine(line);
+                    if (ok && ++linesSinceFlush >= 10) {
+                        ctx.toolhead->flush();
+                        ctx.toolhead->generateSteps(false);
+                        linesSinceFlush = 0;
+                    }
+                }
+
+                lineCount++;
+                {
+                    std::lock_guard<std::mutex> lock(printJob.mutex);
+                    printJob.state = "printing";
+                    printJob.filePosition = static_cast<size_t>((std::max)(0LL, static_cast<long long>(file.tellg())));
+                    if (printJob.fileSize > 0) {
+                        printJob.progress = (std::min)(1.0,
+                            static_cast<double>(printJob.filePosition) / static_cast<double>(printJob.fileSize));
+                    }
+                    auto elapsed = std::chrono::steady_clock::now() - printJob.startedAt;
+                    printJob.printDuration = std::chrono::duration<double>(elapsed).count();
+                    printJob.totalDuration = printJob.printDuration;
+                }
+
+                if (!ok) {
+                    errors++;
+                    std::lock_guard<std::mutex> lock(printJob.mutex);
+                    printJob.message = ctx.gcode->getLastMessage();
+                    break;
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_mcuMutex);
+                ctx.toolhead->flush();
+                ctx.toolhead->generateSteps(true);
+            }
+
+            std::lock_guard<std::mutex> lock(printJob.mutex);
+            if (printJob.cancelRequested.load(std::memory_order_acquire)) {
+                printJob.state = "cancelled";
+                printJob.message = "Print cancelled";
+            } else if (errors > 0) {
+                printJob.state = "error";
+                if (printJob.message.empty())
+                    printJob.message = "Print failed";
+            } else {
+                printJob.state = "complete";
+                printJob.message = "Print finished";
+                printJob.progress = 1.0;
+                printJob.filePosition = printJob.fileSize;
+            }
+            printJob.active.store(false, std::memory_order_release);
+        });
+
+        message = "ok";
+        return true;
+    };
+
+    callbacks.pausePrint = [&](std::string& message) -> bool {
+        if (!printJob.active.load(std::memory_order_acquire)) {
+            message = "No active print";
+            return false;
+        }
+        printJob.pauseRequested.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(printJob.mutex);
+            printJob.state = "paused";
+            printJob.message = "Print paused";
+        }
+        message = "ok";
+        return true;
+    };
+
+    callbacks.resumePrint = [&](std::string& message) -> bool {
+        if (!printJob.active.load(std::memory_order_acquire)) {
+            message = "No active print";
+            return false;
+        }
+        printJob.pauseRequested.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(printJob.mutex);
+            printJob.state = "printing";
+            printJob.message = "Print resumed";
+        }
+        message = "ok";
+        return true;
+    };
+
+    callbacks.cancelPrint = [&](std::string& message) -> bool {
+        if (!printJob.active.load(std::memory_order_acquire)) {
+            message = "No active print";
+            return false;
+        }
+        printJob.pauseRequested.store(false, std::memory_order_release);
+        printJob.cancelRequested.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(printJob.mutex);
+            printJob.state = "cancelled";
+            printJob.message = "Cancellation requested";
         }
         message = "ok";
         return true;
@@ -937,6 +1193,12 @@ static int runApiServer(TestContext& ctx, int httpPort) {
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
+
+    if (printJob.active.load(std::memory_order_acquire)) {
+        printJob.cancelRequested.store(true, std::memory_order_release);
+    }
+    if (printJob.worker.joinable())
+        printJob.worker.join();
 
     server.stop();
     return 0;

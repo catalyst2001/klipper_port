@@ -533,11 +533,40 @@ json MoonrakerApiServer::dispatchJsonRpc(const json& message,
             return makeJsonRpcError(id, -32000, msg.empty() ? "G-code execution failed" : msg);
         return makeJsonRpcResult(id, "ok");
     }
+    if (method == "printer.print.start") {
+        std::string filename = params.value("filename", "");
+        std::string msg;
+        if (!m_callbacks.startPrint || !m_callbacks.startPrint(filename, msg))
+            return makeJsonRpcError(id, -32000, msg.empty() ? "Unable to start print" : msg);
+        return makeJsonRpcResult(id, "ok");
+    }
+    if (method == "printer.print.pause") {
+        std::string msg;
+        if (!m_callbacks.pausePrint || !m_callbacks.pausePrint(msg))
+            return makeJsonRpcError(id, -32000, msg.empty() ? "Unable to pause print" : msg);
+        return makeJsonRpcResult(id, "ok");
+    }
+    if (method == "printer.print.resume") {
+        std::string msg;
+        if (!m_callbacks.resumePrint || !m_callbacks.resumePrint(msg))
+            return makeJsonRpcError(id, -32000, msg.empty() ? "Unable to resume print" : msg);
+        return makeJsonRpcResult(id, "ok");
+    }
+    if (method == "printer.print.cancel") {
+        std::string msg;
+        if (!m_callbacks.cancelPrint || !m_callbacks.cancelPrint(msg))
+            return makeJsonRpcError(id, -32000, msg.empty() ? "Unable to cancel print" : msg);
+        return makeJsonRpcResult(id, "ok");
+    }
     if (method == "access.oneshot_token") {
         return makeJsonRpcResult(id, "dev-token");
     }
     if (method == "server.files.list") {
-        return makeJsonRpcResult(id, json::array());
+        return makeJsonRpcResult(id, m_callbacks.listFiles ? m_callbacks.listFiles() : json::array());
+    }
+    if (method == "server.files.metadata") {
+        std::string filename = params.value("filename", "");
+        return makeJsonRpcResult(id, m_callbacks.getFileMetadata ? m_callbacks.getFileMetadata(filename) : json::object());
     }
     if (method == "server.files.roots") {
         return makeJsonRpcResult(id, {
@@ -546,6 +575,12 @@ json MoonrakerApiServer::dispatchJsonRpc(const json& message,
     }
     if (method == "server.webcams.list") {
         return makeJsonRpcResult(id, {{"webcams", json::array()}});
+    }
+    if (method == "server.history.list") {
+        return makeJsonRpcResult(id, {{"jobs", json::array()}, {"count", 0}});
+    }
+    if (method == "server.job_queue.status") {
+        return makeJsonRpcResult(id, {{"queued_jobs", json::array()}, {"queue_state", "ready"}});
     }
     if (method == "server.extensions.list") {
         return makeJsonRpcResult(id, {{"extensions", json::array()}});
@@ -727,7 +762,15 @@ void MoonrakerApiServer::handleClient(uintptr_t clientHandle) {
     } else if (req.path == "/server/files/roots") {
         result = json{{"result", {{"roots", json::array({{{"name", "gcodes"}, {"path", "gcode"}, {"permissions", "rw"}}})}}}};
     } else if (req.path == "/server/files/list") {
-        result = json{{"result", json::array()}};
+        result = json{{"result", m_callbacks.listFiles ? m_callbacks.listFiles() : json::array()}};
+    } else if (req.path == "/server/files/metadata") {
+        auto query = parseQuery(req.query);
+        std::string filename = query.count("filename") ? query["filename"] : "";
+        result = json{{"result", m_callbacks.getFileMetadata ? m_callbacks.getFileMetadata(filename) : json::object()}};
+    } else if (req.path == "/server/history/list") {
+        result = json{{"result", {{"jobs", json::array()}, {"count", 0}}}};
+    } else if (req.path == "/server/job_queue/status") {
+        result = json{{"result", {{"queued_jobs", json::array()}, {"queue_state", "ready"}}}};
     } else if (req.path == "/server/webcams/list") {
         result = json{{"result", {{"webcams", json::array()}}}};
     } else if (req.path == "/server/extensions/list") {
@@ -793,6 +836,51 @@ void MoonrakerApiServer::handleClient(uintptr_t clientHandle) {
                 code = 500;
                 result = makeError(500, msg.empty() ? "G-code execution failed" : msg);
             }
+        }
+    } else if (req.path == "/printer/print/start") {
+        std::string filename;
+        auto query = parseQuery(req.query);
+        auto it = query.find("filename");
+        if (it != query.end())
+            filename = it->second;
+        if (filename.empty() && !req.body.empty()) {
+            try {
+                auto j = json::parse(req.body);
+                if (j.contains("filename") && j["filename"].is_string())
+                    filename = j["filename"].get<std::string>();
+            } catch (...) {
+            }
+        }
+        std::string msg;
+        if (!m_callbacks.startPrint || !m_callbacks.startPrint(filename, msg)) {
+            code = 500;
+            result = makeError(500, msg.empty() ? "Unable to start print" : msg);
+        } else {
+            result = json{{"result", "ok"}};
+        }
+    } else if (req.path == "/printer/print/pause") {
+        std::string msg;
+        if (!m_callbacks.pausePrint || !m_callbacks.pausePrint(msg)) {
+            code = 500;
+            result = makeError(500, msg.empty() ? "Unable to pause print" : msg);
+        } else {
+            result = json{{"result", "ok"}};
+        }
+    } else if (req.path == "/printer/print/resume") {
+        std::string msg;
+        if (!m_callbacks.resumePrint || !m_callbacks.resumePrint(msg)) {
+            code = 500;
+            result = makeError(500, msg.empty() ? "Unable to resume print" : msg);
+        } else {
+            result = json{{"result", "ok"}};
+        }
+    } else if (req.path == "/printer/print/cancel") {
+        std::string msg;
+        if (!m_callbacks.cancelPrint || !m_callbacks.cancelPrint(msg)) {
+            code = 500;
+            result = makeError(500, msg.empty() ? "Unable to cancel print" : msg);
+        } else {
+            result = json{{"result", "ok"}};
         }
     } else {
         code = 404;
