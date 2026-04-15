@@ -21,6 +21,7 @@
 #include <chrono>
 #include <iomanip>
 #include <algorithm>
+#include <cctype>
 #include <csignal>
 #include <map>
 #include <filesystem>
@@ -805,7 +806,8 @@ static int runApiServer(TestContext& ctx, int httpPort) {
     auto defaultObjects = []() {
         return std::vector<std::string>{
             "webhooks", "toolhead", "gcode_move", "motion_report",
-            "print_stats", "extruder", "heater_bed", "virtual_sdcard", "configfile"
+            "print_stats", "extruder", "heater_bed", "virtual_sdcard",
+            "display_status", "pause_resume", "configfile"
         };
     };
 
@@ -864,6 +866,41 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         };
     } history;
 
+    struct JobQueueState {
+        std::mutex mutex;
+        uint64_t nextQueueId = 1;
+        bool paused = false;
+        std::vector<json> jobs;
+    } jobQueue;
+
+    struct AuthState {
+        std::mutex mutex;
+        std::string apiKey = "dev-token";
+        std::string currentUser = "developer";
+        std::vector<json> users;
+    } auth;
+
+    struct AnnouncementState {
+        std::mutex mutex;
+        std::vector<json> entries;
+    } announcements;
+
+    struct WebcamState {
+        std::mutex mutex;
+        uint64_t nextId = 1;
+        std::vector<json> items;
+    } webcams;
+
+    struct DevicePowerState {
+        std::mutex mutex;
+        std::map<std::string, bool> devices;
+    } powerState;
+
+    struct ServiceState {
+        std::mutex mutex;
+        std::map<std::string, std::string> states;
+    } services;
+
     auto joinFinishedWorker = [&]() {
         if (printJob.worker.joinable() && !printJob.active.load(std::memory_order_acquire))
             printJob.worker.join();
@@ -908,6 +945,42 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         return gcodeRoot();
     };
 
+    auto normalizeSlashes = [](std::string value) {
+        std::replace(value.begin(), value.end(), '\\', '/');
+        return value;
+    };
+
+    auto toLowerCopy = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return value;
+    };
+
+    auto sanitizeRelativePath = [&](std::string value) {
+        value = normalizeSlashes(std::move(value));
+        while (!value.empty() && value.front() == '/')
+            value.erase(value.begin());
+        fs::path normalized = fs::path(value).lexically_normal();
+        std::string out = normalized.generic_string();
+        return out == "." ? std::string() : out;
+    };
+
+    auto resolvePathInRoot = [&](const std::string& root,
+                                 const std::string& relative,
+                                 fs::path& resolved,
+                                 std::string& error) -> bool {
+        fs::path base = fs::absolute(resolveRootPath(root)).lexically_normal();
+        fs::path candidate = (base / fs::path(sanitizeRelativePath(relative))).lexically_normal();
+        std::string baseStr = toLowerCopy(base.generic_string());
+        std::string candidateStr = toLowerCopy(candidate.generic_string());
+        if (candidateStr != baseStr && candidateStr.rfind(baseStr + "/", 0) != 0) {
+            error = "Path escapes root";
+            return false;
+        }
+        resolved = candidate;
+        return true;
+    };
+
     auto unixNow = []() -> double {
         using namespace std::chrono;
         return duration<double>(system_clock::now().time_since_epoch()).count();
@@ -925,6 +998,91 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         std::ostringstream ss;
         ss << std::uppercase << std::hex << std::setw(16) << std::setfill('0') << value;
         return ss.str();
+    };
+
+    services.states["klipper_host"] = "running";
+    auth.users.push_back({
+        {"username", auth.currentUser},
+        {"source", "moonraker"},
+        {"created_on", unixNow()},
+        {"is_admin", true}
+    });
+
+    announcements.entries.push_back({
+        {"entry_id", "cpp-host-welcome"},
+        {"dismissed", false},
+        {"date", unixNow()},
+        {"title", "klipper_host_cpp"},
+        {"message", "Moonraker compatibility layer active"},
+        {"source", "klipper_host_cpp"},
+        {"priority", "normal"},
+        {"feed", "fluidd"}
+    });
+
+    auto makeUserJson = [&](const std::string& username, const std::string& source = "moonraker") {
+        return json{{"username", username}, {"source", source}, {"created_on", unixNow()}, {"is_admin", true}};
+    };
+
+    auto makeFileEntry = [&](const fs::path& entryPath, const fs::path& base) -> json {
+        double modified = 0.0;
+        try {
+            modified = fileTimeToUnixSeconds(fs::last_write_time(entryPath));
+        } catch (...) {
+        }
+        std::string rel = fs::relative(entryPath, base).generic_string();
+        std::string dirname = fs::relative(entryPath.parent_path(), base).generic_string();
+        if (dirname == ".")
+            dirname.clear();
+        return {
+            {"path", rel},
+            {"filename", rel},
+            {"dirname", dirname},
+            {"modified", modified},
+            {"size", static_cast<int64_t>(fs::is_regular_file(entryPath) ? fs::file_size(entryPath) : 0)},
+            {"permissions", "rw"}
+        };
+    };
+
+    auto makeDirectoryEntry = [&](const fs::path& entryPath, const fs::path& base) -> json {
+        double modified = 0.0;
+        try {
+            modified = fileTimeToUnixSeconds(fs::last_write_time(entryPath));
+        } catch (...) {
+        }
+        std::string rel = fs::relative(entryPath, base).generic_string();
+        std::string dirname = fs::relative(entryPath.parent_path(), base).generic_string();
+        if (dirname == ".")
+            dirname.clear();
+        return {
+            {"path", rel == "." ? std::string() : rel},
+            {"dirname", dirname},
+            {"modified", modified},
+            {"permissions", "rw"}
+        };
+    };
+
+    auto getDirectoryView = [&](const std::string& root, const std::string& relPath) -> json {
+        std::string error;
+        fs::path dirPath;
+        if (!resolvePathInRoot(root, relPath, dirPath, error))
+            return {{"dirs", json::array()}, {"files", json::array()}, {"disk_usage", json::object()}, {"error", error}};
+        fs::create_directories(dirPath);
+        json dirs = json::array();
+        json files = json::array();
+        for (const auto& entry : fs::directory_iterator(dirPath)) {
+            if (entry.is_directory())
+                dirs.push_back(makeDirectoryEntry(entry.path(), fs::absolute(resolveRootPath(root)).lexically_normal()));
+            else if (entry.is_regular_file())
+                files.push_back(makeFileEntry(entry.path(), fs::absolute(resolveRootPath(root)).lexically_normal()));
+        }
+        std::error_code ec;
+        auto spaceInfo = fs::space(dirPath, ec);
+        return {
+            {"dirs", dirs},
+            {"files", files},
+            {"disk_usage", ec ? json::object() : json{{"total", static_cast<int64_t>(spaceInfo.capacity)}, {"used", static_cast<int64_t>(spaceInfo.capacity - spaceInfo.available)}, {"free", static_cast<int64_t>(spaceInfo.available)}}},
+            {"root_info", {{"name", root}, {"path", sanitizeRelativePath(relPath)}}}
+        };
     };
 
     auto tryParseFirstNumber = [](const std::string& text, double& value) -> bool {
@@ -1158,19 +1316,22 @@ static int runApiServer(TestContext& ctx, int httpPort) {
     };
 
     callbacks.getCurrentUser = [&]() -> json {
-        return {
-            {"username", nullptr},
-            {"source", nullptr},
-            {"created_on", nullptr}
-        };
+        std::lock_guard<std::mutex> lock(auth.mutex);
+        for (const auto& user : auth.users) {
+            if (user.value("username", std::string()) == auth.currentUser)
+                return user;
+        }
+        return makeUserJson(auth.currentUser);
     };
 
     callbacks.listUsers = [&]() -> json {
-        return {{"users", json::array()}};
+        std::lock_guard<std::mutex> lock(auth.mutex);
+        return {{"users", auth.users}};
     };
 
     callbacks.getApiKey = [&]() -> std::string {
-        return "dev-token";
+        std::lock_guard<std::mutex> lock(auth.mutex);
+        return auth.apiKey;
     };
 
     callbacks.queryObjects = [&](const std::string& query) -> json {
@@ -1181,6 +1342,33 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         auto hasObj = [&](const std::string& name) {
             return std::find(requested.begin(), requested.end(), name) != requested.end();
         };
+        auto findRail = [&](const std::string& stepperName) -> PrinterRail* {
+            for (auto& stepperInfo : ctx.config->steppers) {
+                if (stepperInfo.name == stepperName)
+                    return stepperInfo.rail.get();
+            }
+            return nullptr;
+        };
+
+        PrinterRail* railX = findRail("stepper_x");
+        PrinterRail* railY = findRail("stepper_y");
+        PrinterRail* railZ = findRail("stepper_z");
+        json axisMinimum = json::array({
+            railX ? railX->getPosMin() : 0.0,
+            railY ? railY->getPosMin() : 0.0,
+            railZ ? railZ->getPosMin() : 0.0,
+            0.0
+        });
+        json axisMaximum = json::array({
+            railX ? railX->getPosMax() : 200.0,
+            railY ? railY->getPosMax() : 200.0,
+            railZ ? railZ->getPosMax() : 200.0,
+            0.0
+        });
+        std::string homedAxes;
+        if (ctx.gcode->isHomed(0)) homedAxes.push_back('x');
+        if (ctx.gcode->isHomed(1)) homedAxes.push_back('y');
+        if (ctx.gcode->isHomed(2)) homedAxes.push_back('z');
 
         json status = json::object();
         if (hasObj("webhooks")) {
@@ -1194,6 +1382,10 @@ static int runApiServer(TestContext& ctx, int httpPort) {
                 {"position", {pos.x, pos.y, pos.z, epos}},
                 {"max_velocity", ctx.toolhead->getMaxVelocity()},
                 {"max_accel", ctx.toolhead->getMaxAccel()},
+                {"kinematics", ctx.config->kinematics},
+                {"homed_axes", homedAxes},
+                {"axis_minimum", axisMinimum},
+                {"axis_maximum", axisMaximum},
                 {"print_time", ctx.toolhead->getNextPrintTime()},
                 {"estimated_print_time", eventtime},
                 {"stalls", 0}
@@ -1203,12 +1395,15 @@ static int runApiServer(TestContext& ctx, int httpPort) {
             status["gcode_move"] = {
                 {"gcode_position", {pos.x, pos.y, pos.z, epos}},
                 {"position", {pos.x, pos.y, pos.z, epos}},
+                {"homing_origin", {0.0, 0.0, 0.0, 0.0}},
+                {"axis_minimum", axisMinimum},
+                {"axis_maximum", axisMaximum},
                 {"speed", ctx.gcode->getFeedrate()},
                 {"speed_factor", ctx.gcode->getSpeedFactor()},
                 {"extrude_factor", 1.0},
                 {"absolute_coordinates", ctx.gcode->isAbsoluteMode()},
                 {"absolute_extrude", ctx.gcode->isAbsoluteExtruderMode()},
-                {"homing_origin", {0.0, 0.0, 0.0, 0.0}}
+                {"speed_mode", "absolute"}
             };
         }
         if (hasObj("motion_report")) {
@@ -1255,7 +1450,20 @@ static int runApiServer(TestContext& ctx, int httpPort) {
                 {"file_size", static_cast<int64_t>(printJob.fileSize)}
             };
         }
+        if (hasObj("display_status")) {
+            std::lock_guard<std::mutex> lock(printJob.mutex);
+            status["display_status"] = {
+                {"message", printJob.message},
+                {"progress", printJob.progress}
+            };
+        }
+        if (hasObj("pause_resume")) {
+            status["pause_resume"] = {
+                {"is_paused", printJob.pauseRequested.load(std::memory_order_acquire)}
+            };
+        }
         if (hasObj("configfile")) {
+            fs::path vsdPath = fs::absolute(gcodeRoot()).lexically_normal();
             status["configfile"] = {
                 {"save_config_pending", false},
                 {"warnings", json::array()},
@@ -1263,6 +1471,30 @@ static int runApiServer(TestContext& ctx, int httpPort) {
                     {"printer", {
                         {"max_velocity", ctx.toolhead->getMaxVelocity()},
                         {"max_accel", ctx.toolhead->getMaxAccel()}
+                    }},
+                    {"virtual_sdcard", {
+                        {"path", vsdPath.generic_string()}
+                    }},
+                    {"pause_resume", json::object()},
+                    {"display_status", json::object()},
+                    {"gcode_macro CANCEL_PRINT", {
+                        {"description", "Moonraker compatibility cancel macro"},
+                        {"gcode", "CANCEL_PRINT_BASE"}
+                    }}
+                }},
+                {"settings", {
+                    {"printer", {
+                        {"max_velocity", ctx.toolhead->getMaxVelocity()},
+                        {"max_accel", ctx.toolhead->getMaxAccel()}
+                    }},
+                    {"virtual_sdcard", {
+                        {"path", vsdPath.generic_string()}
+                    }},
+                    {"pause_resume", json::object()},
+                    {"display_status", json::object()},
+                    {"gcode_macro CANCEL_PRINT", {
+                        {"description", "Moonraker compatibility cancel macro"},
+                        {"gcode", "CANCEL_PRINT_BASE"}
                     }}
                 }}
             };
@@ -1337,19 +1569,26 @@ static int runApiServer(TestContext& ctx, int httpPort) {
     };
 
     callbacks.getAnnouncements = [&]() -> json {
+        std::lock_guard<std::mutex> lock(announcements.mutex);
+        json entries = json::array();
+        for (const auto& entry : announcements.entries) {
+            if (!entry.value("dismissed", false))
+                entries.push_back(entry);
+        }
         return {
-            {"entries", json::array()},
-            {"feeds", json::array()}
+            {"entries", entries},
+            {"feeds", json::array({{{"name", "fluidd"}, {"title", "Fluidd"}}})}
         };
     };
 
     callbacks.getJobQueueStatus = [&]() -> json {
-        std::lock_guard<std::mutex> lock(printJob.mutex);
-        std::string queueState = "ready";
+        std::lock_guard<std::mutex> printLock(printJob.mutex);
+        std::lock_guard<std::mutex> queueLock(jobQueue.mutex);
+        std::string queueState = jobQueue.paused ? "paused" : "ready";
         if (printJob.active.load(std::memory_order_acquire))
             queueState = printJob.pauseRequested.load(std::memory_order_acquire) ? "paused" : "loading";
         return {
-            {"queued_jobs", json::array()},
+            {"queued_jobs", jobQueue.jobs},
             {"queue_state", queueState}
         };
     };
@@ -1545,7 +1784,501 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         return true;
     };
 
-    MoonrakerApiServer server(std::move(callbacks));
+    auto startNextQueuedJob = [&](std::string& message) -> bool {
+        std::string filename;
+        {
+            std::lock_guard<std::mutex> lock(jobQueue.mutex);
+            if (jobQueue.jobs.empty()) {
+                message = "Job queue is empty";
+                return false;
+            }
+            filename = jobQueue.jobs.front().value("filename", std::string());
+        }
+
+        if (!callbacks.startPrint(filename, message))
+            return false;
+
+        std::lock_guard<std::mutex> lock(jobQueue.mutex);
+        if (!jobQueue.jobs.empty() && jobQueue.jobs.front().value("filename", std::string()) == filename)
+            jobQueue.jobs.erase(jobQueue.jobs.begin());
+        return true;
+    };
+
+    callbacks.downloadFile = [&](const std::string& root,
+                                 const std::string& path,
+                                 std::string& contentType,
+                                 std::string& content,
+                                 std::string& error) -> bool {
+        fs::path resolved;
+        if (!resolvePathInRoot(root, path, resolved, error))
+            return false;
+        if (!fs::exists(resolved) || !fs::is_regular_file(resolved)) {
+            error = "File not found";
+            return false;
+        }
+
+        std::ifstream file(resolved, std::ios::binary);
+        if (!file) {
+            error = "Unable to open file";
+            return false;
+        }
+        std::ostringstream buffer;
+        buffer << file.rdbuf();
+        content = buffer.str();
+        contentType = "application/octet-stream";
+        return true;
+    };
+
+    callbacks.uploadFile = [&](const std::string& root,
+                               const std::string& path,
+                               const std::string& filename,
+                               const std::vector<uint8_t>& data,
+                               bool startPrint,
+                               std::string& error) -> json {
+        fs::path directory;
+        if (!resolvePathInRoot(root, path, directory, error))
+            return json::object();
+        fs::create_directories(directory);
+
+        std::string cleanName = fs::path(normalizeSlashes(filename)).filename().generic_string();
+        if (cleanName.empty()) {
+            error = "Missing filename";
+            return json::object();
+        }
+
+        fs::path target = (directory / cleanName).lexically_normal();
+        std::ofstream file(target, std::ios::binary);
+        if (!file) {
+            error = "Unable to create uploaded file";
+            return json::object();
+        }
+        file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        file.close();
+
+        std::string relPath = fs::relative(target, fs::absolute(resolveRootPath(root)).lexically_normal()).generic_string();
+        if (startPrint) {
+            std::string startMessage;
+            if (!callbacks.startPrint(relPath, startMessage)) {
+                error = startMessage.empty() ? "Upload succeeded but print start failed" : startMessage;
+                return json::object();
+            }
+        }
+
+        return {
+            {"item", makeFileEntry(target, fs::absolute(resolveRootPath(root)).lexically_normal())},
+            {"print_started", startPrint},
+            {"root", root}
+        };
+    };
+
+    callbacks.invokeMethod = [&](const std::string& method, const json& params, std::string& error) -> json {
+        auto strParam = [&](std::initializer_list<const char*> keys, const std::string& fallback = std::string()) {
+            for (const char* key : keys) {
+                auto it = params.find(key);
+                if (it != params.end()) {
+                    if (it->is_string())
+                        return it->get<std::string>();
+                    if (it->is_number_integer())
+                        return std::to_string(it->get<int64_t>());
+                    if (it->is_boolean())
+                        return it->get<bool>() ? std::string("true") : std::string("false");
+                }
+            }
+            return fallback;
+        };
+
+        auto boolParam = [&](std::initializer_list<const char*> keys, bool fallback = false) {
+            for (const char* key : keys) {
+                auto it = params.find(key);
+                if (it == params.end())
+                    continue;
+                if (it->is_boolean())
+                    return it->get<bool>();
+                if (it->is_number_integer())
+                    return it->get<int>() != 0;
+                if (it->is_string()) {
+                    std::string value = toLowerCopy(it->get<std::string>());
+                    return value == "true" || value == "1" || value == "on";
+                }
+            }
+            return fallback;
+        };
+
+        auto pathResult = [&](const std::string& root, const std::string& relPath) {
+            return json{{"root", root}, {"path", sanitizeRelativePath(relPath)}};
+        };
+
+        if (method == "server.files.get_directory") {
+            std::string root = strParam({"root"}, "gcodes");
+            std::string path = strParam({"path", "directory"});
+            json directory = getDirectoryView(root, path);
+            if (directory.contains("error")) {
+                error = directory["error"].get<std::string>();
+                directory.erase("error");
+            }
+            return directory;
+        }
+        if (method == "server.files.metascan") {
+            return callbacks.getFileMetadata ? callbacks.getFileMetadata(strParam({"filename", "path"})) : json::object();
+        }
+        if (method == "server.files.move" || method == "server.files.copy") {
+            std::string srcRoot = strParam({"root", "source_root"}, "gcodes");
+            std::string dstRoot = strParam({"dest_root", "root"}, srcRoot);
+            std::string srcPath = strParam({"source", "from", "path", "filename"});
+            std::string dstPath = strParam({"dest", "destination", "new_path"});
+            fs::path srcResolved;
+            fs::path dstResolved;
+            if (!resolvePathInRoot(srcRoot, srcPath, srcResolved, error)
+                || !resolvePathInRoot(dstRoot, dstPath, dstResolved, error))
+                return json::object();
+            if (!fs::exists(srcResolved)) {
+                error = "Source path does not exist";
+                return json::object();
+            }
+            fs::create_directories(dstResolved.parent_path());
+            std::error_code ec;
+            if (method == "server.files.move") {
+                fs::rename(srcResolved, dstResolved, ec);
+            } else if (fs::is_directory(srcResolved)) {
+                fs::copy(srcResolved, dstResolved,
+                    fs::copy_options::recursive | fs::copy_options::overwrite_existing,
+                    ec);
+            } else {
+                fs::copy_file(srcResolved, dstResolved, fs::copy_options::overwrite_existing, ec);
+            }
+            if (ec) {
+                error = ec.message();
+                return json::object();
+            }
+            return {{"item", fs::is_directory(dstResolved)
+                ? makeDirectoryEntry(dstResolved, fs::absolute(resolveRootPath(dstRoot)).lexically_normal())
+                : makeFileEntry(dstResolved, fs::absolute(resolveRootPath(dstRoot)).lexically_normal())}};
+        }
+        if (method == "server.files.delete" || method == "server.files.delete_dir") {
+            std::string root = strParam({"root"}, "gcodes");
+            std::string path = strParam({"path", "filename"});
+            fs::path resolved;
+            if (!resolvePathInRoot(root, path, resolved, error))
+                return json::object();
+            if (!fs::exists(resolved)) {
+                error = "Path does not exist";
+                return json::object();
+            }
+            std::error_code ec;
+            if (fs::is_directory(resolved))
+                fs::remove_all(resolved, ec);
+            else
+                fs::remove(resolved, ec);
+            if (ec) {
+                error = ec.message();
+                return json::object();
+            }
+            return pathResult(root, path);
+        }
+        if (method == "server.files.create_dir") {
+            std::string root = strParam({"root"}, "gcodes");
+            std::string path = strParam({"path", "directory"});
+            fs::path resolved;
+            if (!resolvePathInRoot(root, path, resolved, error))
+                return json::object();
+            std::error_code ec;
+            fs::create_directories(resolved, ec);
+            if (ec) {
+                error = ec.message();
+                return json::object();
+            }
+            return {{"item", makeDirectoryEntry(resolved, fs::absolute(resolveRootPath(root)).lexically_normal())}};
+        }
+        if (method == "printer.gcode.help") {
+            return {
+                {"G0", "Linear move"},
+                {"G1", "Linear move"},
+                {"G2", "Arc move clockwise"},
+                {"G3", "Arc move counter-clockwise"},
+                {"G28", "Home axes"},
+                {"G90", "Absolute positioning"},
+                {"G91", "Relative positioning"},
+                {"G92", "Set current position"},
+                {"M82", "Absolute extruder mode"},
+                {"M83", "Relative extruder mode"},
+                {"M84", "Disable steppers"},
+                {"M112", "Emergency stop"},
+                {"M114", "Report current position"},
+                {"M400", "Wait for moves to finish"}
+            };
+        }
+        if (method == "printer.query_endstops.status") {
+            json states = json::object();
+            for (const auto& stepperInfo : ctx.config->steppers) {
+                if (!stepperInfo.endstop)
+                    continue;
+                bool triggered = false;
+                if (!stepperInfo.endstop->queryState(triggered)) {
+                    error = "Failed to query endstop: " + stepperInfo.name;
+                    return json::object();
+                }
+                std::string axis = stepperInfo.name;
+                if (axis.rfind("stepper_", 0) == 0)
+                    axis = axis.substr(8);
+                states[axis] = triggered ? "TRIGGERED" : "open";
+            }
+            return states;
+        }
+        if (method == "printer.emergency_stop") {
+            std::string message;
+            if (!callbacks.executeGcode || !callbacks.executeGcode("M112", message)) {
+                error = message.empty() ? "Emergency stop failed" : message;
+                return json::object();
+            }
+            return {{"state", "shutdown"}};
+        }
+        if (method == "printer.restart") {
+            if (ctx.mcu.isShutdown() && !ctx.mcu.clearShutdown()) {
+                error = ctx.mcu.getLastError().empty() ? "Unable to clear shutdown" : ctx.mcu.getLastError();
+                return json::object();
+            }
+            g_shutdown = false;
+            return {{"state", "ready"}};
+        }
+        if (method == "printer.firmware_restart") {
+            if (!ctx.mcu.firmwareRestart()) {
+                error = ctx.mcu.getLastError().empty() ? "Firmware restart failed" : ctx.mcu.getLastError();
+                return json::object();
+            }
+            return {{"state", "restarting"}};
+        }
+        if (method == "server.history.delete_job") {
+            std::string jobId = strParam({"job_id", "uid"});
+            std::lock_guard<std::mutex> lock(history.mutex);
+            auto it = std::remove_if(history.jobs.begin(), history.jobs.end(), [&](const json& entry) {
+                return entry.value("job_id", std::string()) == jobId;
+            });
+            if (it == history.jobs.end()) {
+                error = "History job not found";
+                return json::object();
+            }
+            history.jobs.erase(it, history.jobs.end());
+            return {{"deleted", jobId}};
+        }
+        if (method == "server.history.reset_totals") {
+            std::lock_guard<std::mutex> lock(history.mutex);
+            history.totals = {
+                {"total_jobs", 0},
+                {"total_time", 0.0},
+                {"total_print_time", 0.0},
+                {"total_filament_used", 0.0},
+                {"longest_job", 0.0},
+                {"longest_print", 0.0}
+            };
+            return history.totals;
+        }
+        if (method == "server.job_queue.post_job") {
+            json filenames = json::array();
+            if (params.contains("filenames") && params["filenames"].is_array())
+                filenames = params["filenames"];
+            else if (!strParam({"filename"}).empty())
+                filenames.push_back(strParam({"filename"}));
+            if (filenames.empty()) {
+                error = "Missing filename";
+                return json::object();
+            }
+            {
+                std::lock_guard<std::mutex> lock(jobQueue.mutex);
+                for (const auto& name : filenames) {
+                    std::string filename = name.is_string() ? name.get<std::string>() : std::string();
+                    jobQueue.jobs.push_back({
+                        {"job_id", formatJobId(jobQueue.nextQueueId++)},
+                        {"filename", normalizeFilename(filename)},
+                        {"time_added", unixNow()},
+                        {"state", "queued"}
+                    });
+                }
+            }
+            return callbacks.getJobQueueStatus();
+        }
+        if (method == "server.job_queue.delete_job") {
+            std::string jobId = strParam({"job_id"});
+            {
+                std::lock_guard<std::mutex> lock(jobQueue.mutex);
+                auto it = std::remove_if(jobQueue.jobs.begin(), jobQueue.jobs.end(), [&](const json& entry) {
+                    return entry.value("job_id", std::string()) == jobId;
+                });
+                if (it == jobQueue.jobs.end()) {
+                    error = "Queued job not found";
+                    return json::object();
+                }
+                jobQueue.jobs.erase(it, jobQueue.jobs.end());
+            }
+            return callbacks.getJobQueueStatus();
+        }
+        if (method == "server.job_queue.pause") {
+            {
+                std::lock_guard<std::mutex> lock(jobQueue.mutex);
+                jobQueue.paused = boolParam({"pause", "state"}, true);
+            }
+            return callbacks.getJobQueueStatus();
+        }
+        if (method == "server.job_queue.start") {
+            {
+                std::lock_guard<std::mutex> lock(jobQueue.mutex);
+                jobQueue.paused = false;
+            }
+            std::string message;
+            if (!startNextQueuedJob(message)) {
+                error = message;
+                return json::object();
+            }
+            return callbacks.getJobQueueStatus();
+        }
+        if (method == "access.login") {
+            std::string username = strParam({"username"}, auth.currentUser);
+            std::string password = strParam({"password"});
+            if (password.empty())
+                password = "dev";
+            std::lock_guard<std::mutex> lock(auth.mutex);
+            auth.currentUser = username;
+            bool exists = false;
+            for (const auto& user : auth.users)
+                exists = exists || user.value("username", std::string()) == username;
+            if (!exists)
+                auth.users.push_back(makeUserJson(username));
+            return {{"username", username}, {"token", auth.apiKey}, {"refresh_token", auth.apiKey}, {"source", "moonraker"}};
+        }
+        if (method == "access.logout") {
+            return {{"username", auth.currentUser}, {"action", "logged_out"}};
+        }
+        if (method == "access.post_user") {
+            std::string username = strParam({"username"});
+            if (username.empty()) {
+                error = "Missing username";
+                return json::object();
+            }
+            std::lock_guard<std::mutex> lock(auth.mutex);
+            for (const auto& user : auth.users) {
+                if (user.value("username", std::string()) == username) {
+                    error = "User already exists";
+                    return json::object();
+                }
+            }
+            auth.users.push_back(makeUserJson(username));
+            return makeUserJson(username);
+        }
+        if (method == "access.delete_user") {
+            std::string username = strParam({"username"});
+            std::lock_guard<std::mutex> lock(auth.mutex);
+            auto it = std::remove_if(auth.users.begin(), auth.users.end(), [&](const json& user) {
+                return user.value("username", std::string()) == username;
+            });
+            if (it == auth.users.end()) {
+                error = "User not found";
+                return json::object();
+            }
+            auth.users.erase(it, auth.users.end());
+            if (auth.currentUser == username)
+                auth.currentUser = auth.users.empty() ? std::string("developer") : auth.users.front().value("username", std::string("developer"));
+            return {{"username", username}, {"deleted", true}};
+        }
+        if (method == "access.user.password") {
+            return {{"username", auth.currentUser}, {"updated", true}};
+        }
+        if (method == "access.refresh_jwt") {
+            std::lock_guard<std::mutex> lock(auth.mutex);
+            return {{"token", auth.apiKey}, {"refresh_token", auth.apiKey}};
+        }
+        if (method == "access.post_api_key") {
+            std::lock_guard<std::mutex> lock(auth.mutex);
+            auth.apiKey = "dev-token-" + formatJobId(static_cast<uint64_t>(unixNow()));
+            return auth.apiKey;
+        }
+        if (method == "server.announcements.dismiss") {
+            std::string entryId = strParam({"entry_id"});
+            std::lock_guard<std::mutex> lock(announcements.mutex);
+            for (auto& entry : announcements.entries) {
+                if (entry.value("entry_id", std::string()) == entryId) {
+                    entry["dismissed"] = true;
+                    return {{"entry_id", entryId}, {"dismissed", true}};
+                }
+            }
+            error = "Announcement not found";
+            return json::object();
+        }
+        if (method == "server.webcams.list") {
+            std::lock_guard<std::mutex> lock(webcams.mutex);
+            return {{"webcams", webcams.items}};
+        }
+        if (method == "server.webcams.post_item") {
+            std::lock_guard<std::mutex> lock(webcams.mutex);
+            json item = {
+                {"uid", formatJobId(webcams.nextId++)},
+                {"name", strParam({"name"}, "Camera")},
+                {"stream_url", strParam({"stream_url", "url"})},
+                {"snapshot_url", strParam({"snapshot_url"})},
+                {"enabled", boolParam({"enabled"}, true)}
+            };
+            webcams.items.push_back(item);
+            return item;
+        }
+        if (method == "server.webcams.delete_item") {
+            std::string uid = strParam({"uid", "webcam_id", "id"});
+            std::lock_guard<std::mutex> lock(webcams.mutex);
+            auto it = std::remove_if(webcams.items.begin(), webcams.items.end(), [&](const json& webcam) {
+                return webcam.value("uid", std::string()) == uid;
+            });
+            if (it == webcams.items.end()) {
+                error = "Webcam not found";
+                return json::object();
+            }
+            webcams.items.erase(it, webcams.items.end());
+            return {{"uid", uid}, {"deleted", true}};
+        }
+        if (method == "machine.device_power.devices") {
+            std::lock_guard<std::mutex> lock(powerState.mutex);
+            json devices = json::array();
+            for (const auto& device : powerState.devices)
+                devices.push_back({{"device", device.first}, {"status", device.second ? "on" : "off"}, {"locked_while_printing", false}});
+            return {{"devices", devices}};
+        }
+        if (method == "machine.device_power.status") {
+            return callbacks.invokeMethod("machine.device_power.devices", json::object(), error);
+        }
+        if (method == "machine.device_power.post_device") {
+            std::string device = strParam({"device", "name"});
+            if (device.empty()) {
+                error = "Missing device name";
+                return json::object();
+            }
+            bool state = boolParam({"state", "status"}, toLowerCopy(strParam({"action"})) != "off");
+            std::lock_guard<std::mutex> lock(powerState.mutex);
+            powerState.devices[device] = state;
+            return {{"device", device}, {"status", state ? "on" : "off"}};
+        }
+        if (method == "machine.peripherals.usb") {
+            return {{"usb_devices", json::array()}};
+        }
+        if (method == "machine.peripherals.serial") {
+            return {{"serial_devices", json::array()}};
+        }
+        if (method == "machine.peripherals.video") {
+            return {{"video_devices", json::array()}};
+        }
+        if (method == "machine.peripherals.canbus") {
+            return {{"interfaces", json::array()}};
+        }
+        if (method == "machine.services.start" || method == "machine.services.stop" || method == "machine.services.restart") {
+            std::string service = strParam({"service"}, "klipper_host");
+            std::lock_guard<std::mutex> lock(services.mutex);
+            services.states[service] = (method == "machine.services.stop") ? "stopped" : "running";
+            return {{"service", service}, {"state", services.states[service]}};
+        }
+        if (method == "server.restart" || method == "machine.reboot" || method == "machine.shutdown") {
+            return {{"accepted", true}, {"action", method}};
+        }
+
+        error = "__method_not_handled__";
+        return json::object();
+    };
+
+    MoonrakerApiServer server(callbacks);
     std::string error;
     if (!server.start(static_cast<uint16_t>(httpPort), error)) {
         LogError("Moonraker API start failed: " + error);

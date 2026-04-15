@@ -120,28 +120,46 @@ static bool parseRequest(const std::string& raw, HttpRequest& req) {
     return true;
 }
 
-static std::string jsonResponse(int code, const json& payload) {
-    std::string status = "200 OK";
-    if (code == 204) status = "204 No Content";
-    else if (code == 400) status = "400 Bad Request";
-    else if (code == 404) status = "404 Not Found";
-    else if (code == 500) status = "500 Internal Server Error";
-    std::string body = (code == 204) ? "" : payload.dump(2);
+static json makeError(int code, const std::string& message) {
+    return json{{"error", {{"code", code}, {"message", message}}}};
+}
 
+static std::string httpStatusText(int code) {
+    switch (code) {
+    case 200: return "200 OK";
+    case 201: return "201 Created";
+    case 204: return "204 No Content";
+    case 400: return "400 Bad Request";
+    case 404: return "404 Not Found";
+    case 405: return "405 Method Not Allowed";
+    case 409: return "409 Conflict";
+    case 500: return "500 Internal Server Error";
+    default: return std::to_string(code) + " OK";
+    }
+}
+
+static std::string buildHttpResponse(
+    int code,
+    const std::string& contentType,
+    const std::string& body,
+    const std::vector<std::pair<std::string, std::string>>& extraHeaders = {}) {
     std::ostringstream ss;
-    ss << "HTTP/1.1 " << status << "\r\n"
-       << "Content-Type: application/json\r\n"
+    ss << "HTTP/1.1 " << httpStatusText(code) << "\r\n"
+       << "Content-Type: " << contentType << "\r\n"
        << "Access-Control-Allow-Origin: *\r\n"
-       << "Access-Control-Allow-Headers: Content-Type, X-Api-Key\r\n"
-       << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-       << "Connection: close\r\n"
-       << "Content-Length: " << body.size() << "\r\n\r\n"
+       << "Access-Control-Allow-Headers: Content-Type, X-Api-Key, Authorization\r\n"
+       << "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
+       << "Connection: close\r\n";
+    for (const auto& header : extraHeaders)
+        ss << header.first << ": " << header.second << "\r\n";
+    ss << "Content-Length: " << body.size() << "\r\n\r\n"
        << body;
     return ss.str();
 }
 
-static json makeError(int code, const std::string& message) {
-    return json{{"error", {{"code", code}, {"message", message}}}};
+static std::string jsonResponse(int code, const json& payload) {
+    std::string body = (code == 204) ? "" : payload.dump(2);
+    return buildHttpResponse(code, "application/json", body);
 }
 
 static std::string recvRequest(SOCKET client) {
@@ -382,6 +400,122 @@ static json makeJsonRpcResult(const json& id, const json& result) {
 
 static json makeJsonRpcError(const json& id, int code, const std::string& message) {
     return json{{"jsonrpc", "2.0"}, {"error", {{"code", code}, {"message", message}}}, {"id", id}};
+}
+
+static constexpr const char* kMethodNotHandled = "__method_not_handled__";
+
+struct MultipartUpload {
+    std::map<std::string, std::string> fields;
+    std::string fileName;
+    std::vector<uint8_t> fileData;
+};
+
+static std::string contentDispositionValue(const std::string& header, const std::string& key) {
+    const std::string marker = key + "=\"";
+    size_t pos = header.find(marker);
+    if (pos == std::string::npos)
+        return std::string();
+    pos += marker.size();
+    size_t end = header.find('"', pos);
+    if (end == std::string::npos)
+        return std::string();
+    return header.substr(pos, end - pos);
+}
+
+static bool parseMultipartUpload(const HttpRequest& req, MultipartUpload& upload, std::string& error) {
+    auto it = req.headers.find("content-type");
+    if (it == req.headers.end()) {
+        error = "Missing Content-Type";
+        return false;
+    }
+
+    const std::string marker = "boundary=";
+    size_t boundaryPos = it->second.find(marker);
+    if (boundaryPos == std::string::npos) {
+        error = "Missing multipart boundary";
+        return false;
+    }
+    std::string boundary = it->second.substr(boundaryPos + marker.size());
+    if (!boundary.empty() && boundary.front() == '"' && boundary.back() == '"')
+        boundary = boundary.substr(1, boundary.size() - 2);
+    if (boundary.empty()) {
+        error = "Invalid multipart boundary";
+        return false;
+    }
+
+    const std::string delimiter = "--" + boundary;
+    size_t pos = 0;
+    while (true) {
+        size_t start = req.body.find(delimiter, pos);
+        if (start == std::string::npos)
+            break;
+        start += delimiter.size();
+        if (req.body.compare(start, 2, "--") == 0)
+            break;
+        if (req.body.compare(start, 2, "\r\n") == 0)
+            start += 2;
+
+        size_t next = req.body.find(delimiter, start);
+        if (next == std::string::npos)
+            break;
+
+        std::string part = req.body.substr(start, next - start);
+        if (part.size() >= 2 && part.compare(part.size() - 2, 2, "\r\n") == 0)
+            part.resize(part.size() - 2);
+
+        size_t headerEnd = part.find("\r\n\r\n");
+        if (headerEnd == std::string::npos) {
+            pos = next;
+            continue;
+        }
+
+        std::string headers = part.substr(0, headerEnd);
+        std::string payload = part.substr(headerEnd + 4);
+        std::istringstream hs(headers);
+        std::string line;
+        std::string disposition;
+        while (std::getline(hs, line)) {
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            auto colon = line.find(':');
+            if (colon == std::string::npos)
+                continue;
+            std::string key = toLower(trim(line.substr(0, colon)));
+            std::string value = trim(line.substr(colon + 1));
+            if (key == "content-disposition")
+                disposition = value;
+        }
+
+        std::string fieldName = contentDispositionValue(disposition, "name");
+        std::string fileName = contentDispositionValue(disposition, "filename");
+        if (!fileName.empty()) {
+            upload.fileName = fileName;
+            upload.fileData.assign(payload.begin(), payload.end());
+        } else if (!fieldName.empty()) {
+            upload.fields[fieldName] = payload;
+        }
+        pos = next;
+    }
+
+    if (upload.fileData.empty()) {
+        error = "Multipart upload did not contain a file";
+        return false;
+    }
+    return true;
+}
+
+static std::string guessMimeType(const std::string& path) {
+    auto dot = path.find_last_of('.');
+    std::string ext = dot == std::string::npos ? std::string() : toLower(path.substr(dot));
+    if (ext == ".gcode" || ext == ".cfg" || ext == ".log" || ext == ".txt" || ext == ".json")
+        return "text/plain; charset=utf-8";
+    if (ext == ".jpg" || ext == ".jpeg")
+        return "image/jpeg";
+    if (ext == ".png")
+        return "image/png";
+    if (ext == ".webp")
+        return "image/webp";
+    return "application/octet-stream";
 }
 } // namespace
 
@@ -731,7 +865,8 @@ json MoonrakerApiServer::dispatchJsonRpc(const json& message,
             m_callbacks.getApiKey ? json(m_callbacks.getApiKey()) : json("dev-token"));
     }
     if (method == "access.oneshot_token") {
-        return makeJsonRpcResult(id, "dev-token");
+        return makeJsonRpcResult(id,
+            m_callbacks.getApiKey ? json(m_callbacks.getApiKey()) : json("dev-token"));
     }
     if (method == "server.files.list") {
         std::string root = params.value("root", "gcodes");
@@ -751,6 +886,14 @@ json MoonrakerApiServer::dispatchJsonRpc(const json& message,
             m_callbacks.getGcodeStore ? m_callbacks.getGcodeStore() : json{{"gcode_store", json::array()}});
     }
     if (method == "server.webcams.list") {
+        if (m_callbacks.invokeMethod) {
+            std::string error;
+            json invoked = m_callbacks.invokeMethod(method, params, error);
+            if (error.empty())
+                return makeJsonRpcResult(id, invoked);
+            if (error != kMethodNotHandled)
+                return makeJsonRpcError(id, -32000, error);
+        }
         return makeJsonRpcResult(id, {{"webcams", json::array()}});
     }
     if (method == "server.announcements.list") {
@@ -776,6 +919,14 @@ json MoonrakerApiServer::dispatchJsonRpc(const json& message,
         return makeJsonRpcResult(id, {{"extensions", json::array()}});
     }
     if (method == "machine.device_power.devices") {
+        if (m_callbacks.invokeMethod) {
+            std::string error;
+            json invoked = m_callbacks.invokeMethod(method, params, error);
+            if (error.empty())
+                return makeJsonRpcResult(id, invoked);
+            if (error != kMethodNotHandled)
+                return makeJsonRpcError(id, -32000, error);
+        }
         return makeJsonRpcResult(id, {{"devices", json::array()}});
     }
     if (method == "machine.proc_stats") {
@@ -815,6 +966,15 @@ json MoonrakerApiServer::dispatchJsonRpc(const json& message,
             m_database[ns + ":" + key] = value;
         }
         return makeJsonRpcResult(id, {{"namespace", ns}, {"key", key}, {"value", value}});
+    }
+
+    if (m_callbacks.invokeMethod) {
+        std::string error;
+        json result = m_callbacks.invokeMethod(method, params, error);
+        if (error.empty())
+            return makeJsonRpcResult(id, result);
+        if (error != kMethodNotHandled)
+            return makeJsonRpcError(id, -32000, error);
     }
 
     return makeJsonRpcError(id, -32601, "Method not found: " + method);
@@ -945,9 +1105,143 @@ void MoonrakerApiServer::handleClient(const std::shared_ptr<ClientSession>& sess
     json result;
     int code = 200;
 
+    const auto query = parseQuery(req.query);
+    auto mergedParams = [&]() -> json {
+        json params = json::object();
+        for (const auto& kv : query)
+            params[kv.first] = kv.second;
+        if (!req.body.empty()) {
+            try {
+                json body = json::parse(req.body);
+                if (body.is_object()) {
+                    for (auto it = body.begin(); it != body.end(); ++it)
+                        params[it.key()] = it.value();
+                }
+            } catch (...) {
+            }
+        }
+        return params;
+    };
+
+    auto invokeHttpMethod = [&](const std::string& methodName, json params = json::object()) -> bool {
+        if (!m_callbacks.invokeMethod)
+            return false;
+        if (!params.is_object())
+            params = json::object();
+        for (const auto& kv : query) {
+            if (!params.contains(kv.first))
+                params[kv.first] = kv.second;
+        }
+        if (!req.body.empty()) {
+            try {
+                json body = json::parse(req.body);
+                if (body.is_object()) {
+                    for (auto it = body.begin(); it != body.end(); ++it)
+                        params[it.key()] = it.value();
+                }
+            } catch (...) {
+            }
+        }
+        std::string error;
+        json invoked = m_callbacks.invokeMethod(methodName, params, error);
+        if (error == kMethodNotHandled)
+            return false;
+        if (!error.empty()) {
+            code = 500;
+            result = makeError(500, error);
+        } else {
+            result = json{{"result", invoked}};
+        }
+        return true;
+    };
+
     if (req.method == "OPTIONS") {
         code = 204;
         result = json::object();
+    } else if (req.method == "GET"
+            && req.path.rfind("/server/files/", 0) == 0
+            && req.path != "/server/files/roots"
+            && req.path != "/server/files/list"
+            && req.path != "/server/files/metadata"
+            && req.path != "/server/files/get_directory"
+            && req.path != "/server/files/metascan"
+            && req.path != "/server/files/move"
+            && req.path != "/server/files/copy"
+            && req.path != "/server/files/delete"
+            && req.path != "/server/files/create_dir"
+            && req.path != "/server/files/delete_dir"
+            && req.path != "/server/files/upload") {
+        const std::string fileTarget = req.path.substr(std::strlen("/server/files/"));
+        auto slash = fileTarget.find('/');
+        if (slash == std::string::npos) {
+            code = 404;
+            result = makeError(404, "File path is missing root");
+        } else if (!m_callbacks.downloadFile) {
+            code = 404;
+            result = makeError(404, "File download is not available");
+        } else {
+            std::string root = fileTarget.substr(0, slash);
+            std::string relPath = fileTarget.substr(slash + 1);
+            std::string contentType;
+            std::string data;
+            std::string error;
+            if (!m_callbacks.downloadFile(root, relPath, contentType, data, error)) {
+                code = 404;
+                result = makeError(404, error.empty() ? "File not found" : error);
+            } else {
+                out = buildHttpResponse(200,
+                    contentType.empty() ? guessMimeType(relPath) : contentType,
+                    data,
+                    {{"Content-Disposition", "inline; filename=\"" + relPath + "\""}});
+                sendAll(client, out.data(), out.size());
+                closeClientSocket(session);
+                session->finished.store(true, std::memory_order_release);
+                return;
+            }
+        }
+    } else if (req.path == "/server/files/upload") {
+        if (!m_callbacks.uploadFile) {
+            code = 404;
+            result = makeError(404, "Upload handler is not available");
+        } else {
+            std::string root = query.count("root") ? query.at("root") : "gcodes";
+            std::string path = query.count("path") ? query.at("path") : "";
+            bool startPrint = query.count("print") && query.at("print") == "true";
+            std::string filename = query.count("filename") ? query.at("filename") : "";
+            std::vector<uint8_t> data;
+            auto contentTypeIt = req.headers.find("content-type");
+            if (contentTypeIt != req.headers.end()
+                && contentTypeIt->second.find("multipart/form-data") != std::string::npos) {
+                MultipartUpload upload;
+                std::string error;
+                if (!parseMultipartUpload(req, upload, error)) {
+                    code = 400;
+                    result = makeError(400, error);
+                } else {
+                    if (upload.fields.count("root")) root = upload.fields["root"];
+                    if (upload.fields.count("path")) path = upload.fields["path"];
+                    if (upload.fields.count("print")) startPrint = (toLower(upload.fields["print"]) == "true");
+                    if (filename.empty()) filename = upload.fileName;
+                    data = std::move(upload.fileData);
+                }
+            } else {
+                data.assign(req.body.begin(), req.body.end());
+            }
+
+            if (code == 200) {
+                if (filename.empty())
+                    filename = "upload.gcode";
+                std::string error;
+                json uploadResult = m_callbacks.uploadFile(root, path, filename, data, startPrint, error);
+                if (!error.empty()) {
+                    code = 500;
+                    result = makeError(500, error);
+                } else {
+                    code = 201;
+                    result = json{{"result", uploadResult}};
+                }
+            }
+        }
     } else if (req.path == "/server/info") {
         result = json{{"result", m_callbacks.getServerInfo ? m_callbacks.getServerInfo() : json::object()}};
     } else if (req.path == "/server/config") {
@@ -960,12 +1254,13 @@ void MoonrakerApiServer::handleClient(const std::shared_ptr<ClientSession>& sess
         result = json{{"result", m_callbacks.getSystemInfo ? m_callbacks.getSystemInfo() : json::object()}};
     } else if (req.path == "/access/info") {
         result = json{{"result", m_callbacks.getAccessInfo ? m_callbacks.getAccessInfo() : json{{"default_source", "moonraker"}, {"available_sources", json::array({"moonraker"})}, {"login_required", false}, {"trusted", true}}}};
-    } else if (req.path == "/access/user") {
+    } else if (req.path == "/access/user" && req.method == "GET") {
         result = json{{"result", m_callbacks.getCurrentUser ? m_callbacks.getCurrentUser() : json{{"username", nullptr}, {"source", nullptr}, {"created_on", nullptr}}}};
     } else if (req.path == "/access/users/list") {
         result = json{{"result", m_callbacks.listUsers ? m_callbacks.listUsers() : json{{"users", json::array()}}}};
     } else if (req.path == "/machine/device_power/devices") {
-        result = json{{"result", {{"devices", json::array()}}}};
+        if (!invokeHttpMethod("machine.device_power.devices"))
+            result = json{{"result", {{"devices", json::array()}}}};
     } else if (req.path == "/machine/proc_stats") {
         result = json{{"result", {{"system_cpu_usage", {{"cpu", 0.0}}}, {"system_memory", {{"total", 0}, {"used", 0}, {"available", 0}}}}}};
     } else if (req.path == "/printer/objects/list") {
@@ -976,28 +1271,26 @@ void MoonrakerApiServer::handleClient(const std::shared_ptr<ClientSession>& sess
         } else {
             try {
                 auto j = json::parse(req.body);
-                std::string query = objectsQueryStringFromJson(j.value("objects", json::object()));
-                result = json{{"result", m_callbacks.queryObjects ? m_callbacks.queryObjects(query) : json::object()}};
+                std::string objectQuery = objectsQueryStringFromJson(j.value("objects", json::object()));
+                result = json{{"result", m_callbacks.queryObjects ? m_callbacks.queryObjects(objectQuery) : json::object()}};
             } catch (...) {
                 code = 400;
                 result = makeError(400, "Invalid JSON body");
             }
         }
-    } else if (req.path == "/access/oneshot_token" || req.path == "/access/api_key") {
+    } else if (req.path == "/access/oneshot_token" || (req.path == "/access/api_key" && req.method == "GET")) {
         result = json{{"result", m_callbacks.getApiKey ? json(m_callbacks.getApiKey()) : json("dev-token")}};
     } else if (req.path == "/server/files/roots") {
         result = json{{"result", {{"roots", m_callbacks.listFileRoots ? m_callbacks.listFileRoots() : json::array({{{"name", "gcodes"}, {"path", "gcode"}, {"permissions", "rw"}}})}}}};
     } else if (req.path == "/server/files/list") {
-        auto query = parseQuery(req.query);
-        std::string root = query.count("root") ? query["root"] : "gcodes";
+        std::string root = query.count("root") ? query.at("root") : "gcodes";
         result = json{{"result", m_callbacks.listFiles ? m_callbacks.listFiles(root) : json::array()}};
     } else if (req.path == "/server/gcode_store") {
         result = json{{"result", m_callbacks.getGcodeStore ? m_callbacks.getGcodeStore() : json{{"gcode_store", json::array()}}}};
     } else if (req.path == "/server/announcements/list") {
         result = json{{"result", m_callbacks.getAnnouncements ? m_callbacks.getAnnouncements() : json{{"entries", json::array()}, {"feeds", json::array()}}}};
     } else if (req.path == "/server/files/metadata") {
-        auto query = parseQuery(req.query);
-        std::string filename = query.count("filename") ? query["filename"] : "";
+        std::string filename = query.count("filename") ? query.at("filename") : "";
         result = json{{"result", m_callbacks.getFileMetadata ? m_callbacks.getFileMetadata(filename) : json::object()}};
     } else if (req.path == "/server/history/list") {
         result = json{{"result", m_callbacks.getHistoryList ? m_callbacks.getHistoryList() : json{{"jobs", json::array()}, {"count", 0}}}};
@@ -1006,7 +1299,8 @@ void MoonrakerApiServer::handleClient(const std::shared_ptr<ClientSession>& sess
     } else if (req.path == "/server/job_queue/status") {
         result = json{{"result", m_callbacks.getJobQueueStatus ? m_callbacks.getJobQueueStatus() : json{{"queued_jobs", json::array()}, {"queue_state", "ready"}}}};
     } else if (req.path == "/server/webcams/list") {
-        result = json{{"result", {{"webcams", json::array()}}}};
+        if (!invokeHttpMethod("server.webcams.list"))
+            result = json{{"result", {{"webcams", json::array()}}}};
     } else if (req.path == "/server/extensions/list") {
         result = json{{"result", {{"extensions", json::array()}}}};
     } else if (req.path == "/server/database/list") {
@@ -1021,9 +1315,8 @@ void MoonrakerApiServer::handleClient(const std::shared_ptr<ClientSession>& sess
         }
         result = json{{"result", {{"namespaces", namespaces}}}};
     } else if (req.path == "/server/database/item") {
-        auto query = parseQuery(req.query);
-        std::string ns = query.count("namespace") ? query["namespace"] : "fluidd";
-        std::string key = query.count("key") ? query["key"] : "";
+        std::string ns = query.count("namespace") ? query.at("namespace") : "fluidd";
+        std::string key = query.count("key") ? query.at("key") : "";
         if (req.method == "GET") {
             std::lock_guard<std::mutex> lock(m_stateMutex);
             json value = json::object();
@@ -1046,20 +1339,8 @@ void MoonrakerApiServer::handleClient(const std::shared_ptr<ClientSession>& sess
             }
         }
     } else if (req.path == "/printer/gcode/script") {
-        std::string script;
-        auto query = parseQuery(req.query);
-        auto it = query.find("script");
-        if (it != query.end())
-            script = it->second;
-        if (script.empty() && !req.body.empty()) {
-            try {
-                auto j = json::parse(req.body);
-                if (j.contains("script") && j["script"].is_string())
-                    script = j["script"].get<std::string>();
-            } catch (...) {
-            }
-        }
-
+        json params = mergedParams();
+        std::string script = params.value("script", "");
         if (script.empty()) {
             code = 400;
             result = makeError(400, "Missing gcode script");
@@ -1077,19 +1358,7 @@ void MoonrakerApiServer::handleClient(const std::shared_ptr<ClientSession>& sess
             }
         }
     } else if (req.path == "/printer/print/start") {
-        std::string filename;
-        auto query = parseQuery(req.query);
-        auto it = query.find("filename");
-        if (it != query.end())
-            filename = it->second;
-        if (filename.empty() && !req.body.empty()) {
-            try {
-                auto j = json::parse(req.body);
-                if (j.contains("filename") && j["filename"].is_string())
-                    filename = j["filename"].get<std::string>();
-            } catch (...) {
-            }
-        }
+        std::string filename = mergedParams().value("filename", "");
         std::string msg;
         if (!m_callbacks.startPrint || !m_callbacks.startPrint(filename, msg)) {
             code = 500;
@@ -1121,6 +1390,82 @@ void MoonrakerApiServer::handleClient(const std::shared_ptr<ClientSession>& sess
         } else {
             result = json{{"result", "ok"}};
         }
+    } else if (req.path == "/printer/gcode/help") {
+        invokeHttpMethod("printer.gcode.help");
+    } else if (req.path == "/printer/query_endstops/status") {
+        invokeHttpMethod("printer.query_endstops.status");
+    } else if (req.path == "/printer/emergency_stop") {
+        invokeHttpMethod("printer.emergency_stop");
+    } else if (req.path == "/printer/restart") {
+        invokeHttpMethod("printer.restart");
+    } else if (req.path == "/printer/firmware_restart") {
+        invokeHttpMethod("printer.firmware_restart");
+    } else if (req.path == "/server/files/get_directory") {
+        invokeHttpMethod("server.files.get_directory");
+    } else if (req.path == "/server/files/metascan") {
+        invokeHttpMethod("server.files.metascan");
+    } else if (req.path == "/server/files/move") {
+        invokeHttpMethod("server.files.move");
+    } else if (req.path == "/server/files/copy") {
+        invokeHttpMethod("server.files.copy");
+    } else if (req.path == "/server/files/delete") {
+        invokeHttpMethod("server.files.delete");
+    } else if (req.path == "/server/files/create_dir") {
+        invokeHttpMethod("server.files.create_dir");
+    } else if (req.path == "/server/files/delete_dir") {
+        invokeHttpMethod("server.files.delete_dir");
+    } else if (req.path == "/server/history/delete_job") {
+        invokeHttpMethod("server.history.delete_job");
+    } else if (req.path == "/server/history/reset_totals") {
+        invokeHttpMethod("server.history.reset_totals");
+    } else if (req.path == "/server/job_queue/job") {
+        invokeHttpMethod(req.method == "DELETE" ? "server.job_queue.delete_job" : "server.job_queue.post_job");
+    } else if (req.path == "/server/job_queue/pause") {
+        invokeHttpMethod("server.job_queue.pause");
+    } else if (req.path == "/server/job_queue/start") {
+        invokeHttpMethod("server.job_queue.start");
+    } else if (req.path == "/server/announcements/dismiss") {
+        invokeHttpMethod("server.announcements.dismiss");
+    } else if (req.path == "/server/webcams/item") {
+        invokeHttpMethod(req.method == "DELETE" ? "server.webcams.delete_item" : "server.webcams.post_item");
+    } else if (req.path == "/machine/peripherals/usb") {
+        invokeHttpMethod("machine.peripherals.usb");
+    } else if (req.path == "/machine/peripherals/serial") {
+        invokeHttpMethod("machine.peripherals.serial");
+    } else if (req.path == "/machine/peripherals/video") {
+        invokeHttpMethod("machine.peripherals.video");
+    } else if (req.path == "/machine/peripherals/canbus") {
+        invokeHttpMethod("machine.peripherals.canbus");
+    } else if (req.path == "/machine/services/start") {
+        invokeHttpMethod("machine.services.start");
+    } else if (req.path == "/machine/services/stop") {
+        invokeHttpMethod("machine.services.stop");
+    } else if (req.path == "/machine/services/restart") {
+        invokeHttpMethod("machine.services.restart");
+    } else if (req.path == "/machine/device_power/status") {
+        invokeHttpMethod("machine.device_power.status");
+    } else if (req.path == "/machine/device_power/device") {
+        invokeHttpMethod("machine.device_power.post_device");
+    } else if (req.path == "/server/restart") {
+        invokeHttpMethod("server.restart");
+    } else if (req.path == "/machine/reboot") {
+        invokeHttpMethod("machine.reboot");
+    } else if (req.path == "/machine/shutdown") {
+        invokeHttpMethod("machine.shutdown");
+    } else if (req.path == "/access/login") {
+        invokeHttpMethod("access.login");
+    } else if (req.path == "/access/logout") {
+        invokeHttpMethod("access.logout");
+    } else if (req.path == "/access/user/password") {
+        invokeHttpMethod("access.user.password");
+    } else if (req.path == "/access/refresh_jwt") {
+        invokeHttpMethod("access.refresh_jwt");
+    } else if (req.path == "/access/api_key" && req.method == "POST") {
+        invokeHttpMethod("access.post_api_key");
+    } else if (req.path == "/access/user" && req.method == "POST") {
+        invokeHttpMethod("access.post_user");
+    } else if (req.path == "/access/user" && req.method == "DELETE") {
+        invokeHttpMethod("access.delete_user");
     } else {
         code = 404;
         result = makeError(404, "Endpoint not found");

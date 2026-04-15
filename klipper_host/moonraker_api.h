@@ -35,6 +35,20 @@ struct MoonrakerApiCallbacks {
     std::function<bool(std::string& message)> pausePrint;
     std::function<bool(std::string& message)> resumePrint;
     std::function<bool(std::string& message)> cancelPrint;
+    std::function<nlohmann::json(const std::string& method,
+                                 const nlohmann::json& params,
+                                 std::string& error)> invokeMethod;
+    std::function<bool(const std::string& root,
+                       const std::string& path,
+                       std::string& contentType,
+                       std::string& content,
+                       std::string& error)> downloadFile;
+    std::function<nlohmann::json(const std::string& root,
+                                 const std::string& path,
+                                 const std::string& filename,
+                                 const std::vector<uint8_t>& data,
+                                 bool startPrint,
+                                 std::string& error)> uploadFile;
 };
 
 class MoonrakerApiServer {
