@@ -727,10 +727,19 @@ json MoonrakerApiServer::dispatchJsonRpc(const json& message,
         return makeJsonRpcResult(id, {{"webcams", json::array()}});
     }
     if (method == "server.history.list") {
-        return makeJsonRpcResult(id, {{"jobs", json::array()}, {"count", 0}});
+        return makeJsonRpcResult(id,
+            m_callbacks.getHistoryList ? m_callbacks.getHistoryList()
+                                         : json{{"jobs", json::array()}, {"count", 0}});
+    }
+    if (method == "server.history.totals") {
+        return makeJsonRpcResult(id,
+            m_callbacks.getHistoryTotals ? m_callbacks.getHistoryTotals()
+                                           : json{{"job_totals", json::object()}, {"auxiliary_totals", json::array()}});
     }
     if (method == "server.job_queue.status") {
-        return makeJsonRpcResult(id, {{"queued_jobs", json::array()}, {"queue_state", "ready"}});
+        return makeJsonRpcResult(id,
+            m_callbacks.getJobQueueStatus ? m_callbacks.getJobQueueStatus()
+                                            : json{{"queued_jobs", json::array()}, {"queue_state", "ready"}});
     }
     if (method == "server.extensions.list") {
         return makeJsonRpcResult(id, {{"extensions", json::array()}});
@@ -948,9 +957,11 @@ void MoonrakerApiServer::handleClient(const std::shared_ptr<ClientSession>& sess
         std::string filename = query.count("filename") ? query["filename"] : "";
         result = json{{"result", m_callbacks.getFileMetadata ? m_callbacks.getFileMetadata(filename) : json::object()}};
     } else if (req.path == "/server/history/list") {
-        result = json{{"result", {{"jobs", json::array()}, {"count", 0}}}};
+        result = json{{"result", m_callbacks.getHistoryList ? m_callbacks.getHistoryList() : json{{"jobs", json::array()}, {"count", 0}}}};
+    } else if (req.path == "/server/history/totals") {
+        result = json{{"result", m_callbacks.getHistoryTotals ? m_callbacks.getHistoryTotals() : json{{"job_totals", json::object()}, {"auxiliary_totals", json::array()}}}};
     } else if (req.path == "/server/job_queue/status") {
-        result = json{{"result", {{"queued_jobs", json::array()}, {"queue_state", "ready"}}}};
+        result = json{{"result", m_callbacks.getJobQueueStatus ? m_callbacks.getJobQueueStatus() : json{{"queued_jobs", json::array()}, {"queue_state", "ready"}}}};
     } else if (req.path == "/server/webcams/list") {
         result = json{{"result", {{"webcams", json::array()}}}};
     } else if (req.path == "/server/extensions/list") {

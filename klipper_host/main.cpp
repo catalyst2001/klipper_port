@@ -368,17 +368,36 @@ struct TestContext {
     }
 };
 
+struct GcodeRunHooks {
+    std::function<bool()> shouldPause;
+    std::function<bool()> shouldCancel;
+    std::function<void(size_t filePosition, size_t fileSize,
+                       size_t contentLines, size_t totalLines)> onProgress;
+};
+
 // ---- Mode: run gcode file (reactor-based) ----
-static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t startLine = 0, double speedFactor = 1.0) {
+static int runGcodeFile(TestContext& ctx, const std::string& filePath,
+                        size_t startLine = 0, double speedFactor = 1.0,
+                        const GcodeRunHooks* hooks = nullptr) {
     std::ifstream file(filePath);
     if (!file.is_open()) {
         LogError("Cannot open file: " + filePath);
         return 1;
     }
     std::vector<std::string> lines;
+    std::vector<size_t> lineOffsets;
     std::string line;
-    while (std::getline(file, line))
+    size_t fileSize = 0;
+    try {
+        if (std::filesystem::exists(filePath))
+            fileSize = static_cast<size_t>(std::filesystem::file_size(filePath));
+    } catch (...) {
+    }
+    while (std::getline(file, line)) {
         lines.push_back(line);
+        std::streampos pos = file.tellg();
+        lineOffsets.push_back(pos >= 0 ? static_cast<size_t>(pos) : fileSize);
+    }
     Log("Loaded gcode: " + filePath + " (" + std::to_string(lines.size()) + " lines)");
     if (speedFactor != 1.0) {
         Log("Speed factor: " + std::to_string(speedFactor) + "x");
@@ -401,9 +420,22 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
         }
         Log("Preamble: " + std::to_string(preamble.size()) + " setup commands");
         std::vector<std::string> newLines;
+        std::vector<size_t> newOffsets;
         newLines.insert(newLines.end(), preamble.begin(), preamble.end());
         newLines.insert(newLines.end(), lines.begin() + startLine, lines.end());
+        for (size_t i = 0; i < startLine; ++i) {
+            std::string t = lines[i];
+            while (!t.empty() && (t[0] == ' ' || t[0] == '\t')) t.erase(t.begin());
+            if (t.empty() || t[0] == ';' || t[0] == '%' || t[0] == '(') continue;
+            if (t[0] == 'M' || t[0] == 'm' ||
+                t.substr(0, 3) == "G28" || t.substr(0, 3) == "G90" ||
+                t.substr(0, 3) == "G91" || t.substr(0, 3) == "G92") {
+                newOffsets.push_back(i < lineOffsets.size() ? lineOffsets[i] : 0);
+            }
+        }
+        newOffsets.insert(newOffsets.end(), lineOffsets.begin() + startLine, lineOffsets.end());
         lines = std::move(newLines);
+        lineOffsets = std::move(newOffsets);
         Log("Effective lines: " + std::to_string(lines.size()));
     }
 
@@ -515,12 +547,37 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
             ctx.reactor.end();
             return REACTOR_NEVER;
         }
+        if (hooks && hooks->shouldCancel && hooks->shouldCancel()) {
+            if (ctx.mcu.isConnected() && !ctx.mcu.isShutdown()) {
+                ctx.toolhead->flush();
+                ctx.toolhead->generateSteps(true);
+            }
+            if (hooks->onProgress) {
+                size_t filePosition = gcodeIdx > 0 && !lineOffsets.empty()
+                    ? lineOffsets[(std::min)(gcodeIdx, lineOffsets.size()) - 1]
+                    : 0;
+                hooks->onProgress(filePosition, fileSize, contentLines, lines.size());
+            }
+            ctx.reactor.end();
+            return REACTOR_NEVER;
+        }
+        if (hooks && hooks->shouldPause && hooks->shouldPause()) {
+            if (hooks->onProgress) {
+                size_t filePosition = gcodeIdx > 0 && !lineOffsets.empty()
+                    ? lineOffsets[(std::min)(gcodeIdx, lineOffsets.size()) - 1]
+                    : 0;
+                hooks->onProgress(filePosition, fileSize, contentLines, lines.size());
+            }
+            return eventtime + 0.100;
+        }
         if (!g_running || gcodeIdx >= lines.size()) {
             // Final flush + step gen
             if (ctx.mcu.isConnected() && !ctx.mcu.isShutdown()) {
                 ctx.toolhead->flush();
                 ctx.toolhead->generateSteps(true);
             }
+            if (hooks && hooks->onProgress)
+                hooks->onProgress(fileSize, fileSize, contentLines, lines.size());
             ctx.reactor.end();
             return REACTOR_NEVER;
         }
@@ -606,6 +663,12 @@ static int runGcodeFile(TestContext& ctx, const std::string& filePath, size_t st
                    << " gated=" << ctx.mcu.getStepSyncGated();
                 Log(ss.str());
             }
+        }
+        if (hooks && hooks->onProgress) {
+            size_t filePosition = gcodeIdx > 0 && !lineOffsets.empty()
+                ? lineOffsets[(std::min)(gcodeIdx, lineOffsets.size()) - 1]
+                : 0;
+            hooks->onProgress(filePosition, fileSize, contentLines, lines.size());
         }
 
         return REACTOR_NOW;  // process next batch immediately (checkPause limits rate)
@@ -772,15 +835,34 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         std::atomic<bool> pauseRequested{false};
         std::atomic<bool> cancelRequested{false};
         std::string state = "standby";
+        std::string jobId;
         std::string filename;
         std::string message;
+        json metadata = json::object();
         size_t filePosition = 0;
         size_t fileSize = 0;
         double progress = 0.0;
+        double startTime = 0.0;
+        double endTime = 0.0;
+        double filamentUsed = 0.0;
         double printDuration = 0.0;
         double totalDuration = 0.0;
         std::chrono::steady_clock::time_point startedAt{};
     } printJob;
+
+    struct HistoryState {
+        std::mutex mutex;
+        uint64_t nextJobId = 1;
+        std::vector<json> jobs;
+        json totals = {
+            {"total_jobs", 0},
+            {"total_time", 0.0},
+            {"total_print_time", 0.0},
+            {"total_filament_used", 0.0},
+            {"longest_job", 0.0},
+            {"longest_print", 0.0}
+        };
+    } history;
 
     auto joinFinishedWorker = [&]() {
         if (printJob.worker.joinable() && !printJob.active.load(std::memory_order_acquire))
@@ -810,19 +892,131 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         return fs::path("gcode");
     };
 
+    auto unixNow = []() -> double {
+        using namespace std::chrono;
+        return duration<double>(system_clock::now().time_since_epoch()).count();
+    };
+
+    auto fileTimeToUnixSeconds = [&](fs::file_time_type value) -> double {
+        using namespace std::chrono;
+        auto systemNow = system_clock::now();
+        auto fileNow = fs::file_time_type::clock::now();
+        auto translated = systemNow + duration_cast<system_clock::duration>(value - fileNow);
+        return duration<double>(translated.time_since_epoch()).count();
+    };
+
+    auto formatJobId = [](uint64_t value) -> std::string {
+        std::ostringstream ss;
+        ss << std::uppercase << std::hex << std::setw(16) << std::setfill('0') << value;
+        return ss.str();
+    };
+
+    auto tryParseFirstNumber = [](const std::string& text, double& value) -> bool {
+        size_t start = 0;
+        while (start < text.size()) {
+            char ch = text[start];
+            if ((ch >= '0' && ch <= '9') || ch == '-' || ch == '+')
+                break;
+            ++start;
+        }
+        if (start >= text.size())
+            return false;
+        try {
+            size_t parsed = 0;
+            value = std::stod(text.substr(start), &parsed);
+            return parsed > 0;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    auto scanGcodeMetadata = [&](const std::string& filename) -> json {
+        std::string rel = normalizeFilename(filename);
+        fs::path path = gcodeRoot() / fs::path(rel);
+        json meta = {
+            {"size", 0},
+            {"modified", 0.0},
+            {"uuid", rel},
+            {"slicer", "unknown"},
+            {"object_height", nullptr},
+            {"layer_height", nullptr},
+            {"first_layer_height", nullptr},
+            {"filament_total", nullptr},
+            {"estimated_time", nullptr},
+            {"thumbnails", json::array()},
+            {"gcode_start_byte", 0},
+            {"gcode_end_byte", 0},
+            {"filename", rel}
+        };
+        if (!fs::exists(path) || !fs::is_regular_file(path))
+            return meta;
+
+        meta["size"] = static_cast<int64_t>(fs::file_size(path));
+        meta["gcode_end_byte"] = meta["size"];
+        try {
+            meta["modified"] = fileTimeToUnixSeconds(fs::last_write_time(path));
+        } catch (...) {
+        }
+
+        std::ifstream file(path);
+        std::string line;
+        double minZ = 0.0;
+        double maxZ = 0.0;
+        bool haveMinZ = false;
+        bool haveMaxZ = false;
+        while (std::getline(file, line)) {
+            auto setMetaNumber = [&](const std::string& prefix, const char* field) {
+                if (line.rfind(prefix, 0) != 0)
+                    return false;
+                double value = 0.0;
+                if (!tryParseFirstNumber(line.substr(prefix.size()), value))
+                    return false;
+                meta[field] = value;
+                return true;
+            };
+
+            if (line.rfind("; generated by ", 0) == 0) {
+                meta["slicer"] = line.substr(15);
+            } else if (line.rfind(";GENERATOR.NAME:", 0) == 0) {
+                meta["slicer"] = line.substr(16);
+            } else if (line.rfind(";TIME:", 0) == 0) {
+                setMetaNumber(";TIME:", "estimated_time");
+            } else if (line.rfind(";Layer height:", 0) == 0) {
+                setMetaNumber(";Layer height:", "layer_height");
+            } else if (line.rfind(";First layer height:", 0) == 0) {
+                setMetaNumber(";First layer height:", "first_layer_height");
+            } else if (line.rfind(";MINZ:", 0) == 0) {
+                haveMinZ = tryParseFirstNumber(line.substr(6), minZ);
+            } else if (line.rfind(";MAXZ:", 0) == 0) {
+                haveMaxZ = tryParseFirstNumber(line.substr(6), maxZ);
+            } else if (line.rfind(";Filament used", 0) == 0 || line.rfind("; filament used", 0) == 0) {
+                double filament = 0.0;
+                if (tryParseFirstNumber(line, filament)) {
+                    if (line.find("mm") == std::string::npos && line.find('m') != std::string::npos)
+                        filament *= 1000.0;
+                    meta["filament_total"] = filament;
+                }
+            }
+        }
+        if (haveMinZ && haveMaxZ && maxZ >= minZ)
+            meta["object_height"] = maxZ - minZ;
+        return meta;
+    };
+
     MoonrakerApiCallbacks callbacks;
     callbacks.getServerInfo = [&]() -> json {
         bool connected = ctx.mcu.isConnected() && !ctx.mcu.isShutdown();
         return {
             {"klippy_connected", connected},
             {"klippy_state", connected ? "ready" : (ctx.mcu.isShutdown() ? "shutdown" : "disconnected")},
-            {"components", {"application", "klippy_connection", "machine"}},
+            {"components", {"application", "klippy_connection", "machine", "file_manager", "job_queue", "history"}},
             {"failed_components", json::array()},
             {"registered_directories", {"gcodes"}},
             {"warnings", json::array()},
             {"websocket_count", 0},
             {"moonraker_version", "klipper_host_cpp-dev"},
-            {"api_version", {1, 0, 0}}
+            {"api_version", {1, 0, 0}},
+            {"api_version_string", "1.0.0"}
         };
     };
 
@@ -957,11 +1151,19 @@ static int runApiServer(TestContext& ctx, int httpPort) {
             if (!entry.is_regular_file())
                 continue;
             std::string rel = fs::relative(entry.path(), root).generic_string();
+            double modified = 0.0;
+            try {
+                modified = fileTimeToUnixSeconds(entry.last_write_time());
+            } catch (...) {
+            }
+            std::string dirname = fs::relative(entry.path().parent_path(), root).generic_string();
+            if (dirname == ".")
+                dirname.clear();
             files.push_back({
                 {"path", rel},
                 {"filename", rel},
-                {"dirname", entry.path().parent_path().filename().string()},
-                {"modified", 0},
+                {"dirname", dirname},
+                {"modified", modified},
                 {"size", static_cast<int64_t>(entry.file_size())},
                 {"permissions", "rw"}
             });
@@ -970,29 +1172,43 @@ static int runApiServer(TestContext& ctx, int httpPort) {
     };
 
     callbacks.getFileMetadata = [&](const std::string& filename) -> json {
-        std::string rel = normalizeFilename(filename);
-        fs::path path = gcodeRoot() / fs::path(rel);
-        json meta = {
-            {"filename", rel},
-            {"size", 0},
-            {"modified", 0},
-            {"uuid", rel},
-            {"slicer", "unknown"},
-            {"object_height", nullptr},
-            {"layer_height", nullptr},
-            {"first_layer_height", nullptr},
-            {"filament_total", nullptr},
-            {"estimated_time", nullptr}
+        return scanGcodeMetadata(filename);
+    };
+
+    callbacks.getHistoryList = [&]() -> json {
+        std::lock_guard<std::mutex> lock(history.mutex);
+        return {
+            {"count", static_cast<int>(history.jobs.size())},
+            {"jobs", history.jobs}
         };
-        if (fs::exists(path) && fs::is_regular_file(path)) {
-            meta["size"] = static_cast<int64_t>(fs::file_size(path));
-        }
-        return meta;
+    };
+
+    callbacks.getHistoryTotals = [&]() -> json {
+        std::lock_guard<std::mutex> lock(history.mutex);
+        return {
+            {"job_totals", history.totals},
+            {"auxiliary_totals", json::array()}
+        };
+    };
+
+    callbacks.getJobQueueStatus = [&]() -> json {
+        std::lock_guard<std::mutex> lock(printJob.mutex);
+        std::string queueState = "ready";
+        if (printJob.active.load(std::memory_order_acquire))
+            queueState = printJob.pauseRequested.load(std::memory_order_acquire) ? "paused" : "loading";
+        return {
+            {"queued_jobs", json::array()},
+            {"queue_state", queueState}
+        };
     };
 
     callbacks.executeGcode = [&](const std::string& script, std::string& message) -> bool {
         if (script.empty()) {
             message = "Empty script";
+            return false;
+        }
+        if (printJob.active.load(std::memory_order_acquire)) {
+            message = "Print is in progress";
             return false;
         }
         std::lock_guard<std::mutex> lock(g_mcuMutex);
@@ -1021,113 +1237,110 @@ static int runApiServer(TestContext& ctx, int httpPort) {
             return false;
         }
 
+        json metadata = scanGcodeMetadata(rel);
+        std::string jobId;
+        {
+            std::lock_guard<std::mutex> lock(history.mutex);
+            jobId = formatJobId(history.nextJobId++);
+        }
+
         {
             std::lock_guard<std::mutex> lock(printJob.mutex);
             printJob.active.store(true, std::memory_order_release);
             printJob.pauseRequested.store(false, std::memory_order_release);
             printJob.cancelRequested.store(false, std::memory_order_release);
             printJob.state = "printing";
+            printJob.jobId = jobId;
             printJob.filename = rel;
             printJob.message.clear();
+            printJob.metadata = metadata;
             printJob.filePosition = 0;
-            printJob.fileSize = static_cast<size_t>(fs::file_size(path));
+            printJob.fileSize = metadata.value("size", static_cast<int64_t>(fs::file_size(path)));
             printJob.progress = 0.0;
+            printJob.startTime = unixNow();
+            printJob.endTime = 0.0;
+            printJob.filamentUsed = metadata.contains("filament_total") && metadata["filament_total"].is_number()
+                ? metadata["filament_total"].get<double>() : 0.0;
             printJob.printDuration = 0.0;
             printJob.totalDuration = 0.0;
             printJob.startedAt = std::chrono::steady_clock::now();
         }
 
         printJob.worker = std::thread([&, path, rel]() {
-            std::ifstream file(path);
-            if (!file.is_open()) {
+            GcodeRunHooks hooks;
+            hooks.shouldPause = [&]() {
+                return printJob.pauseRequested.load(std::memory_order_acquire);
+            };
+            hooks.shouldCancel = [&]() {
+                return printJob.cancelRequested.load(std::memory_order_acquire);
+            };
+            hooks.onProgress = [&](size_t filePosition, size_t fileSize, size_t, size_t) {
                 std::lock_guard<std::mutex> lock(printJob.mutex);
-                printJob.state = "error";
-                printJob.message = "Cannot open file";
-                printJob.active.store(false, std::memory_order_release);
-                return;
-            }
-
-            ctx.toolhead->resetSyncState();
-            double initialTime = ctx.mcu.getClockSync().estimatedPrintTime() + BUFFER_TIME_START;
-            ctx.toolhead->setNextPrintTime(initialTime);
-
-            std::string line;
-            size_t linesSinceFlush = 0;
-            size_t lineCount = 0;
-            size_t errors = 0;
-
-            while (std::getline(file, line)) {
-                if (printJob.cancelRequested.load(std::memory_order_acquire))
-                    break;
-                while (printJob.pauseRequested.load(std::memory_order_acquire)
-                    && !printJob.cancelRequested.load(std::memory_order_acquire)) {
-                    {
-                        std::lock_guard<std::mutex> lock(printJob.mutex);
-                        printJob.state = "paused";
-                        auto elapsed = std::chrono::steady_clock::now() - printJob.startedAt;
-                        printJob.printDuration = std::chrono::duration<double>(elapsed).count();
-                        printJob.totalDuration = printJob.printDuration;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                printJob.filePosition = filePosition;
+                printJob.fileSize = fileSize;
+                if (fileSize > 0) {
+                    printJob.progress = (std::min)(1.0,
+                        static_cast<double>(filePosition) / static_cast<double>(fileSize));
                 }
-
-                if (printJob.cancelRequested.load(std::memory_order_acquire))
-                    break;
-
-                bool ok = false;
-                {
-                    std::lock_guard<std::mutex> lock(g_mcuMutex);
-                    ok = ctx.gcode->executeLine(line);
-                    if (ok && ++linesSinceFlush >= 10) {
-                        ctx.toolhead->flush();
-                        ctx.toolhead->generateSteps(false);
-                        linesSinceFlush = 0;
-                    }
-                }
-
-                lineCount++;
-                {
-                    std::lock_guard<std::mutex> lock(printJob.mutex);
+                auto elapsed = std::chrono::steady_clock::now() - printJob.startedAt;
+                double elapsedSec = std::chrono::duration<double>(elapsed).count();
+                printJob.totalDuration = elapsedSec;
+                printJob.printDuration = elapsedSec;
+                if (printJob.pauseRequested.load(std::memory_order_acquire))
+                    printJob.state = "paused";
+                else if (!printJob.cancelRequested.load(std::memory_order_acquire))
                     printJob.state = "printing";
-                    printJob.filePosition = static_cast<size_t>((std::max)(0LL, static_cast<long long>(file.tellg())));
-                    if (printJob.fileSize > 0) {
-                        printJob.progress = (std::min)(1.0,
-                            static_cast<double>(printJob.filePosition) / static_cast<double>(printJob.fileSize));
-                    }
-                    auto elapsed = std::chrono::steady_clock::now() - printJob.startedAt;
-                    printJob.printDuration = std::chrono::duration<double>(elapsed).count();
-                    printJob.totalDuration = printJob.printDuration;
-                }
+            };
 
-                if (!ok) {
-                    errors++;
-                    std::lock_guard<std::mutex> lock(printJob.mutex);
-                    printJob.message = ctx.gcode->getLastMessage();
-                    break;
+            int rc = runGcodeFile(ctx, path.string(), 0, 1.0, &hooks);
+
+            json historyEntry;
+            {
+                std::lock_guard<std::mutex> lock(printJob.mutex);
+                printJob.endTime = unixNow();
+                if (printJob.cancelRequested.load(std::memory_order_acquire)) {
+                    printJob.state = "cancelled";
+                    printJob.message = "Print cancelled";
+                } else if (g_shutdown || ctx.mcu.isShutdown()) {
+                    printJob.state = "error";
+                    printJob.message = ctx.mcu.getShutdownMsg().empty() ? "MCU shutdown" : ctx.mcu.getShutdownMsg();
+                } else if (rc != 0) {
+                    printJob.state = "error";
+                    if (printJob.message.empty())
+                        printJob.message = ctx.gcode->getLastMessage().empty() ? "Print failed" : ctx.gcode->getLastMessage();
+                } else {
+                    printJob.state = "complete";
+                    printJob.message = "Print finished";
+                    printJob.progress = 1.0;
+                    printJob.filePosition = printJob.fileSize;
                 }
+                historyEntry = {
+                    {"job_id", printJob.jobId},
+                    {"user", nullptr},
+                    {"filename", printJob.filename},
+                    {"exists", true},
+                    {"status", printJob.state == "complete" ? "completed" : printJob.state},
+                    {"start_time", printJob.startTime},
+                    {"end_time", printJob.endTime},
+                    {"print_duration", printJob.printDuration},
+                    {"total_duration", printJob.totalDuration},
+                    {"filament_used", printJob.filamentUsed},
+                    {"metadata", printJob.metadata},
+                    {"auxiliary_data", json::array()}
+                };
+                printJob.active.store(false, std::memory_order_release);
             }
 
             {
-                std::lock_guard<std::mutex> lock(g_mcuMutex);
-                ctx.toolhead->flush();
-                ctx.toolhead->generateSteps(true);
+                std::lock_guard<std::mutex> lock(history.mutex);
+                history.jobs.insert(history.jobs.begin(), historyEntry);
+                history.totals["total_jobs"] = history.totals.value("total_jobs", 0) + 1;
+                history.totals["total_time"] = history.totals.value("total_time", 0.0) + historyEntry.value("total_duration", 0.0);
+                history.totals["total_print_time"] = history.totals.value("total_print_time", 0.0) + historyEntry.value("print_duration", 0.0);
+                history.totals["total_filament_used"] = history.totals.value("total_filament_used", 0.0) + historyEntry.value("filament_used", 0.0);
+                history.totals["longest_job"] = (std::max)(history.totals.value("longest_job", 0.0), historyEntry.value("total_duration", 0.0));
+                history.totals["longest_print"] = (std::max)(history.totals.value("longest_print", 0.0), historyEntry.value("print_duration", 0.0));
             }
-
-            std::lock_guard<std::mutex> lock(printJob.mutex);
-            if (printJob.cancelRequested.load(std::memory_order_acquire)) {
-                printJob.state = "cancelled";
-                printJob.message = "Print cancelled";
-            } else if (errors > 0) {
-                printJob.state = "error";
-                if (printJob.message.empty())
-                    printJob.message = "Print failed";
-            } else {
-                printJob.state = "complete";
-                printJob.message = "Print finished";
-                printJob.progress = 1.0;
-                printJob.filePosition = printJob.fileSize;
-            }
-            printJob.active.store(false, std::memory_order_release);
         });
 
         message = "ok";
