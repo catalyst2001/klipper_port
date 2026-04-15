@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -386,6 +388,18 @@ static json makeJsonRpcError(const json& id, int code, const std::string& messag
 MoonrakerApiServer::MoonrakerApiServer(MoonrakerApiCallbacks callbacks)
     : m_callbacks(std::move(callbacks)) {}
 
+struct MoonrakerApiServer::ClientSession {
+    std::atomic<uintptr_t> socketHandle{0};
+    std::thread thread;
+    std::mutex sendMutex;
+    std::mutex stateMutex;
+    std::atomic<bool> websocket{false};
+    std::atomic<bool> closing{false};
+    std::atomic<bool> finished{false};
+    std::string subscriptionQuery;
+    json lastStatus = json::object();
+};
+
 MoonrakerApiServer::~MoonrakerApiServer() {
     stop();
 }
@@ -435,7 +449,8 @@ bool MoonrakerApiServer::start(uint16_t port, std::string& error) {
     m_port = port;
     m_listenSocket = static_cast<uintptr_t>(listenSock);
     m_running.store(true, std::memory_order_release);
-    m_thread = std::thread(&MoonrakerApiServer::acceptLoop, this);
+    m_acceptThread = std::thread(&MoonrakerApiServer::acceptLoop, this);
+    m_notifyThread = std::thread(&MoonrakerApiServer::notifyLoop, this);
     return true;
 }
 
@@ -450,8 +465,29 @@ void MoonrakerApiServer::stop() {
     }
     m_listenSocket = 0;
 
-    if (m_thread.joinable())
-        m_thread.join();
+    if (m_acceptThread.joinable())
+        m_acceptThread.join();
+
+    std::vector<std::shared_ptr<ClientSession>> clients;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        clients = m_clients;
+    }
+    for (const auto& session : clients)
+        closeClientSocket(session);
+
+    if (m_notifyThread.joinable())
+        m_notifyThread.join();
+
+    for (const auto& session : clients) {
+        if (session->thread.joinable())
+            session->thread.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        m_clients.clear();
+    }
 
     WSACleanup();
 }
@@ -467,16 +503,129 @@ void MoonrakerApiServer::acceptLoop() {
                 break;
             continue;
         }
-        std::thread(&MoonrakerApiServer::handleClient, this,
-                    static_cast<uintptr_t>(client)).detach();
+        auto session = std::make_shared<ClientSession>();
+        session->socketHandle.store(static_cast<uintptr_t>(client), std::memory_order_release);
+        session->thread = std::thread(&MoonrakerApiServer::handleClient, this, session);
+        {
+            std::lock_guard<std::mutex> lock(m_clientsMutex);
+            m_clients.push_back(session);
+        }
+        pruneClosedClients();
     }
+}
+
+void MoonrakerApiServer::notifyLoop() {
+    while (m_running.load(std::memory_order_acquire)) {
+        std::vector<std::shared_ptr<ClientSession>> clients;
+        {
+            std::lock_guard<std::mutex> lock(m_clientsMutex);
+            clients = m_clients;
+        }
+
+        for (const auto& session : clients) {
+            if (!session->websocket.load(std::memory_order_acquire)
+                || session->closing.load(std::memory_order_acquire)) {
+                continue;
+            }
+
+            std::string query;
+            json lastStatus;
+            {
+                std::lock_guard<std::mutex> lock(session->stateMutex);
+                query = session->subscriptionQuery;
+                lastStatus = session->lastStatus;
+            }
+            if (query.empty() || !m_callbacks.queryObjects)
+                continue;
+
+            json result = m_callbacks.queryObjects(query);
+            if (!result.contains("status") || !result.contains("eventtime"))
+                continue;
+
+            json status = result["status"];
+            if (status == lastStatus)
+                continue;
+
+            {
+                std::lock_guard<std::mutex> lock(session->stateMutex);
+                if (session->subscriptionQuery != query)
+                    continue;
+                session->lastStatus = status;
+            }
+
+            sendJsonToClient(session, {
+                {"jsonrpc", "2.0"},
+                {"method", "notify_status_update"},
+                {"params", json::array({status, result["eventtime"]})}
+            });
+        }
+
+        pruneClosedClients();
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+}
+
+void MoonrakerApiServer::pruneClosedClients() {
+    std::vector<std::shared_ptr<ClientSession>> finished;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        auto it = m_clients.begin();
+        while (it != m_clients.end()) {
+            if ((*it)->finished.load(std::memory_order_acquire)) {
+                finished.push_back(*it);
+                it = m_clients.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    for (const auto& session : finished) {
+        if (session->thread.joinable()
+            && session->thread.get_id() != std::this_thread::get_id()) {
+            session->thread.join();
+        }
+    }
+}
+
+void MoonrakerApiServer::closeClientSocket(const std::shared_ptr<ClientSession>& session) {
+    uintptr_t handle = session->socketHandle.exchange(0, std::memory_order_acq_rel);
+    if (handle == 0)
+        return;
+
+    SOCKET client = static_cast<SOCKET>(handle);
+    session->closing.store(true, std::memory_order_release);
+    shutdown(client, SD_BOTH);
+    closesocket(client);
+}
+
+bool MoonrakerApiServer::sendJsonToClient(const std::shared_ptr<ClientSession>& session,
+                                         const json& payload,
+                                         uint8_t opcode) {
+    uintptr_t handle = session->socketHandle.load(std::memory_order_acquire);
+    if (handle == 0)
+        return false;
+
+    std::lock_guard<std::mutex> lock(session->sendMutex);
+    handle = session->socketHandle.load(std::memory_order_acquire);
+    if (handle == 0)
+        return false;
+
+    const std::string wirePayload = (opcode == 0x1) ? payload.dump() : std::string();
+    if (!sendWsFrame(static_cast<SOCKET>(handle), opcode, wirePayload)) {
+        closeClientSocket(session);
+        return false;
+    }
+    return true;
 }
 
 json MoonrakerApiServer::dispatchJsonRpc(const json& message,
                                          bool& sendStatusNotify,
-                                         json& notifyPayload) {
+                                         json& notifyPayload,
+                                         std::string& subscribedQuery) {
     sendStatusNotify = false;
     notifyPayload = json::array();
+    subscribedQuery.clear();
 
     const json id = message.contains("id") ? message["id"] : json(nullptr);
     const std::string method = message.value("method", "");
@@ -519,6 +668,7 @@ json MoonrakerApiServer::dispatchJsonRpc(const json& message,
     }
     if (method == "printer.objects.subscribe") {
         std::string query = objectsQueryStringFromJson(params.value("objects", json::object()));
+        subscribedQuery = query;
         json result = m_callbacks.queryObjects ? m_callbacks.queryObjects(query) : json::object();
         if (result.contains("status") && result.contains("eventtime")) {
             sendStatusNotify = true;
@@ -597,8 +747,13 @@ json MoonrakerApiServer::dispatchJsonRpc(const json& message,
     if (method == "server.database.list") {
         std::lock_guard<std::mutex> lock(m_stateMutex);
         json namespaces = json::array();
-        for (const auto& kv : m_database)
-            namespaces.push_back(kv.first);
+        std::map<std::string, bool> seen;
+        for (const auto& kv : m_database) {
+            std::string ns = kv.first.substr(0, kv.first.find(':'));
+            if (!seen.emplace(ns, true).second)
+                continue;
+            namespaces.push_back(ns);
+        }
         return makeJsonRpcResult(id, {{"namespaces", namespaces}});
     }
     if (method == "server.database.get_item") {
@@ -625,11 +780,15 @@ json MoonrakerApiServer::dispatchJsonRpc(const json& message,
     return makeJsonRpcError(id, -32601, "Method not found: " + method);
 }
 
-void MoonrakerApiServer::handleWebSocketClient(uintptr_t clientHandle) {
-    SOCKET client = static_cast<SOCKET>(clientHandle);
+void MoonrakerApiServer::handleWebSocketClient(const std::shared_ptr<ClientSession>& session) {
+    uintptr_t handle = session->socketHandle.load(std::memory_order_acquire);
+    if (handle == 0)
+        return;
 
-    sendWsFrame(client, 0x1,
-        json{{"jsonrpc", "2.0"}, {"method", "notify_klippy_ready"}, {"params", json::array()}}.dump());
+    SOCKET client = static_cast<SOCKET>(handle);
+
+    sendJsonToClient(session,
+        json{{"jsonrpc", "2.0"}, {"method", "notify_klippy_ready"}, {"params", json::array()}});
 
     while (m_running.load(std::memory_order_acquire)) {
         uint8_t opcode = 0;
@@ -638,11 +797,18 @@ void MoonrakerApiServer::handleWebSocketClient(uintptr_t clientHandle) {
             break;
 
         if (opcode == 0x8) {
-            sendWsFrame(client, 0x8, "");
+            sendJsonToClient(session, json(), 0x8);
             break;
         }
         if (opcode == 0x9) {
-            sendWsFrame(client, 0xA, payload);
+            uintptr_t pingHandle = session->socketHandle.load(std::memory_order_acquire);
+            if (pingHandle == 0)
+                break;
+            std::lock_guard<std::mutex> lock(session->sendMutex);
+            if (!sendWsFrame(static_cast<SOCKET>(pingHandle), 0xA, payload)) {
+                closeClientSocket(session);
+                break;
+            }
             continue;
         }
         if (opcode != 0x1)
@@ -654,37 +820,49 @@ void MoonrakerApiServer::handleWebSocketClient(uintptr_t clientHandle) {
                 for (const auto& msg : incoming) {
                     bool sendNotify = false;
                     json notifyPayload;
-                    json response = dispatchJsonRpc(msg, sendNotify, notifyPayload);
-                    if (msg.contains("id"))
-                        sendWsFrame(client, 0x1, response.dump());
-                    if (sendNotify) {
-                        json notify = {{"jsonrpc", "2.0"}, {"method", "notify_status_update"}, {"params", notifyPayload}};
-                        sendWsFrame(client, 0x1, notify.dump());
+                    std::string subscribedQuery;
+                    json response = dispatchJsonRpc(msg, sendNotify, notifyPayload, subscribedQuery);
+                    if (!subscribedQuery.empty() && notifyPayload.is_array() && notifyPayload.size() >= 1) {
+                        std::lock_guard<std::mutex> lock(session->stateMutex);
+                        session->subscriptionQuery = subscribedQuery;
+                        session->lastStatus = notifyPayload[0];
                     }
+                    if (msg.contains("id"))
+                        sendJsonToClient(session, response);
+                    if (sendNotify)
+                        sendJsonToClient(session, {{"jsonrpc", "2.0"}, {"method", "notify_status_update"}, {"params", notifyPayload}});
                 }
             } else {
                 bool sendNotify = false;
                 json notifyPayload;
-                json response = dispatchJsonRpc(incoming, sendNotify, notifyPayload);
-                if (incoming.contains("id"))
-                    sendWsFrame(client, 0x1, response.dump());
-                if (sendNotify) {
-                    json notify = {{"jsonrpc", "2.0"}, {"method", "notify_status_update"}, {"params", notifyPayload}};
-                    sendWsFrame(client, 0x1, notify.dump());
+                std::string subscribedQuery;
+                json response = dispatchJsonRpc(incoming, sendNotify, notifyPayload, subscribedQuery);
+                if (!subscribedQuery.empty() && notifyPayload.is_array() && notifyPayload.size() >= 1) {
+                    std::lock_guard<std::mutex> lock(session->stateMutex);
+                    session->subscriptionQuery = subscribedQuery;
+                    session->lastStatus = notifyPayload[0];
                 }
+                if (incoming.contains("id"))
+                    sendJsonToClient(session, response);
+                if (sendNotify)
+                    sendJsonToClient(session, {{"jsonrpc", "2.0"}, {"method", "notify_status_update"}, {"params", notifyPayload}});
             }
         } catch (...) {
-            sendWsFrame(client, 0x1,
-                makeJsonRpcError(nullptr, -32700, "Invalid JSON").dump());
+            sendJsonToClient(session, makeJsonRpcError(nullptr, -32700, "Invalid JSON"));
         }
     }
 
-    shutdown(client, SD_BOTH);
-    closesocket(client);
+    closeClientSocket(session);
 }
 
-void MoonrakerApiServer::handleClient(uintptr_t clientHandle) {
-    SOCKET client = static_cast<SOCKET>(clientHandle);
+void MoonrakerApiServer::handleClient(const std::shared_ptr<ClientSession>& session) {
+    uintptr_t handle = session->socketHandle.load(std::memory_order_acquire);
+    if (handle == 0) {
+        session->finished.store(true, std::memory_order_release);
+        return;
+    }
+
+    SOCKET client = static_cast<SOCKET>(handle);
     std::string raw = recvRequest(client);
     HttpRequest req;
     std::string out;
@@ -692,8 +870,8 @@ void MoonrakerApiServer::handleClient(uintptr_t clientHandle) {
     if (!parseRequest(raw, req)) {
         out = jsonResponse(400, makeError(400, "Malformed HTTP request"));
         sendAll(client, out.data(), out.size());
-        shutdown(client, SD_BOTH);
-        closesocket(client);
+        closeClientSocket(session);
+        session->finished.store(true, std::memory_order_release);
         return;
     }
 
@@ -703,8 +881,8 @@ void MoonrakerApiServer::handleClient(uintptr_t clientHandle) {
         if (keyIt == req.headers.end()) {
             out = jsonResponse(400, makeError(400, "Missing Sec-WebSocket-Key"));
             sendAll(client, out.data(), out.size());
-            shutdown(client, SD_BOTH);
-            closesocket(client);
+            closeClientSocket(session);
+            session->finished.store(true, std::memory_order_release);
             return;
         }
 
@@ -714,11 +892,13 @@ void MoonrakerApiServer::handleClient(uintptr_t clientHandle) {
            << "Connection: Upgrade\r\n"
            << "Sec-WebSocket-Accept: " << websocketAcceptKey(keyIt->second) << "\r\n\r\n";
         if (!sendAll(client, hs.str().data(), hs.str().size())) {
-            shutdown(client, SD_BOTH);
-            closesocket(client);
+            closeClientSocket(session);
+            session->finished.store(true, std::memory_order_release);
             return;
         }
-        handleWebSocketClient(clientHandle);
+        session->websocket.store(true, std::memory_order_release);
+        handleWebSocketClient(session);
+        session->finished.store(true, std::memory_order_release);
         return;
     }
 
@@ -778,8 +958,13 @@ void MoonrakerApiServer::handleClient(uintptr_t clientHandle) {
     } else if (req.path == "/server/database/list") {
         std::lock_guard<std::mutex> lock(m_stateMutex);
         json namespaces = json::array();
-        for (const auto& kv : m_database)
-            namespaces.push_back(kv.first);
+        std::map<std::string, bool> seen;
+        for (const auto& kv : m_database) {
+            std::string ns = kv.first.substr(0, kv.first.find(':'));
+            if (!seen.emplace(ns, true).second)
+                continue;
+            namespaces.push_back(ns);
+        }
         result = json{{"result", {{"namespaces", namespaces}}}};
     } else if (req.path == "/server/database/item") {
         auto query = parseQuery(req.query);
@@ -889,6 +1074,6 @@ void MoonrakerApiServer::handleClient(uintptr_t clientHandle) {
 
     out = jsonResponse(code, result);
     sendAll(client, out.data(), out.size());
-    shutdown(client, SD_BOTH);
-    closesocket(client);
+    closeClientSocket(session);
+    session->finished.store(true, std::memory_order_release);
 }

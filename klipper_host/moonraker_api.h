@@ -5,8 +5,10 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <map>
+#include <vector>
 
 #include "nlohmann/json.hpp"
 
@@ -36,18 +38,30 @@ public:
     uint16_t port() const { return m_port; }
 
 private:
+    struct ClientSession;
+
     void acceptLoop();
-    void handleClient(uintptr_t clientHandle);
-    void handleWebSocketClient(uintptr_t clientHandle);
+    void notifyLoop();
+    void pruneClosedClients();
+    void closeClientSocket(const std::shared_ptr<ClientSession>& session);
+    bool sendJsonToClient(const std::shared_ptr<ClientSession>& session,
+                          const nlohmann::json& payload,
+                          uint8_t opcode = 0x1);
+    void handleClient(const std::shared_ptr<ClientSession>& session);
+    void handleWebSocketClient(const std::shared_ptr<ClientSession>& session);
     nlohmann::json dispatchJsonRpc(const nlohmann::json& message,
                                    bool& sendStatusNotify,
-                                   nlohmann::json& notifyPayload);
+                                   nlohmann::json& notifyPayload,
+                                   std::string& subscribedQuery);
 
     MoonrakerApiCallbacks m_callbacks;
     std::atomic<bool> m_running{false};
-    std::thread m_thread;
+    std::thread m_acceptThread;
+    std::thread m_notifyThread;
     uintptr_t m_listenSocket = 0;
     uint16_t m_port = 0;
+    std::mutex m_clientsMutex;
+    std::vector<std::shared_ptr<ClientSession>> m_clients;
     std::mutex m_stateMutex;
     std::map<std::string, nlohmann::json> m_database;
 };
