@@ -800,7 +800,6 @@ static int runInfo(TestContext& ctx) {
 }
 
 static int runApiServer(TestContext& ctx, int httpPort) {
-    ctx.startLegacyThreads();
     using json = nlohmann::json;
 
     auto defaultObjects = []() {
@@ -851,6 +850,25 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         double totalDuration = 0.0;
         std::chrono::steady_clock::time_point startedAt{};
     } printJob;
+
+    auto clearLoadedFile = [&]() {
+        std::lock_guard<std::mutex> lock(printJob.mutex);
+        if (printJob.active.load(std::memory_order_acquire))
+            return false;
+        printJob.state = ctx.mcu.isShutdown() ? "error" : "standby";
+        printJob.filename.clear();
+        printJob.message.clear();
+        printJob.metadata = json::object();
+        printJob.filePosition = 0;
+        printJob.fileSize = 0;
+        printJob.progress = 0.0;
+        printJob.startTime = 0.0;
+        printJob.endTime = 0.0;
+        printJob.filamentUsed = 0.0;
+        printJob.printDuration = 0.0;
+        printJob.totalDuration = 0.0;
+        return true;
+    };
 
     struct HistoryState {
         std::mutex mutex;
@@ -905,6 +923,21 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         if (printJob.worker.joinable() && !printJob.active.load(std::memory_order_acquire))
             printJob.worker.join();
     };
+
+    ctx.mcu.setShutdownCallback([&](const std::string& reason) {
+        Log("!!! MCU SHUTDOWN: " + reason + " !!!");
+        g_shutdown = true;
+        if (printJob.active.load(std::memory_order_acquire)) {
+            printJob.cancelRequested.store(true, std::memory_order_release);
+            std::lock_guard<std::mutex> lock(printJob.mutex);
+            printJob.state = "error";
+            printJob.message = reason.empty() ? "MCU shutdown" : reason;
+        }
+    });
+
+    ctx.gcode->registerCommand("SDCARD_RESET_FILE", [&](const std::map<char, double>&) {
+        return clearLoadedFile();
+    });
 
     auto getHostName = []() -> std::string {
         char* buf = nullptr;
@@ -1179,10 +1212,10 @@ static int runApiServer(TestContext& ctx, int httpPort) {
 
     MoonrakerApiCallbacks callbacks;
     callbacks.getServerInfo = [&]() -> json {
-        bool connected = ctx.mcu.isConnected() && !ctx.mcu.isShutdown();
+        bool connected = ctx.mcu.isConnected() && !ctx.mcu.isShutdown() && !g_shutdown.load(std::memory_order_acquire);
         return {
             {"klippy_connected", connected},
-            {"klippy_state", connected ? "ready" : (ctx.mcu.isShutdown() ? "shutdown" : "disconnected")},
+            {"klippy_state", connected ? "ready" : ((ctx.mcu.isShutdown() || g_shutdown.load(std::memory_order_acquire)) ? "shutdown" : "disconnected")},
             {"components", {"application", "klippy_connection", "machine", "file_manager", "job_queue", "history", "authorization", "database", "announcements", "webcam"}},
             {"failed_components", json::array()},
             {"registered_directories", {"config", "gcodes", "logs"}},
@@ -1204,7 +1237,7 @@ static int runApiServer(TestContext& ctx, int httpPort) {
                     {"enable_debug_logging", false},
                     {"enable_asyncio_debug", false},
                     {"klippy_uds_address", nullptr},
-                    {"max_upload_size", 210},
+                    {"max_upload_size", 512},
                     {"ssl_certificate_path", nullptr},
                     {"ssl_key_path", nullptr}
                 }},
@@ -1249,10 +1282,10 @@ static int runApiServer(TestContext& ctx, int httpPort) {
     };
 
     callbacks.getPrinterInfo = [&]() -> json {
-        bool shutdown = ctx.mcu.isShutdown();
+        bool shutdown = ctx.mcu.isShutdown() || g_shutdown.load(std::memory_order_acquire);
         return {
             {"state", shutdown ? "error" : "ready"},
-            {"state_message", shutdown ? ctx.mcu.getShutdownMsg() : "Printer is ready"},
+            {"state_message", shutdown ? (ctx.mcu.getShutdownMsg().empty() ? "Emergency stop triggered" : ctx.mcu.getShutdownMsg()) : "Printer is ready"},
             {"hostname", getHostName()},
             {"software_version", "klipper_host_cpp"}
         };
@@ -1373,8 +1406,8 @@ static int runApiServer(TestContext& ctx, int httpPort) {
         json status = json::object();
         if (hasObj("webhooks")) {
             status["webhooks"] = {
-                {"state", ctx.mcu.isShutdown() ? "shutdown" : "ready"},
-                {"state_message", ctx.mcu.isShutdown() ? ctx.mcu.getShutdownMsg() : "ready"}
+                {"state", (ctx.mcu.isShutdown() || g_shutdown.load(std::memory_order_acquire)) ? "shutdown" : "ready"},
+                {"state_message", (ctx.mcu.isShutdown() || g_shutdown.load(std::memory_order_acquire)) ? (ctx.mcu.getShutdownMsg().empty() ? "Emergency stop triggered" : ctx.mcu.getShutdownMsg()) : "ready"}
             };
         }
         if (hasObj("toolhead")) {
@@ -1400,7 +1433,7 @@ static int runApiServer(TestContext& ctx, int httpPort) {
                 {"axis_maximum", axisMaximum},
                 {"speed", ctx.gcode->getFeedrate()},
                 {"speed_factor", ctx.gcode->getSpeedFactor()},
-                {"extrude_factor", 1.0},
+                {"extrude_factor", ctx.gcode->getExtrudeFactor()},
                 {"absolute_coordinates", ctx.gcode->isAbsoluteMode()},
                 {"absolute_extrude", ctx.gcode->isAbsoluteExtruderMode()},
                 {"speed_mode", "absolute"}
@@ -1447,7 +1480,8 @@ static int runApiServer(TestContext& ctx, int httpPort) {
                 {"is_active", printJob.active.load(std::memory_order_acquire)},
                 {"progress", printJob.progress},
                 {"file_position", static_cast<int64_t>(printJob.filePosition)},
-                {"file_size", static_cast<int64_t>(printJob.fileSize)}
+                {"file_size", static_cast<int64_t>(printJob.fileSize)},
+                {"file_path", printJob.filename}
             };
         }
         if (hasObj("display_status")) {
@@ -1598,7 +1632,19 @@ static int runApiServer(TestContext& ctx, int httpPort) {
             message = "Empty script";
             return false;
         }
-        if (printJob.active.load(std::memory_order_acquire)) {
+        std::string trimmed = script;
+        auto commentPos = trimmed.find(';');
+        if (commentPos != std::string::npos)
+            trimmed = trimmed.substr(0, commentPos);
+        while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.front())))
+            trimmed.erase(trimmed.begin());
+        while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.back())))
+            trimmed.pop_back();
+        std::string upperTrimmed = trimmed;
+        std::transform(upperTrimmed.begin(), upperTrimmed.end(), upperTrimmed.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+
+        if (printJob.active.load(std::memory_order_acquire) && upperTrimmed != "M112") {
             message = "Print is in progress";
             return false;
         }
@@ -1616,6 +1662,10 @@ static int runApiServer(TestContext& ctx, int httpPort) {
 
     callbacks.startPrint = [&](const std::string& filename, std::string& message) -> bool {
         joinFinishedWorker();
+        if (g_shutdown.load(std::memory_order_acquire) || ctx.mcu.isShutdown()) {
+            message = "Printer is shutdown";
+            return false;
+        }
         if (printJob.active.load(std::memory_order_acquire)) {
             message = "A print is already running";
             return false;
@@ -1627,6 +1677,7 @@ static int runApiServer(TestContext& ctx, int httpPort) {
             message = "File not found: " + rel;
             return false;
         }
+        Log("Starting print file: " + rel);
 
         json metadata = scanGcodeMetadata(rel);
         std::string jobId;
@@ -2001,9 +2052,12 @@ static int runApiServer(TestContext& ctx, int httpPort) {
                 {"G92", "Set current position"},
                 {"M82", "Absolute extruder mode"},
                 {"M83", "Relative extruder mode"},
+                {"M220", "Set speed factor percentage"},
+                {"M221", "Set extrusion flow percentage"},
                 {"M84", "Disable steppers"},
                 {"M112", "Emergency stop"},
                 {"M114", "Report current position"},
+                {"SDCARD_RESET_FILE", "Clear selected virtual SD file"},
                 {"M400", "Wait for moves to finish"}
             };
         }
@@ -2030,6 +2084,13 @@ static int runApiServer(TestContext& ctx, int httpPort) {
                 error = message.empty() ? "Emergency stop failed" : message;
                 return json::object();
             }
+            g_shutdown = true;
+            if (printJob.active.load(std::memory_order_acquire)) {
+                printJob.cancelRequested.store(true, std::memory_order_release);
+                std::lock_guard<std::mutex> lock(printJob.mutex);
+                printJob.state = "error";
+                printJob.message = "Emergency stop triggered";
+            }
             return {{"state", "shutdown"}};
         }
         if (method == "printer.restart") {
@@ -2038,6 +2099,7 @@ static int runApiServer(TestContext& ctx, int httpPort) {
                 return json::object();
             }
             g_shutdown = false;
+            clearLoadedFile();
             return {{"state", "ready"}};
         }
         if (method == "printer.firmware_restart") {
@@ -2288,7 +2350,19 @@ static int runApiServer(TestContext& ctx, int httpPort) {
     Log("Moonraker-compatible API listening on http://0.0.0.0:" + std::to_string(httpPort));
     Log("Press Ctrl-C to stop the API server");
 
+    auto nextIdleClockSync = std::chrono::steady_clock::now() + std::chrono::milliseconds(984);
+
     while (g_running) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= nextIdleClockSync) {
+            if (!printJob.active.load(std::memory_order_acquire)
+                && ctx.mcu.isConnected()
+                && !ctx.mcu.isShutdown()
+                && ctx.mcu.isSerialQueueActive()) {
+                ctx.mcu.clockSyncPollAsync();
+            }
+            nextIdleClockSync = now + std::chrono::milliseconds(984);
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
 

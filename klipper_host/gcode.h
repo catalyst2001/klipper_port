@@ -51,6 +51,7 @@ public:
     // Speed factor (1.0 = normal, 2.0 = double speed)
     void setSpeedFactor(double f) { m_speedFactor = f; }
     double getSpeedFactor() const { return m_speedFactor; }
+    double getExtrudeFactor() const { return m_extrudeFactor; }
 
     // Pressure advance settings (compatibility state).
     double getPressureAdvance() const { return m_pressureAdvance; }
@@ -71,6 +72,8 @@ private:
     bool m_absoluteExtruderMode = true;
     double m_feedrate = 25.0;  // mm/s (default)
     double m_speedFactor = 1.0;  // speed multiplier (M220 equivalent)
+    double m_extrudeFactor = 1.0;  // extrusion multiplier (M221 equivalent)
+    double m_gcodeEPos = 0.0;      // logical E position from gcode stream
     double m_pressureAdvance = 0.0;
     double m_pressureAdvanceSmoothTime = 0.04;
     bool m_pressureAdvanceWarned = false;
@@ -103,6 +106,8 @@ private:
     bool cmdM83(const std::map<char, double>& params);
     bool cmdM204(const std::map<char, double>& params);
     bool cmdM205(const std::map<char, double>& params);
+    bool cmdM220(const std::map<char, double>& params);
+    bool cmdM221(const std::map<char, double>& params);
     bool cmdM84(const std::map<char, double>& params);
     bool cmdM112(const std::map<char, double>& params);
     bool cmdM400(const std::map<char, double>& params);

@@ -130,6 +130,7 @@ static std::string httpStatusText(int code) {
     case 201: return "201 Created";
     case 204: return "204 No Content";
     case 400: return "400 Bad Request";
+    case 413: return "413 Payload Too Large";
     case 404: return "404 Not Found";
     case 405: return "405 Method Not Allowed";
     case 409: return "409 Conflict";
@@ -162,22 +163,30 @@ static std::string jsonResponse(int code, const json& payload) {
     return buildHttpResponse(code, "application/json", body);
 }
 
-static std::string recvRequest(SOCKET client) {
+static constexpr size_t kMaxHttpRequestBytes = 512ull * 1024ull * 1024ull;
+
+struct RequestReadResult {
     std::string data;
+    bool payloadTooLarge = false;
+    bool invalidContentLength = false;
+};
+
+static RequestReadResult recvRequest(SOCKET client) {
+    RequestReadResult result;
     char buf[4096];
-    int contentLength = -1;
+    size_t contentLength = static_cast<size_t>(-1);
     size_t headerEnd = std::string::npos;
 
     for (;;) {
         int got = recv(client, buf, sizeof(buf), 0);
         if (got <= 0)
             break;
-        data.append(buf, buf + got);
+        result.data.append(buf, buf + got);
 
         if (headerEnd == std::string::npos) {
-            headerEnd = data.find("\r\n\r\n");
+            headerEnd = result.data.find("\r\n\r\n");
             if (headerEnd != std::string::npos) {
-                std::string headers = data.substr(0, headerEnd);
+                std::string headers = result.data.substr(0, headerEnd);
                 auto pos = toLower(headers).find("content-length:");
                 if (pos != std::string::npos) {
                     pos += std::strlen("content-length:");
@@ -186,23 +195,40 @@ static std::string recvRequest(SOCKET client) {
                     size_t end = pos;
                     while (end < headers.size() && std::isdigit(static_cast<unsigned char>(headers[end])))
                         ++end;
-                    contentLength = std::stoi(headers.substr(pos, end - pos));
+                    if (end == pos) {
+                        result.invalidContentLength = true;
+                        break;
+                    }
+                    try {
+                        contentLength = static_cast<size_t>(std::stoull(headers.substr(pos, end - pos)));
+                    } catch (...) {
+                        result.invalidContentLength = true;
+                        break;
+                    }
+                    size_t totalNeeded = headerEnd + 4 + contentLength;
+                    if (totalNeeded > kMaxHttpRequestBytes) {
+                        result.payloadTooLarge = true;
+                        break;
+                    }
+                    result.data.reserve(totalNeeded);
                 } else {
                     contentLength = 0;
                 }
             }
         }
 
-        if (headerEnd != std::string::npos && contentLength >= 0) {
-            size_t totalNeeded = headerEnd + 4 + static_cast<size_t>(contentLength);
-            if (data.size() >= totalNeeded)
+        if (headerEnd != std::string::npos && contentLength != static_cast<size_t>(-1)) {
+            size_t totalNeeded = headerEnd + 4 + contentLength;
+            if (result.data.size() >= totalNeeded)
                 break;
         }
 
-        if (data.size() > 1024 * 1024)
+        if (result.data.size() > kMaxHttpRequestBytes) {
+            result.payloadTooLarge = true;
             break;
+        }
     }
-    return data;
+    return result;
 }
 
 static bool sendAll(SOCKET client, const void* data, size_t len) {
@@ -1063,11 +1089,27 @@ void MoonrakerApiServer::handleClient(const std::shared_ptr<ClientSession>& sess
     }
 
     SOCKET client = static_cast<SOCKET>(handle);
-    std::string raw = recvRequest(client);
+    RequestReadResult raw = recvRequest(client);
     HttpRequest req;
     std::string out;
 
-    if (!parseRequest(raw, req)) {
+    if (raw.payloadTooLarge) {
+        out = jsonResponse(413, makeError(413, "HTTP request body exceeds the 512 MiB server limit"));
+        sendAll(client, out.data(), out.size());
+        closeClientSocket(session);
+        session->finished.store(true, std::memory_order_release);
+        return;
+    }
+
+    if (raw.invalidContentLength) {
+        out = jsonResponse(400, makeError(400, "Invalid Content-Length header"));
+        sendAll(client, out.data(), out.size());
+        closeClientSocket(session);
+        session->finished.store(true, std::memory_order_release);
+        return;
+    }
+
+    if (!parseRequest(raw.data, req)) {
         out = jsonResponse(400, makeError(400, "Malformed HTTP request"));
         sendAll(client, out.data(), out.size());
         closeClientSocket(session);

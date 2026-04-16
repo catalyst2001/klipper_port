@@ -116,6 +116,32 @@ bool GCodeParser::executeLine(const std::string& line) {
         return true;
     }
 
+    std::string cleaned = line;
+    auto commentPos = cleaned.find(';');
+    if (commentPos != std::string::npos)
+        cleaned = cleaned.substr(0, commentPos);
+    while (!cleaned.empty() && std::isspace(static_cast<unsigned char>(cleaned.front())))
+        cleaned.erase(cleaned.begin());
+    while (!cleaned.empty() && std::isspace(static_cast<unsigned char>(cleaned.back())))
+        cleaned.pop_back();
+    if (cleaned.empty())
+        return true;
+
+    std::string fullToken;
+    {
+        std::istringstream tokenStream(cleaned);
+        tokenStream >> fullToken;
+    }
+    std::transform(fullToken.begin(), fullToken.end(), fullToken.begin(),
+        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    auto fullCustomIt = m_customHandlers.find(fullToken);
+    if (fullCustomIt != m_customHandlers.end()) {
+        bool ok = fullCustomIt->second({});
+        if (!ok && m_lastMsg.empty())
+            m_lastMsg = "Command failed: " + fullToken;
+        return ok;
+    }
+
     auto parsed = parseLine(line);
     if (parsed.command.empty()) return true; // empty line is OK
 
@@ -148,6 +174,10 @@ bool GCodeParser::executeLine(const std::string& line) {
         return cmdM204(parsed.params);
     } else if (parsed.command == "M205") {
         return cmdM205(parsed.params);
+    } else if (parsed.command == "M220") {
+        return cmdM220(parsed.params);
+    } else if (parsed.command == "M221") {
+        return cmdM221(parsed.params);
     } else if (parsed.command == "M84") {
         return cmdM84(parsed.params);
     } else if (parsed.command == "M112") {
@@ -323,6 +353,8 @@ bool GCodeParser::cmdG0G1(const std::map<char, double>& params) {
     Vec3 target = curPos;
     double curE = m_toolhead.getExtruderPosition();
     double targetE = curE;
+    double rawE = m_gcodeEPos;
+    double targetRawE = rawE;
 
     if (m_absoluteMode) {
         auto xIt = params.find('X');
@@ -343,12 +375,14 @@ bool GCodeParser::cmdG0G1(const std::map<char, double>& params) {
     auto eIt = params.find('E');
     if (eIt != params.end()) {
         if (m_absoluteExtruderMode)
-            targetE = eIt->second + m_baseEPos;
+            targetRawE = eIt->second;
         else
-            targetE += eIt->second;
+            targetRawE += eIt->second;
+        targetE = curE + (targetRawE - rawE) * m_extrudeFactor;
     }
 
     m_toolhead.moveAbsolute(target, m_feedrate * m_speedFactor, targetE);
+    m_gcodeEPos = targetRawE;
     return true;
 }
 
@@ -390,10 +424,9 @@ bool GCodeParser::cmdG2G3(bool clockwise, const std::map<char, double>& params) 
 
     auto eIt = params.find('E');
     if (eIt != params.end()) {
-        if (m_absoluteExtruderMode)
-            endE = eIt->second + m_baseEPos;
-        else
-            endE += eIt->second;
+        double targetRawE = m_absoluteExtruderMode ? eIt->second : (m_gcodeEPos + eIt->second);
+        endE = curE + (targetRawE - m_gcodeEPos) * m_extrudeFactor;
+        m_gcodeEPos = targetRawE;
     }
 
     // I, J are always relative offsets from current position to arc center
@@ -575,7 +608,10 @@ bool GCodeParser::cmdG92(const std::map<char, double>& params) {
     auto zIt = params.find('Z');
     if (zIt != params.end()) m_basePos.z = curPos.z - zIt->second;
     auto eIt = params.find('E');
-    if (eIt != params.end()) m_baseEPos = curE - eIt->second;
+    if (eIt != params.end()) {
+        m_baseEPos = curE - eIt->second;
+        m_gcodeEPos = eIt->second;
+    }
 
     m_lastMsg = "ok";
     return true;
@@ -586,7 +622,7 @@ bool GCodeParser::cmdM114(const std::map<char, double>&) {
     Vec3 pos = m_toolhead.getPosition();
     double ePos = m_toolhead.getExtruderPosition();
     Vec3 gpos = {pos.x - m_basePos.x, pos.y - m_basePos.y, pos.z - m_basePos.z};
-    double ge = ePos - m_baseEPos;
+    double ge = m_gcodeEPos;
 
     std::ostringstream ss;
     ss << "X:" << gpos.x << " Y:" << gpos.y << " Z:" << gpos.z << " E:" << ge;
@@ -637,6 +673,22 @@ bool GCodeParser::cmdM205(const std::map<char, double>& params) {
     if (scv > 0.0)
         m_toolhead.setSquareCornerVelocity(scv);
 
+    m_lastMsg = "ok";
+    return true;
+}
+
+bool GCodeParser::cmdM220(const std::map<char, double>& params) {
+    auto sIt = params.find('S');
+    if (sIt != params.end())
+        m_speedFactor = (std::max)(0.0, sIt->second / 100.0);
+    m_lastMsg = "ok";
+    return true;
+}
+
+bool GCodeParser::cmdM221(const std::map<char, double>& params) {
+    auto sIt = params.find('S');
+    if (sIt != params.end())
+        m_extrudeFactor = (std::max)(0.0, sIt->second / 100.0);
     m_lastMsg = "ok";
     return true;
 }
