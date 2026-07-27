@@ -3,8 +3,8 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="klipper_gui/klipper_gui.vcxproj">
+  <Project Path="klipper_gui/klipper_gui.vcxproj" Id="b2a3d4e5-f6a7-48b9-a0c1-d2e3f4a5b6c7">
     <Platform Project="x64" />
   </Project>
-  <Project Path="klipper_host/klipper_host.vcxproj" />
+  <Project Path="klipper_host/klipper_host.vcxproj" Id="00c373b9-a9d1-40aa-bd46-af3ed62a55ca" />
 </Solution>

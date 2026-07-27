@@ -47,6 +47,19 @@ if errorlevel 1 (
     exit /b 1
 )
 
+:: ---- Step 4: Copy wxWidgets runtime DLLs into output folders ----
+echo.
+echo Copying wxWidgets runtime DLLs to build output folders...
+for %%C in (Debug Release) do (
+    if exist "%ROOT%x64\%%C\" (
+        if /I "%%C"=="Debug" (
+            xcopy /Y /D "%VCPKG_DIR%\installed\%TRIPLET%\debug\bin\*.dll" "%ROOT%x64\%%C\" >nul
+        ) else (
+            xcopy /Y /D "%VCPKG_DIR%\installed\%TRIPLET%\bin\*.dll" "%ROOT%x64\%%C\" >nul
+        )
+    )
+)
+
 echo.
 echo ============================================
 echo  Setup complete!
@@ -54,6 +67,7 @@ echo.
 echo  You can now open klipper_host_cpp.slnx
 echo  and build with Configuration=Debug,
 echo  Platform=x64.
+echo  The GUI executable will now find its wxWidgets DLLs automatically.
 echo ============================================
 
 endlocal

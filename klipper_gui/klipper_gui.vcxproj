@@ -115,6 +115,13 @@
     <ClInclude Include="..\klipper_host\input_shaper.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <ImportGroup Label="ExtensionTargets">
-  </ImportGroup>
+  <ImportGroup Label="ExtensionTargets" />
+  <Target Name="CopyWxWidgetsRuntimeDlls" AfterTargets="Build">
+    <PropertyGroup>
+      <WxVcpkgBin Condition="'$(Configuration)' == 'Debug'">$(SolutionDir)vcpkg\installed\x64-windows\debug\bin</WxVcpkgBin>
+      <WxVcpkgBin Condition="'$(Configuration)' != 'Debug'">$(SolutionDir)vcpkg\installed\x64-windows\bin</WxVcpkgBin>
+    </PropertyGroup>
+    <Message Importance="High" Text="Copying wxWidgets runtime DLLs from $(WxVcpkgBin) to $(OutDir)" />
+    <Exec Command="if exist &quot;$(WxVcpkgBin)&quot; xcopy /Y /D &quot;$(WxVcpkgBin)\*.dll&quot; &quot;$(OutDir)&quot; >nul" />
+  </Target>
 </Project>
