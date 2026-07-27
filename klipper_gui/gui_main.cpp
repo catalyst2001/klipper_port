@@ -13,6 +13,8 @@
 #include <queue>
 #include <sstream>
 #include <fstream>
+#include <algorithm>
+#include <cctype>
 
 #include "../klipper_host/klipper_mcu.h"
 #include "../klipper_host/mcu_objects.h"
@@ -67,6 +69,7 @@ private:
 
     // UI Controls
     wxTextCtrl* m_logText = nullptr;
+    wxChoice* m_portChoice = nullptr;
     wxButton* m_btnConnect = nullptr;
     wxButton* m_btnIdentify = nullptr;
     wxButton* m_btnGetClock = nullptr;
@@ -246,6 +249,7 @@ private:
 
     void PopulateCommandList();
     void PopulateResponseList();
+    void RefreshComPortList();
     int ResolvePinNumber(const wxString& pinStr);
     void OnAddDigitalOut(wxCommandEvent& evt);
     void OnAddAdc(wxCommandEvent& evt);
@@ -378,7 +382,11 @@ void KlipperFrame::CreateUI() {
 
     // Top toolbar
     auto* toolSizer = new wxBoxSizer(wxHORIZONTAL);
-    m_btnConnect = new wxButton(mainPanel, ID_CONNECT, "Connect COM3");
+    toolSizer->Add(new wxStaticText(mainPanel, wxID_ANY, "Port:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_portChoice = new wxChoice(mainPanel, wxID_ANY, wxDefaultPosition, wxSize(110, -1));
+    
+    toolSizer->Add(m_portChoice, 0, wxALL, 3);
+    m_btnConnect = new wxButton(mainPanel, ID_CONNECT, "Connect");
     m_btnIdentify = new wxButton(mainPanel, ID_IDENTIFY, "Identify");
     m_btnGetClock = new wxButton(mainPanel, ID_GET_CLOCK, "Get Clock");
     m_btnGetUptime = new wxButton(mainPanel, ID_GET_UPTIME, "Get Uptime");
@@ -727,6 +735,8 @@ void KlipperFrame::CreateUI() {
     m_btnSendGcode->Enable(false);
     m_btnHomeAll->Enable(false);
     m_btnLoadConfig->Enable(false);
+
+		RefreshComPortList();
 }
 
 void KlipperFrame::buildTmcDriverTabs() {
@@ -1253,7 +1263,51 @@ void KlipperFrame::OnUITimer(wxTimerEvent&) {
     }
 }
 
+void KlipperFrame::RefreshComPortList() {
+    if (!m_portChoice) return;
+
+    m_portChoice->Clear();
+    std::vector<std::string> ports;
+
+    char buffer[65535] = {};
+    DWORD result = QueryDosDeviceA(nullptr, buffer, static_cast<DWORD>(sizeof(buffer)));
+    if (result != 0) {
+        for (char* p = buffer; *p; p += std::strlen(p) + 1) {
+            std::string deviceName(p);
+            if (deviceName.size() >= 4 && deviceName.rfind("COM", 0) == 0) {
+                bool numeric = true;
+                for (size_t i = 3; i < deviceName.size(); ++i) {
+                    if (!std::isdigit(static_cast<unsigned char>(deviceName[i]))) {
+                        numeric = false;
+                        break;
+                    }
+                }
+                if (numeric) {
+                    ports.push_back(deviceName);
+                }
+            }
+        }
+        std::sort(ports.begin(), ports.end(), [](const std::string& a, const std::string& b) {
+            return std::stoi(a.substr(3)) < std::stoi(b.substr(3));
+        });
+    }
+
+    for (const auto& port : ports) {
+        m_portChoice->Append(wxString::FromUTF8(port));
+    }
+
+    if (!ports.empty()) {
+        m_portChoice->SetSelection(0);
+        m_btnConnect->Enable(true);
+    }
+    else {
+        m_btnConnect->Enable(false);
+    }
+}
+
 void KlipperFrame::OnConnect(wxCommandEvent&) {
+    if (!m_portChoice) return;
+
     if (m_connected) {
         // Stop any active print first (PrintThread stops SQ and restarts legacy threads)
         if (m_printing) {
@@ -1270,7 +1324,7 @@ void KlipperFrame::OnConnect(wxCommandEvent&) {
         m_connected = false;
         m_statusLabel->SetLabel("Status: Disconnected");
         m_statusLabel->SetForegroundColour(*wxRED);
-        m_btnConnect->SetLabel("Connect COM3");
+        m_btnConnect->SetLabel("Connect");
         m_btnIdentify->Enable(false);
         m_btnGetClock->Enable(false);
         m_btnGetUptime->Enable(false);
@@ -1326,14 +1380,24 @@ void KlipperFrame::OnConnect(wxCommandEvent&) {
         Log("Disconnected.", *wxRED);
     }
     else {
-        Log("Connecting to COM3...");
-        if (m_mcu.connect("COM3", 250000)) {
+        wxString selectedPort = m_portChoice->GetStringSelection();
+        if (selectedPort.empty()) {
+            RefreshComPortList();
+            selectedPort = m_portChoice->GetStringSelection();
+        }
+        if (selectedPort.empty()) {
+            Log("No COM ports available.", *wxRED);
+            return;
+        }
+
+        Log("Connecting to " + selectedPort + "...");
+        if (m_mcu.connect(selectedPort.ToStdString(), 250000)) {
             m_connected = true;
             m_statusLabel->SetLabel("Status: Connected (not identified)");
             m_statusLabel->SetForegroundColour(wxColour(200, 150, 0));
             m_btnConnect->SetLabel("Disconnect");
             m_btnIdentify->Enable(true);
-            Log("Connected to COM3!", wxColour(0, 128, 0));
+            Log("Connected to " + selectedPort + "!", wxColour(0, 128, 0));
         }
         else {
             Log("Failed to connect: " + wxString(m_mcu.getLastError()), *wxRED);
